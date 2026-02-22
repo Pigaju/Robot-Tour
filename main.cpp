@@ -4128,38 +4128,38 @@ static void drawRunScreen() {
 static void drawBfsNavScreen(int bfs_setup_step) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_CYAN);
-  ui.setTextSize(2);
-  ui.drawString("BFS PATHFINDING", 120, 30);
+  ui.setTextSize(1);
+  ui.drawString("BFS PATHFINDING", 120, 10);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
   
-  // Show current setup step
+  // Show current setup step with more compact spacing
   ui.setTextColor(bfs_setup_step == 0 ? TFT_YELLOW : TFT_DARKGREY);
-  ui.drawString("Start Node:", 30, 80);
-  ui.drawString(bfs_state.nodes[bfs_start_node].name, 160, 80);
+  ui.drawString("Start:", 30, 40);
+  ui.drawString(bfs_state.nodes[bfs_start_node].name, 120, 40);
   
   ui.setTextColor(bfs_setup_step == 1 ? TFT_YELLOW : TFT_DARKGREY);
-  ui.drawString("Goal Node:", 30, 110);
-  ui.drawString(bfs_state.nodes[bfs_goal_node].name, 160, 110);
+  ui.drawString("Goal:", 30, 60);
+  ui.drawString(bfs_state.nodes[bfs_goal_node].name, 120, 60);
   
-  // Show all available nodes as reference
+  // Show all available nodes in a single compact line
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("Nodes:", 30, 150);
+  ui.drawString("Nodes:", 30, 85);
   
-  char nodeList[64] = "";
+  char nodeList[96] = "";
   for (uint8_t i = 0; i < bfs_state.node_count; i++) {
     if (i > 0) strcat(nodeList, " ");
     strcat(nodeList, bfs_state.nodes[i].name);
   }
-  ui.drawString(nodeList, 30, 165);
+  ui.drawString(nodeList, 30, 100);
   
   // Instructions
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to select, click to toggle", 30, 190);
-  ui.drawString("Press & hold to start navigation", 30, 205);
+  ui.drawString("Dial: select | Click: toggle", 120, 140);
+  ui.drawString("Hold: start navigation", 120, 155);
 }
 
 static void renderCurrentScreen() {
@@ -4616,6 +4616,18 @@ void loop() {
   handleSerialCommands();
 
   const unsigned long now = millis();
+
+  // === BEST FIX: Track screen changes and reset BFS state ===
+  static ScreenState lastScreen = SCREEN_MAIN_MENU;
+  static int bfs_setup_step = 0;
+  
+  if (currentScreen != lastScreen) {
+    // Screen changed - reset state
+    if (currentScreen == SCREEN_BFS_NAV) {
+      bfs_setup_step = 0;  // Reset to selecting start node
+    }
+    lastScreen = currentScreen;
+  }
 
 #if RUN_CLOUD_UPLOAD_ENABLE
 #if RUN_CLOUD_UPLOAD_ON_STOP
