@@ -3795,20 +3795,20 @@ static void drawMainMenu() {
   // If the critical devices aren't present, do not start the run (safer than open-loop).
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(FW_VERSION, 120, 2);
+  const int cx = ui.width() / 2;
+  const int cy = ui.height() / 2;
+  ui.drawString(FW_VERSION, cx, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(1);
-  ui.drawString("MENU", 120, 15);
+  ui.drawString("MENU", cx, 15);
 
-  float radius = 70.0f;
-  float centerX = 120.0f;
-  float centerY = 120.0f;
+  float radius = min(cx, cy) - 50.0f;
 
   for (int i = 0; i < NUM_MENU_ITEMS; i++) {
     float angle = (i * (360.0f / NUM_MENU_ITEMS) - 90.0f) * (float)M_PI / 180.0f;
-    float itemX = centerX + radius * cosf(angle);
-    float itemY = centerY + radius * sinf(angle);
+    float itemX = cx + radius * cosf(angle);
+    float itemY = cy + radius * sinf(angle);
 
     if (i == selectedMenuItem) {
       ui.fillCircle(itemX, itemY, 30, TFT_DARKGREEN);
@@ -3826,17 +3826,17 @@ static void drawMainMenu() {
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
-  ui.drawString(menuNames[selectedMenuItem], centerX, centerY);
+  ui.drawString(menuNames[selectedMenuItem], cx, cy);
 
   // Status lines (keep readable; don't cram everything onto one line)
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
   const String line1 = String(runDistanceM, 2) + "m / " + String(runTimeS, 1) + "s";
-  ui.drawString(line1, 120, 195);
+  ui.drawString(line1, cx, ui.height() - 40);
 
   ui.setTextColor(TFT_WHITE);
   const String line2 = (canDistanceM >= CAN_ENABLE_MIN_M) ? (String("CAN DIST: ") + String(canDistanceM, 2) + "m") : String("CAN DIST: OFF");
-  ui.drawString(line2, 120, 220);
+  ui.drawString(line2, cx, ui.height() - 15);
 
   ui.setTextSize(1);
 }
@@ -3926,28 +3926,29 @@ static void drawSetCanDistance() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(FW_VERSION, 120, 2);
+  const int cx = ui.width() / 2;
+  ui.drawString(FW_VERSION, cx, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("CAN DIST", 120, 25);
+  ui.drawString("CAN DIST", cx, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", 120, 55);
-  ui.drawString("Distance between", 120, 70);
-  ui.drawString("inside can edges", 120, 85);
-  ui.drawString("0 = straight run", 120, 100);
+  ui.drawString("Turn dial to adjust", cx, 55);
+  ui.drawString("Distance between", cx, 70);
+  ui.drawString("inside can edges", cx, 85);
+  ui.drawString("0 = straight run", cx, 100);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(4);
-  ui.drawString(String(canDistanceM, 2), 120, 115);
+  ui.drawString(String(canDistanceM, 2), cx, 115);
   ui.setTextSize(2);
-  ui.drawString("meters", 120, 155);
+  ui.drawString("meters", cx, 155);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString("Press to save", 120, 210);
+  ui.drawString("Press to save", cx, 210);
   ui.setTextSize(1);
 }
 
