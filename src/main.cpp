@@ -4270,6 +4270,7 @@ void testMotorFormats() {
   Serial.println("\n=== END DIAGNOSTIC ===\n");
 }
 
+#ifndef TEST_BUILD
 void scanI2CBus() {
   Serial.println("\n=== I2C BUS SCAN ===");
   Serial.println("Scanning I2C addresses 0x00-0x7F...\n");
@@ -4298,6 +4299,7 @@ void scanI2CBus() {
   Serial.printf("\nTotal devices found: %d\n", devices_found);
   Serial.println("===========================\n");
 }
+#endif // TEST_BUILD
 
 void updateDisplay() {
   ui.fillScreen(TFT_BLACK);
@@ -4448,6 +4450,7 @@ static void runBootMotorSpinTest() {
   showBootMotorTestScreen("STOPPED", "Boot test complete", "(interactive control disabled)");
 }
 
+#ifndef TEST_BUILD
 void setup() {
   // Initialize serial immediately
   Serial.begin(115200);
@@ -4619,6 +4622,7 @@ void setup() {
   renderCurrentScreen();
 }
 
+#ifndef TEST_BUILD
 void loop() {
   M5.update();
 
@@ -4693,6 +4697,8 @@ void loop() {
     stopRun();
     return;
   }
+}
+#endif // TEST_BUILD
 
   // Always keep sensor polling active (I2C)
   readWheelEncoders();
