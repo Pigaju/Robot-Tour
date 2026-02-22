@@ -4,16 +4,12 @@
 #include <string.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
-#ifdef ESP32
-  #include <esp_system.h>
-#endif
+#include <esp_system.h>
 
 #include <time.h>
 #include <sys/time.h>
 
-#ifdef ESP32
-  #include <esp_heap_caps.h>
-#endif
+#include <esp_heap_caps.h>
 
 // Optional WiFi + cloud uploader (posts the saved CSV to a webhook)
 // Disabled for track testing (keeps firmware focused on control + local logging).
@@ -79,7 +75,7 @@ static bool cloudUploadLastRunCsv();
 // a logical "forward" command makes both wheels propel forward.
 #define INVERT_LEFT_MOTOR_DIRECTION 1
 // If the *right* motor needs reversing to match "forward".
-#define INVERT_RIGHT_MOTOR_DIRECTION 0
+#define INVERT_RIGHT_MOTOR_DIRECTION 1
 
 // Dial direction: set so turning RIGHT increases values.
 // If the dial feels backwards, flip this to -1.
@@ -174,11 +170,21 @@ static uint16_t control_period_ms = CONTROL_PERIOD_MS;
 
 // Double-buffered drawing surface (sprite)
 static M5Canvas ui(&M5.Display);
+#define CX (M5.Display.width()/2)
 
 // I2C speed: higher can reduce loop blocking/phase lag, but only if your wiring/devices are stable.
 // We default to 100kHz because 400kHz can cause intermittent I2C failures on some setups (long wires/noisy power),
 // which is much worse (no encoder updates => no stop, no steering).
 #define I2C_CLOCK_HZ 100000
+
+// I2C bus guard delay (µs) between back-to-back transactions.
+// Prevents bus contention when 5 devices share the bus (2 motors, 2 encoders, IMU).
+#define I2C_GUARD_US 150
+static inline void i2cGuard() { delayMicroseconds(I2C_GUARD_US); }
+
+// I2C consecutive error tracking for automatic bus recovery
+static uint16_t i2c_consecutive_errors = 0;
+static uint32_t i2c_total_errors = 0;
 
 static const uint32_t i2c_clock_hz = I2C_CLOCK_HZ;
 
@@ -2064,12 +2070,12 @@ static void showBVSplashScreen() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_BLUE);
   ui.setTextSize(3);
-  ui.drawString("BLUE VALLEY", 120, 80);
-  ui.drawString("NORTH", 120, 110);
+  ui.drawString("BLUE VALLEY", CX, 80);
+  ui.drawString("NORTH", CX, 110);
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString("Science Olympiad", 120, 150);
-  ui.drawString("E.V. 2025-26", 120, 170);
+  ui.drawString("Science Olympiad", CX, 150);
+  ui.drawString("E.V. 2025-26", CX, 170);
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
 }
@@ -2078,16 +2084,16 @@ static void showImuCountdownScreen(int secondsLeft) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("IMU CAL", 120, 25);
+  ui.drawString("IMU CAL", CX, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Keep car still", 120, 55);
-  ui.drawString("Calibration starts in", 120, 80);
+  ui.drawString("Keep car still", CX, 55);
+  ui.drawString("Calibration starts in", CX, 80);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(5);
-  ui.drawString(String(secondsLeft), 120, 140);
+  ui.drawString(String(secondsLeft), CX, 140);
 
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
@@ -2097,18 +2103,18 @@ static void showImuReadyScreen(float biasZ) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
-  ui.drawString("READY TO RACE", 120, 60);
+  ui.drawString("READY TO RACE", CX, 60);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("Gyro Z bias (dps)", 120, 105);
+  ui.drawString("Gyro Z bias (dps)", CX, 105);
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString(String(biasZ, 2), 120, 130);
+  ui.drawString(String(biasZ, 2), CX, 130);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("OK to move car", 120, 200);
+  ui.drawString("OK to move car", CX, 200);
 
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
@@ -2118,22 +2124,22 @@ static void showImuCalScreen(int pct, float biasZ) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("IMU CAL", 120, 25);
+  ui.drawString("IMU CAL", CX, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Keep car still", 120, 55);
+  ui.drawString("Keep car still", CX, 55);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString(String(pct) + "%", 120, 90);
+  ui.drawString(String(pct) + "%", CX, 90);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("Gyro Z bias (dps)", 120, 130);
+  ui.drawString("Gyro Z bias (dps)", CX, 130);
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
-  ui.drawString(String(biasZ, 2), 120, 155);
+  ui.drawString(String(biasZ, 2), CX, 155);
 
   ui.pushSprite(0, 0);
 }
@@ -2331,6 +2337,7 @@ static bool imu6886ReadBytes(uint8_t reg, uint8_t* buf, size_t len) {
   for (size_t i = 0; i < len; i++) {
     buf[i] = (uint8_t)Wire.read();
   }
+  i2cGuard();  // guard delay after IMU burst read
   return true;
 }
 
@@ -3409,12 +3416,11 @@ static void readWheelEncodersInternal(bool force) {
   encoderL_found = false;
   encoderR_found = false;
 
-  // Only attempt requestFrom() if the device ACKs at all.
-  if (i2cPing(ENCODER_L_ADDR)) {
+  // Read left encoder directly (skip i2cPing — reduces bus traffic by 2 transactions)
+  {
     Wire.beginTransmission(ENCODER_L_ADDR);
     Wire.write((uint8_t)0x00);
-    if (Wire.endTransmission(true) == 0) {
-      delayMicroseconds(200);
+    if (Wire.endTransmission(false) == 0) {  // repeated-start, keeps bus held
       if (Wire.requestFrom((uint8_t)ENCODER_L_ADDR, (size_t)4) == 4 && Wire.available() >= 4) {
         int32_t value = 0;
         value |= (int32_t)Wire.read() << 0;
@@ -3427,11 +3433,13 @@ static void readWheelEncodersInternal(bool force) {
     }
   }
 
-  if (i2cPing(ENCODER_R_ADDR)) {
+  i2cGuard();  // pause between encoder reads
+
+  // Read right encoder directly
+  {
     Wire.beginTransmission(ENCODER_R_ADDR);
     Wire.write((uint8_t)0x00);
-    if (Wire.endTransmission(true) == 0) {
-      delayMicroseconds(200);
+    if (Wire.endTransmission(false) == 0) {  // repeated-start
       if (Wire.requestFrom((uint8_t)ENCODER_R_ADDR, (size_t)4) == 4 && Wire.available() >= 4) {
         int32_t value = 0;
         value |= (int32_t)Wire.read() << 0;
@@ -3443,6 +3451,8 @@ static void readWheelEncodersInternal(bool force) {
       }
     }
   }
+
+  i2cGuard();  // settle before next I2C user
 }
 
 void driveMotor(uint8_t motor_addr, uint8_t direction, uint8_t speed) {
@@ -3482,10 +3492,20 @@ void driveMotor(uint8_t motor_addr, uint8_t direction, uint8_t speed) {
   Wire.write(reg_dir);
   err_dir = Wire.endTransmission(true);
 
+  i2cGuard();  // settle between direction and speed writes
+
   Wire.beginTransmission(motor_addr);
   Wire.write(0x01);
   Wire.write(pwm);
   err_pwm = Wire.endTransmission(true);
+
+  // Track I2C bus health
+  if (err_dir != 0 || err_pwm != 0) {
+    i2c_consecutive_errors++;
+    i2c_total_errors++;
+  } else {
+    i2c_consecutive_errors = 0;
+  }
 
   // Store last I2C status so we can see whether 0x20/0x21 are ACKing.
   if (motor_addr == MOTOR_L_ADDR) {
@@ -3511,6 +3531,8 @@ void driveMotor(uint8_t motor_addr, uint8_t direction, uint8_t speed) {
     }
   }
 #endif
+
+  i2cGuard();  // guard delay after motor write
 }
 
 static bool i2cPing(uint8_t addr) {
@@ -3521,8 +3543,7 @@ static bool i2cPing(uint8_t addr) {
 static bool readReg8(uint8_t addr, uint8_t reg, uint8_t* out) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
-  if (Wire.endTransmission(true) != 0) return false;
-  delayMicroseconds(200);
+  if (Wire.endTransmission(false) != 0) return false;  // repeated-start
   if (Wire.requestFrom((uint8_t)addr, (size_t)1) != 1) return false;
   if (!Wire.available()) return false;
   *out = Wire.read();
@@ -3530,25 +3551,34 @@ static bool readReg8(uint8_t addr, uint8_t reg, uint8_t* out) {
 }
 
 static void updateMotorDiagnostics() {
-  motorL_present = i2cPing(MOTOR_L_ADDR);
-  motorR_present = i2cPing(MOTOR_R_ADDR);
+  // Infer presence from last write errors (avoids extra i2cPing traffic)
+  motorL_present = (motorL_err_dir == 0);
+  motorR_present = (motorR_err_dir == 0);
 
-  if (motorL_present) {
-    uint8_t v;
-    if (readReg8(MOTOR_L_ADDR, 0x00, &v)) motorL_dir_rb = v;
-    if (readReg8(MOTOR_L_ADDR, 0x01, &v)) motorL_spd_rb = v;
-  } else {
-    motorL_dir_rb = 0xFF;
-    motorL_spd_rb = 0xFF;
-  }
+  // Only do full readback when motors are idle (no active run)
+  if (motor_l_speed == 0 && motor_r_speed == 0) {
+    i2cGuard();
+    if (i2cPing(MOTOR_L_ADDR)) {
+      motorL_present = true;
+      uint8_t v;
+      if (readReg8(MOTOR_L_ADDR, 0x00, &v)) motorL_dir_rb = v;
+      if (readReg8(MOTOR_L_ADDR, 0x01, &v)) motorL_spd_rb = v;
+    } else {
+      motorL_dir_rb = 0xFF;
+      motorL_spd_rb = 0xFF;
+    }
 
-  if (motorR_present) {
-    uint8_t v;
-    if (readReg8(MOTOR_R_ADDR, 0x00, &v)) motorR_dir_rb = v;
-    if (readReg8(MOTOR_R_ADDR, 0x01, &v)) motorR_spd_rb = v;
-  } else {
-    motorR_dir_rb = 0xFF;
-    motorR_spd_rb = 0xFF;
+    i2cGuard();
+    if (i2cPing(MOTOR_R_ADDR)) {
+      motorR_present = true;
+      uint8_t v;
+      if (readReg8(MOTOR_R_ADDR, 0x00, &v)) motorR_dir_rb = v;
+      if (readReg8(MOTOR_R_ADDR, 0x01, &v)) motorR_spd_rb = v;
+    } else {
+      motorR_dir_rb = 0xFF;
+      motorR_spd_rb = 0xFF;
+    }
+    i2cGuard();
   }
 }
 
@@ -3564,6 +3594,8 @@ static void hbridgeWriteDirectionSpeed8(uint8_t motor_addr, uint8_t direction, u
   Wire.write(direction);
   e0 = Wire.endTransmission(true);
 
+  i2cGuard();
+
   Wire.beginTransmission(motor_addr);
   Wire.write((uint8_t)0x01);
   Wire.write(speed);
@@ -3571,6 +3603,8 @@ static void hbridgeWriteDirectionSpeed8(uint8_t motor_addr, uint8_t direction, u
 
   if (err_dir) *err_dir = e0;
   if (err_spd) *err_spd = e1;
+
+  i2cGuard();
 }
 
 void stopAllMotors() {
@@ -3811,25 +3845,26 @@ static void drawSetDistance() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(FW_VERSION, 120, 2);
+  const int cx = ui.width() / 2;
+  ui.drawString(FW_VERSION, cx, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("SET DISTANCE", 120, 25);
+  ui.drawString("SET DISTANCE", cx, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", 120, 55);
+  ui.drawString("Turn dial to adjust", cx, 55);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(4);
-  ui.drawString(String(runDistanceM, 2), 120, 115);
+  ui.drawString(String(runDistanceM, 2), cx, 115);
   ui.setTextSize(2);
-  ui.drawString("meters", 120, 155);
+  ui.drawString("meters", cx, 155);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString("Press to save", 120, 210);
+  ui.drawString("Press to save", cx, 210);
   ui.setTextSize(1);
 }
 
@@ -3837,51 +3872,53 @@ static void drawSetControlMode() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(FW_VERSION, 120, 2);
+  const int cx = ui.width() / 2;
+  ui.drawString(FW_VERSION, cx, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("CTRL MODE", 120, 25);
+  ui.drawString("CTRL MODE", cx, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", 120, 55);
-  ui.drawString("Click to save", 120, 70);
+  ui.drawString("Turn dial to adjust", cx, 55);
+  ui.drawString("Click to save", cx, 70);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(3);
-  ui.drawString(controlModeName(control_mode), 120, 125);
+  ui.drawString(controlModeName(control_mode), cx, 125);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("IMU = gyro heading hold", 120, 170);
-  ui.drawString("ENC = rate match only", 120, 185);
-  ui.drawString("HYBRID = ENC + IMU", 120, 200);
+  ui.drawString("IMU = gyro heading hold", cx, 170);
+  ui.drawString("ENC = rate match only", cx, 185);
+  ui.drawString("HYBRID = ENC + IMU", cx, 200);
 }
 
 static void drawSetTime() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(FW_VERSION, 120, 2);
+  const int cx = ui.width() / 2;
+  ui.drawString(FW_VERSION, cx, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("SET TIME", 120, 25);
+  ui.drawString("SET TIME", cx, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", 120, 55);
+  ui.drawString("Turn dial to adjust", cx, 55);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(4);
-  ui.drawString(String(runTimeS, 1), 120, 115);
+  ui.drawString(String(runTimeS, 1), cx, 115);
   ui.setTextSize(2);
-  ui.drawString("seconds", 120, 155);
+  ui.drawString("seconds", cx, 155);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString("Press to save", 120, 210);
+  ui.drawString("Press to save", cx, 210);
   ui.setTextSize(1);
 }
 
@@ -4263,51 +4300,52 @@ void scanI2CBus() {
 
 void updateDisplay() {
   ui.fillScreen(TFT_BLACK);
+  const int cx = ui.width() / 2;
 
   // Title
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("HW TEST", 120, 15);
+  ui.drawString("HW TEST", cx, 15);
 
   // I2C clock status
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(String("I2C: ") + String((unsigned)(i2c_clock_hz / 1000u)) + " kHz", 120, 30);
-  ui.drawString("Hold BtnA: exit", 120, 45);
+  ui.drawString(String("I2C: ") + String((unsigned)(i2c_clock_hz / 1000u)) + " kHz", cx, 30);
+  ui.drawString("Hold BtnA: exit", cx, 45);
  
   // Selected motor
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Motor:", 120, 65);
+  ui.drawString("Motor:", cx, 65);
  
   ui.setTextColor(selected_motor == 0 ? TFT_GREEN : TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString(selected_motor == 0 ? "LEFT" : "RIGHT", 120, 85);
+  ui.drawString(selected_motor == 0 ? "LEFT" : "RIGHT", cx, 85);
  
   // Speed display
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Speed (+/-):", 120, 110);
+  ui.drawString("Speed (+/-):", cx, 110);
  
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
   char spd_str[16];
   snprintf(spd_str, sizeof(spd_str), "%d", (int)motor_command);
-  ui.drawString(spd_str, 120, 135);
+  ui.drawString(spd_str, cx, 135);
 
   // Legend (use sign for direction)
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
 #if INVERT_MOTOR_DIRECTION
-  ui.drawString("+ = REV   - = FWD", 120, 160);
+  ui.drawString("+ = REV   - = FWD", cx, 160);
 #else
-  ui.drawString("+ = FWD   - = REV", 120, 160);
+  ui.drawString("+ = FWD   - = REV", cx, 160);
 #endif
 
   // Exit hint
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Hold BtnA: MENU", 120, 172);
+  ui.drawString("Hold BtnA: MENU", cx, 172);
 
   // IMU attitude (degrees)
   ui.setTextSize(1);
@@ -4318,10 +4356,10 @@ void updateDisplay() {
     // Display as X/Y/Z degrees for your test harness
     snprintf(imu1, sizeof(imu1), "IMU deg  X:% .1f  Y:% .1f", (double)imu_roll, (double)imu_pitch);
     snprintf(imu2, sizeof(imu2), "         Z:% .1f", (double)imu_yaw);
-    ui.drawString(imu1, 120, 182);
-    ui.drawString(imu2, 120, 194);
+    ui.drawString(imu1, cx, 182);
+    ui.drawString(imu2, cx, 194);
   } else {
-    ui.drawString("IMU deg  X:--  Y:--  Z:--", 120, 188);
+    ui.drawString("IMU deg  X:--  Y:--  Z:--", cx, 188);
   }
 
 
@@ -4334,23 +4372,27 @@ void updateDisplay() {
   else snprintf(lbuf, sizeof(lbuf), "L:--");
   if (encoderR_found) snprintf(rbuf, sizeof(rbuf), "R:%ld", encoderR_count);
   else snprintf(rbuf, sizeof(rbuf), "R:--");
-  ui.drawString(lbuf, 120, 210);
-  ui.drawString(rbuf, 120, 230);
+  ui.drawString(lbuf, cx, 210);
+  ui.drawString(rbuf, cx, 230);
 }
 
 static void showBootMotorTestScreen(const char* line1, const char* line2, const char* line3) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextDatum(middle_center);
 
+  const int cx = ui.width() / 2;
+  const int left_x = cx - 60;
+  const int right_x = cx + 60;
+
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("BOOT MOTOR TEST", 120, 30);
+  ui.drawString("BOOT MOTOR TEST", cx, 30);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  if (line1) ui.drawString(line1, 120, 80);
-  if (line2) ui.drawString(line2, 120, 100);
-  if (line3) ui.drawString(line3, 120, 120);
+  if (line1) ui.drawString(line1, cx, 80);
+  if (line2) ui.drawString(line2, cx, 100);
+  if (line3) ui.drawString(line3, cx, 120);
 
   ui.setTextColor(TFT_BLUE);
   ui.setTextSize(1);
@@ -4360,8 +4402,8 @@ static void showBootMotorTestScreen(const char* line1, const char* line2, const 
   else snprintf(lbuf, sizeof(lbuf), "L:--");
   if (encoderR_found) snprintf(rbuf, sizeof(rbuf), "R:%ld", encoderR_count);
   else snprintf(rbuf, sizeof(rbuf), "R:--");
-  ui.drawString(lbuf, 60, 210);
-  ui.drawString(rbuf, 180, 210);
+  ui.drawString(lbuf, left_x, 210);
+  ui.drawString(rbuf, right_x, 210);
 
   ui.pushSprite(0, 0);
 }
@@ -4655,7 +4697,7 @@ void loop() {
   readWheelEncoders();
 
   static unsigned long lastMotorDiag = 0;
-  if (now - lastMotorDiag > 500) {
+  if (now - lastMotorDiag > 1000) {   // reduced from 500ms to 1000ms to cut bus traffic
     lastMotorDiag = now;
     updateMotorDiagnostics();
   }
