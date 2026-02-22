@@ -4,12 +4,16 @@
 #include <string.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
-#include <esp_system.h>
+#ifdef ESP32
+  #include <esp_system.h>
+#endif
 
 #include <time.h>
 #include <sys/time.h>
 
-#include <esp_heap_caps.h>
+#ifdef ESP32
+  #include <esp_heap_caps.h>
+#endif
 
 // Optional WiFi + cloud uploader (posts the saved CSV to a webhook)
 // Disabled for track testing (keeps firmware focused on control + local logging).
