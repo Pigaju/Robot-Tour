@@ -170,7 +170,6 @@ static uint16_t control_period_ms = CONTROL_PERIOD_MS;
 
 // Double-buffered drawing surface (sprite)
 static M5Canvas ui(&M5.Display);
-#define CX (M5.Display.width()/2)
 
 // I2C speed: higher can reduce loop blocking/phase lag, but only if your wiring/devices are stable.
 // We default to 100kHz because 400kHz can cause intermittent I2C failures on some setups (long wires/noisy power),
@@ -2070,12 +2069,12 @@ static void showBVSplashScreen() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_BLUE);
   ui.setTextSize(3);
-  ui.drawString("BLUE VALLEY", CX, 80);
-  ui.drawString("NORTH", CX, 110);
+  ui.drawString("BLUE VALLEY", 120, 80);
+  ui.drawString("NORTH", 120, 110);
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString("Science Olympiad", CX, 150);
-  ui.drawString("E.V. 2025-26", CX, 170);
+  ui.drawString("Science Olympiad", 120, 150);
+  ui.drawString("E.V. 2025-26", 120, 170);
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
 }
@@ -2084,16 +2083,16 @@ static void showImuCountdownScreen(int secondsLeft) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("IMU CAL", CX, 25);
+  ui.drawString("IMU CAL", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Keep car still", CX, 55);
-  ui.drawString("Calibration starts in", CX, 80);
+  ui.drawString("Keep car still", 120, 55);
+  ui.drawString("Calibration starts in", 120, 80);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(5);
-  ui.drawString(String(secondsLeft), CX, 140);
+  ui.drawString(String(secondsLeft), 120, 140);
 
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
@@ -2103,18 +2102,18 @@ static void showImuReadyScreen(float biasZ) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
-  ui.drawString("READY TO RACE", CX, 60);
+  ui.drawString("READY TO RACE", 120, 60);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("Gyro Z bias (dps)", CX, 105);
+  ui.drawString("Gyro Z bias (dps)", 120, 105);
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString(String(biasZ, 2), CX, 130);
+  ui.drawString(String(biasZ, 2), 120, 130);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("OK to move car", CX, 200);
+  ui.drawString("OK to move car", 120, 200);
 
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
@@ -2124,22 +2123,22 @@ static void showImuCalScreen(int pct, float biasZ) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("IMU CAL", CX, 25);
+  ui.drawString("IMU CAL", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Keep car still", CX, 55);
+  ui.drawString("Keep car still", 120, 55);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString(String(pct) + "%", CX, 90);
+  ui.drawString(String(pct) + "%", 120, 90);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("Gyro Z bias (dps)", CX, 130);
+  ui.drawString("Gyro Z bias (dps)", 120, 130);
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
-  ui.drawString(String(biasZ, 2), CX, 155);
+  ui.drawString(String(biasZ, 2), 120, 155);
 
   ui.pushSprite(0, 0);
 }
@@ -3795,20 +3794,20 @@ static void drawMainMenu() {
   // If the critical devices aren't present, do not start the run (safer than open-loop).
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  const int cy = ui.height() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(1);
-  ui.drawString("MENU", cx, 15);
+  ui.drawString("MENU", 120, 15);
 
-  float radius = min(cx, cy) - 50.0f;
+  float radius = 70.0f;
+  float centerX = 120.0f;
+  float centerY = 120.0f;
 
   for (int i = 0; i < NUM_MENU_ITEMS; i++) {
     float angle = (i * (360.0f / NUM_MENU_ITEMS) - 90.0f) * (float)M_PI / 180.0f;
-    float itemX = cx + radius * cosf(angle);
-    float itemY = cy + radius * sinf(angle);
+    float itemX = centerX + radius * cosf(angle);
+    float itemY = centerY + radius * sinf(angle);
 
     if (i == selectedMenuItem) {
       ui.fillCircle(itemX, itemY, 30, TFT_DARKGREEN);
@@ -3826,17 +3825,17 @@ static void drawMainMenu() {
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
-  ui.drawString(menuNames[selectedMenuItem], cx, cy);
+  ui.drawString(menuNames[selectedMenuItem], centerX, centerY);
 
   // Status lines (keep readable; don't cram everything onto one line)
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
   const String line1 = String(runDistanceM, 2) + "m / " + String(runTimeS, 1) + "s";
-  ui.drawString(line1, cx, ui.height() - 40);
+  ui.drawString(line1, 120, 195);
 
   ui.setTextColor(TFT_WHITE);
   const String line2 = (canDistanceM >= CAN_ENABLE_MIN_M) ? (String("CAN DIST: ") + String(canDistanceM, 2) + "m") : String("CAN DIST: OFF");
-  ui.drawString(line2, cx, ui.height() - 15);
+  ui.drawString(line2, 120, 220);
 
   ui.setTextSize(1);
 }
@@ -3845,26 +3844,25 @@ static void drawSetDistance() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("SET DISTANCE", cx, 25);
+  ui.drawString("SET DISTANCE", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", cx, 55);
+  ui.drawString("Turn dial to adjust", 120, 55);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(4);
-  ui.drawString(String(runDistanceM, 2), cx, 115);
+  ui.drawString(String(runDistanceM, 2), 120, 115);
   ui.setTextSize(2);
-  ui.drawString("meters", cx, 155);
+  ui.drawString("meters", 120, 155);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString("Press to save", cx, 210);
+  ui.drawString("Press to save", 120, 210);
   ui.setTextSize(1);
 }
 
@@ -3872,53 +3870,51 @@ static void drawSetControlMode() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("CTRL MODE", cx, 25);
+  ui.drawString("CTRL MODE", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", cx, 55);
-  ui.drawString("Click to save", cx, 70);
+  ui.drawString("Turn dial to adjust", 120, 55);
+  ui.drawString("Click to save", 120, 70);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(3);
-  ui.drawString(controlModeName(control_mode), cx, 125);
+  ui.drawString(controlModeName(control_mode), 120, 125);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("IMU = gyro heading hold", cx, 170);
-  ui.drawString("ENC = rate match only", cx, 185);
-  ui.drawString("HYBRID = ENC + IMU", cx, 200);
+  ui.drawString("IMU = gyro heading hold", 120, 170);
+  ui.drawString("ENC = rate match only", 120, 185);
+  ui.drawString("HYBRID = ENC + IMU", 120, 200);
 }
 
 static void drawSetTime() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("SET TIME", cx, 25);
+  ui.drawString("SET TIME", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", cx, 55);
+  ui.drawString("Turn dial to adjust", 120, 55);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(4);
-  ui.drawString(String(runTimeS, 1), cx, 115);
+  ui.drawString(String(runTimeS, 1), 120, 115);
   ui.setTextSize(2);
-  ui.drawString("seconds", cx, 155);
+  ui.drawString("seconds", 120, 155);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString("Press to save", cx, 210);
+  ui.drawString("Press to save", 120, 210);
   ui.setTextSize(1);
 }
 
@@ -3926,29 +3922,28 @@ static void drawSetCanDistance() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("CAN DIST", cx, 25);
+  ui.drawString("CAN DIST", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", cx, 55);
-  ui.drawString("Distance between", cx, 70);
-  ui.drawString("inside can edges", cx, 85);
-  ui.drawString("0 = straight run", cx, 100);
+  ui.drawString("Turn dial to adjust", 120, 55);
+  ui.drawString("Distance between", 120, 70);
+  ui.drawString("inside can edges", 120, 85);
+  ui.drawString("0 = straight run", 120, 100);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(4);
-  ui.drawString(String(canDistanceM, 2), cx, 115);
+  ui.drawString(String(canDistanceM, 2), 120, 115);
   ui.setTextSize(2);
-  ui.drawString("meters", cx, 155);
+  ui.drawString("meters", 120, 155);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString("Press to save", cx, 210);
+  ui.drawString("Press to save", 120, 210);
   ui.setTextSize(1);
 }
 
@@ -4133,38 +4128,38 @@ static void drawRunScreen() {
 static void drawBfsNavScreen(int bfs_setup_step) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_CYAN);
-  ui.setTextSize(2);
-  ui.drawString("BFS PATHFINDING", 120, 30);
+  ui.setTextSize(1);
+  ui.drawString("BFS PATHFINDING", 120, 10);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
   
-  // Show current setup step
+  // Show current setup step with more compact spacing
   ui.setTextColor(bfs_setup_step == 0 ? TFT_YELLOW : TFT_DARKGREY);
-  ui.drawString("Start Node:", 30, 80);
-  ui.drawString(bfs_state.nodes[bfs_start_node].name, 160, 80);
+  ui.drawString("Start:", 30, 40);
+  ui.drawString(bfs_state.nodes[bfs_start_node].name, 120, 40);
   
   ui.setTextColor(bfs_setup_step == 1 ? TFT_YELLOW : TFT_DARKGREY);
-  ui.drawString("Goal Node:", 30, 110);
-  ui.drawString(bfs_state.nodes[bfs_goal_node].name, 160, 110);
+  ui.drawString("Goal:", 30, 60);
+  ui.drawString(bfs_state.nodes[bfs_goal_node].name, 120, 60);
   
-  // Show all available nodes as reference
+  // Show all available nodes in a single compact line
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("Nodes:", 30, 150);
+  ui.drawString("Nodes:", 30, 85);
   
-  char nodeList[64] = "";
+  char nodeList[96] = "";
   for (uint8_t i = 0; i < bfs_state.node_count; i++) {
     if (i > 0) strcat(nodeList, " ");
     strcat(nodeList, bfs_state.nodes[i].name);
   }
-  ui.drawString(nodeList, 30, 165);
+  ui.drawString(nodeList, 30, 100);
   
   // Instructions
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to select, click to toggle", 30, 190);
-  ui.drawString("Press & hold to start navigation", 30, 205);
+  ui.drawString("Dial: select | Click: toggle", 120, 140);
+  ui.drawString("Hold: start navigation", 120, 155);
 }
 
 static void renderCurrentScreen() {
@@ -4270,7 +4265,6 @@ void testMotorFormats() {
   Serial.println("\n=== END DIAGNOSTIC ===\n");
 }
 
-#ifndef TEST_BUILD
 void scanI2CBus() {
   Serial.println("\n=== I2C BUS SCAN ===");
   Serial.println("Scanning I2C addresses 0x00-0x7F...\n");
@@ -4299,56 +4293,54 @@ void scanI2CBus() {
   Serial.printf("\nTotal devices found: %d\n", devices_found);
   Serial.println("===========================\n");
 }
-#endif // TEST_BUILD
 
 void updateDisplay() {
   ui.fillScreen(TFT_BLACK);
-  const int cx = ui.width() / 2;
 
   // Title
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("HW TEST", cx, 15);
+  ui.drawString("HW TEST", 120, 15);
 
   // I2C clock status
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(String("I2C: ") + String((unsigned)(i2c_clock_hz / 1000u)) + " kHz", cx, 30);
-  ui.drawString("Hold BtnA: exit", cx, 45);
+  ui.drawString(String("I2C: ") + String((unsigned)(i2c_clock_hz / 1000u)) + " kHz", 120, 30);
+  ui.drawString("Hold BtnA: exit", 120, 45);
  
   // Selected motor
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Motor:", cx, 65);
+  ui.drawString("Motor:", 120, 65);
  
   ui.setTextColor(selected_motor == 0 ? TFT_GREEN : TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString(selected_motor == 0 ? "LEFT" : "RIGHT", cx, 85);
+  ui.drawString(selected_motor == 0 ? "LEFT" : "RIGHT", 120, 85);
  
   // Speed display
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Speed (+/-):", cx, 110);
+  ui.drawString("Speed (+/-):", 120, 110);
  
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
   char spd_str[16];
   snprintf(spd_str, sizeof(spd_str), "%d", (int)motor_command);
-  ui.drawString(spd_str, cx, 135);
+  ui.drawString(spd_str, 120, 135);
 
   // Legend (use sign for direction)
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
 #if INVERT_MOTOR_DIRECTION
-  ui.drawString("+ = REV   - = FWD", cx, 160);
+  ui.drawString("+ = REV   - = FWD", 120, 160);
 #else
-  ui.drawString("+ = FWD   - = REV", cx, 160);
+  ui.drawString("+ = FWD   - = REV", 120, 160);
 #endif
 
   // Exit hint
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Hold BtnA: MENU", cx, 172);
+  ui.drawString("Hold BtnA: MENU", 120, 172);
 
   // IMU attitude (degrees)
   ui.setTextSize(1);
@@ -4359,10 +4351,10 @@ void updateDisplay() {
     // Display as X/Y/Z degrees for your test harness
     snprintf(imu1, sizeof(imu1), "IMU deg  X:% .1f  Y:% .1f", (double)imu_roll, (double)imu_pitch);
     snprintf(imu2, sizeof(imu2), "         Z:% .1f", (double)imu_yaw);
-    ui.drawString(imu1, cx, 182);
-    ui.drawString(imu2, cx, 194);
+    ui.drawString(imu1, 120, 182);
+    ui.drawString(imu2, 120, 194);
   } else {
-    ui.drawString("IMU deg  X:--  Y:--  Z:--", cx, 188);
+    ui.drawString("IMU deg  X:--  Y:--  Z:--", 120, 188);
   }
 
 
@@ -4375,27 +4367,23 @@ void updateDisplay() {
   else snprintf(lbuf, sizeof(lbuf), "L:--");
   if (encoderR_found) snprintf(rbuf, sizeof(rbuf), "R:%ld", encoderR_count);
   else snprintf(rbuf, sizeof(rbuf), "R:--");
-  ui.drawString(lbuf, cx, 210);
-  ui.drawString(rbuf, cx, 230);
+  ui.drawString(lbuf, 120, 210);
+  ui.drawString(rbuf, 120, 230);
 }
 
 static void showBootMotorTestScreen(const char* line1, const char* line2, const char* line3) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextDatum(middle_center);
 
-  const int cx = ui.width() / 2;
-  const int left_x = cx - 60;
-  const int right_x = cx + 60;
-
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("BOOT MOTOR TEST", cx, 30);
+  ui.drawString("BOOT MOTOR TEST", 120, 30);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  if (line1) ui.drawString(line1, cx, 80);
-  if (line2) ui.drawString(line2, cx, 100);
-  if (line3) ui.drawString(line3, cx, 120);
+  if (line1) ui.drawString(line1, 120, 80);
+  if (line2) ui.drawString(line2, 120, 100);
+  if (line3) ui.drawString(line3, 120, 120);
 
   ui.setTextColor(TFT_BLUE);
   ui.setTextSize(1);
@@ -4405,8 +4393,8 @@ static void showBootMotorTestScreen(const char* line1, const char* line2, const 
   else snprintf(lbuf, sizeof(lbuf), "L:--");
   if (encoderR_found) snprintf(rbuf, sizeof(rbuf), "R:%ld", encoderR_count);
   else snprintf(rbuf, sizeof(rbuf), "R:--");
-  ui.drawString(lbuf, left_x, 210);
-  ui.drawString(rbuf, right_x, 210);
+  ui.drawString(lbuf, 60, 210);
+  ui.drawString(rbuf, 180, 210);
 
   ui.pushSprite(0, 0);
 }
@@ -4450,7 +4438,6 @@ static void runBootMotorSpinTest() {
   showBootMotorTestScreen("STOPPED", "Boot test complete", "(interactive control disabled)");
 }
 
-#ifndef TEST_BUILD
 void setup() {
   // Initialize serial immediately
   Serial.begin(115200);
@@ -4622,7 +4609,6 @@ void setup() {
   renderCurrentScreen();
 }
 
-#ifndef TEST_BUILD
 void loop() {
   M5.update();
 
@@ -4630,6 +4616,18 @@ void loop() {
   handleSerialCommands();
 
   const unsigned long now = millis();
+
+  // === BEST FIX: Track screen changes and reset BFS state ===
+  static ScreenState lastScreen = SCREEN_MAIN_MENU;
+  static int bfs_setup_step = 0;
+  
+  if (currentScreen != lastScreen) {
+    // Screen changed - reset state
+    if (currentScreen == SCREEN_BFS_NAV) {
+      bfs_setup_step = 0;  // Reset to selecting start node
+    }
+    lastScreen = currentScreen;
+  }
 
 #if RUN_CLOUD_UPLOAD_ENABLE
 #if RUN_CLOUD_UPLOAD_ON_STOP
@@ -4697,8 +4695,6 @@ void loop() {
     stopRun();
     return;
   }
-}
-#endif // TEST_BUILD
 
   // Always keep sensor polling active (I2C)
   readWheelEncoders();

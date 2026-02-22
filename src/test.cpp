@@ -1,3 +1,5 @@
+#ifdef TEST_BUILD
+
 #include <M5Dial.h>
 #include <Wire.h>
 
@@ -227,3 +229,5 @@ void loop() {
         testEncoderReading();
     }
 }
+
+#endif // TEST_BUILD
