@@ -2453,6 +2453,7 @@ enum ScreenState {
   SCREEN_SET_CTRL_MODE,
   SCREEN_HW_TEST,
   SCREEN_BFS_NAV,
+  SCREEN_BFS_RUN,
 };
 
 static ScreenState currentScreen = SCREEN_MAIN_MENU;
@@ -2479,6 +2480,33 @@ static bool bfs_run_active = false;    // Currently executing BFS path
 static uint8_t bfs_current_target = 0; // Current target waypoint in path
 static float bfs_target_distance = 0.0f;
 static float bfs_target_angle = 0.0f;
+static int bfs_setup_step = 0;         // 0=selecting start, 1=selecting goal
+
+// BFS Run state machine
+enum BfsRunPhase {
+  BFS_PHASE_IDLE = 0,
+  BFS_PHASE_TURN,        // Pivoting to face next waypoint
+  BFS_PHASE_DRIVE,       // Driving toward next waypoint
+  BFS_PHASE_ARRIVED,     // Reached a waypoint, advance path
+  BFS_PHASE_DONE,        // Reached final goal
+};
+static BfsRunPhase bfs_run_phase = BFS_PHASE_IDLE;
+static float bfs_run_start_yaw = 0.0f;       // IMU yaw at start of BFS run
+static float bfs_run_target_yaw_deg = 0.0f;  // Target yaw for current segment
+static float bfs_run_segment_dist_m = 0.0f;  // Distance for current segment
+static float bfs_run_driven_m = 0.0f;        // Distance driven in current segment
+static int32_t bfs_run_enc_start_L = 0;
+static int32_t bfs_run_enc_start_R = 0;
+static float bfs_run_total_driven_m = 0.0f;
+static unsigned long bfs_run_start_ms = 0;
+static float bfs_run_cumulative_yaw_deg = 0.0f;  // Accumulated heading from start
+
+// BFS run tuning
+#define BFS_TURN_PWM 120
+#define BFS_TURN_TOLERANCE_DEG 5.0f
+#define BFS_DRIVE_PWM 160
+#define BFS_DRIVE_STEER_KP 3.0f
+#define BFS_ARRIVE_TOLERANCE_M 0.08f
 
 static float runDistanceM = 7.0f;
 static float runTimeS = 15.0f;
@@ -3050,7 +3078,7 @@ static void enterScreen(ScreenState next) {
 
   // IMU calibration happens when entering the RUN screen (not on Start).
   // This keeps START latency low and makes calibration explicit.
-  if (next == SCREEN_RUN) {
+  if (next == SCREEN_RUN || next == SCREEN_BFS_RUN) {
     if (imu_present && imu_control_enabled) {
       // Give the car a moment to settle (users often enter RUN while still handling it).
       delay(500);
@@ -4127,45 +4155,128 @@ static void drawRunScreen() {
 // ========================================================================
 static void drawBfsNavScreen(int bfs_setup_step) {
   ui.fillScreen(TFT_BLACK);
-  ui.setTextColor(TFT_CYAN);
-  ui.setTextSize(1);
-  ui.drawString("BFS PATHFINDING", 120, 10);
 
-  ui.setTextColor(TFT_WHITE);
-  ui.setTextSize(1);
-  
-  // Show current setup step with more compact spacing
+  // Title (centered near top of round display)
+  ui.setTextColor(TFT_CYAN);
+  ui.setTextSize(2);
+  ui.drawString("BFS NAV", 120, 40);
+
+  // Start node selection
+  char startBuf[32];
+  snprintf(startBuf, sizeof(startBuf), "Start: %s",
+           bfs_state.node_count > 0 ? bfs_state.nodes[bfs_start_node].name : "--");
+  ui.setTextSize(2);
   ui.setTextColor(bfs_setup_step == 0 ? TFT_YELLOW : TFT_DARKGREY);
-  ui.drawString("Start:", 30, 40);
-  ui.drawString(bfs_state.nodes[bfs_start_node].name, 120, 40);
-  
+  ui.drawString(startBuf, 120, 80);
+
+  // Goal node selection
+  char goalBuf[32];
+  snprintf(goalBuf, sizeof(goalBuf), "Goal: %s",
+           bfs_state.node_count > 0 ? bfs_state.nodes[bfs_goal_node].name : "--");
+  ui.setTextSize(2);
   ui.setTextColor(bfs_setup_step == 1 ? TFT_YELLOW : TFT_DARKGREY);
-  ui.drawString("Goal:", 30, 60);
-  ui.drawString(bfs_state.nodes[bfs_goal_node].name, 120, 60);
-  
-  // Show all available nodes in a single compact line
+  ui.drawString(goalBuf, 120, 115);
+
+  // Selection indicator arrow
+  ui.setTextColor(TFT_WHITE);
+  ui.setTextSize(2);
+  ui.drawString(">", 20, bfs_setup_step == 0 ? 80 : 115);
+
+  // Available nodes (compact centered list)
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("Nodes:", 30, 85);
-  
   char nodeList[96] = "";
   for (uint8_t i = 0; i < bfs_state.node_count; i++) {
-    if (i > 0) strcat(nodeList, " ");
+    if (i > 0) strcat(nodeList, "  ");
     strcat(nodeList, bfs_state.nodes[i].name);
   }
-  ui.drawString(nodeList, 30, 100);
-  
-  // Instructions
+  ui.drawString(nodeList, 120, 150);
+
+  // Instructions (centered near bottom of round display)
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(1);
-  ui.drawString("Dial: select | Click: toggle", 120, 140);
-  ui.drawString("Hold: start navigation", 120, 155);
+  ui.drawString("Dial:sel  Click:toggle", 120, 185);
+  ui.drawString("Hold:go  2s:back", 120, 200);
+}
+
+// ========================================================================
+// BFS RUN DISPLAY SCREEN
+// ========================================================================
+static void drawBfsRunScreen() {
+  ui.fillScreen(TFT_BLACK);
+
+  ui.setTextColor(TFT_CYAN);
+  ui.setTextSize(2);
+  ui.drawString("BFS RUN", 120, 30);
+
+  // Phase indicator
+  const char* phaseStr = "IDLE";
+  uint16_t phaseColor = TFT_DARKGREY;
+  switch (bfs_run_phase) {
+    case BFS_PHASE_TURN:    phaseStr = "TURNING";  phaseColor = TFT_ORANGE;  break;
+    case BFS_PHASE_DRIVE:   phaseStr = "DRIVING";  phaseColor = TFT_GREEN;   break;
+    case BFS_PHASE_ARRIVED: phaseStr = "ARRIVED";  phaseColor = TFT_YELLOW;  break;
+    case BFS_PHASE_DONE:    phaseStr = "DONE!";    phaseColor = TFT_MAGENTA; break;
+    default: break;
+  }
+  ui.setTextColor(phaseColor);
+  ui.setTextSize(2);
+  ui.drawString(phaseStr, 120, 60);
+
+  // Current path progress
+  ui.setTextColor(TFT_WHITE);
+  ui.setTextSize(1);
+  if (bfs_state.path_valid && bfs_state.path_length > 0) {
+    // Show: from -> to  (step N/M)
+    uint8_t fromIdx = (bfs_state.path_index > 0) ? bfs_state.path[bfs_state.path_index - 1]
+                                                  : bfs_state.path[0];
+    uint8_t toIdx = bfs_state.path[bfs_state.path_index];
+    if (bfs_run_phase == BFS_PHASE_DONE) {
+      toIdx = bfs_state.path[bfs_state.path_length - 1];
+      fromIdx = toIdx;
+    }
+    char pathBuf[48];
+    snprintf(pathBuf, sizeof(pathBuf), "%s -> %s",
+             bfs_state.nodes[fromIdx].name, bfs_state.nodes[toIdx].name);
+    ui.drawString(pathBuf, 120, 85);
+
+    char stepBuf[24];
+    snprintf(stepBuf, sizeof(stepBuf), "Step %d / %d",
+             (int)bfs_state.path_index + 1, (int)bfs_state.path_length);
+    ui.drawString(stepBuf, 120, 100);
+  }
+
+  // Segment distance
+  ui.setTextColor(TFT_WHITE);
+  ui.setTextSize(3);
+  char distBuf[16];
+  snprintf(distBuf, sizeof(distBuf), "%.2fm", (double)bfs_run_total_driven_m);
+  ui.drawString(distBuf, 120, 135);
+
+  // Elapsed time
+  float elapsed = 0.0f;
+  if (bfs_run_start_ms > 0) {
+    elapsed = (millis() - bfs_run_start_ms) / 1000.0f;
+  }
+  ui.setTextSize(2);
+  char timeBuf[16];
+  snprintf(timeBuf, sizeof(timeBuf), "%.1fs", (double)elapsed);
+  ui.drawString(timeBuf, 120, 165);
+
+  // Yaw info
+  ui.setTextColor(TFT_DARKGREY);
+  ui.setTextSize(1);
+  char yawBuf[32];
+  snprintf(yawBuf, sizeof(yawBuf), "Yaw: %.1f tgt: %.1f",
+           (double)imu_yaw, (double)bfs_run_target_yaw_deg);
+  ui.drawString(yawBuf, 120, 190);
+
+  // Button hint
+  ui.setTextColor(TFT_GREEN);
+  ui.drawString("Click: STOP", 120, 210);
 }
 
 static void renderCurrentScreen() {
-  // BFS Nav screen setup state (persistent across re-renders)
-  static int bfs_setup_step = 0;
-  
   switch (currentScreen) {
     case SCREEN_MAIN_MENU:
       drawMainMenu();
@@ -4193,6 +4304,9 @@ static void renderCurrentScreen() {
       break;
     case SCREEN_BFS_NAV:
       drawBfsNavScreen(bfs_setup_step);
+      break;
+    case SCREEN_BFS_RUN:
+      drawBfsRunScreen();
       break;
     case SCREEN_HW_TEST:
       updateDisplay();
@@ -4579,6 +4693,9 @@ void setup() {
  
   boot_ms = millis();
 
+  // Initialize BFS graph for navigation
+  bfsInitializeGraph();
+
   // Safety: ensure motors are stopped on boot.
   motor_enabled = 0;
   motor_command = 0;
@@ -4617,9 +4734,8 @@ void loop() {
 
   const unsigned long now = millis();
 
-  // === BEST FIX: Track screen changes and reset BFS state ===
+  // === Track screen changes and reset BFS state ===
   static ScreenState lastScreen = SCREEN_MAIN_MENU;
-  static int bfs_setup_step = 0;
   
   if (currentScreen != lastScreen) {
     // Screen changed - reset state
@@ -4870,18 +4986,22 @@ void loop() {
   else if (currentScreen == SCREEN_BFS_NAV) {
     // BFS Navigation setup screen
     // Dial selects: 0=start node, 1=goal node
-    static int bfs_setup_step = 0;
     
     // Use centralized dial handler for node selection
     applyBfsDialSteps(dialSteps, bfs_setup_step);
     
-    // Button toggles between start and goal selection, long-press to begin navigation
+    // Button toggles between start and goal selection
     if ((now - boot_ms) > 500 && M5.BtnA.wasClicked()) {
       bfs_setup_step = 1 - bfs_setup_step;  // Toggle between 0 and 1
     }
     
+    // Long-press (800ms) to start BFS navigation
     static bool bfsNavLongPressHandled = false;
-    if (!M5.BtnA.isPressed()) bfsNavLongPressHandled = false;
+    static bool bfsNavExitHandled = false;
+    if (!M5.BtnA.isPressed()) {
+      bfsNavLongPressHandled = false;
+      bfsNavExitHandled = false;
+    }
     if (!bfsNavLongPressHandled && M5.BtnA.pressedFor(800)) {
       bfsNavLongPressHandled = true;
       // Compute path and start navigation
@@ -4889,11 +5009,184 @@ void loop() {
         bfs_run_active = true;
         bfs_current_target = bfsGetNextTarget();
         savePersistedSettings();
-        enterScreen(SCREEN_RUN);
+        // Initialize BFS run state
+        bfs_run_phase = BFS_PHASE_IDLE;
+        bfs_run_total_driven_m = 0.0f;
+        bfs_run_start_ms = 0;
+        bfs_run_cumulative_yaw_deg = 0.0f;
+        enterScreen(SCREEN_BFS_RUN);
       }
+    }
+    // Very long press (2s) to exit back to main menu
+    if (!bfsNavExitHandled && M5.BtnA.pressedFor(2000)) {
+      bfsNavExitHandled = true;
+      enterScreen(SCREEN_MAIN_MENU);
     }
     
     stopAllMotors();
+  }
+
+  else if (currentScreen == SCREEN_BFS_RUN) {
+    // BFS path-following run screen
+    if ((now - boot_ms) > 500 && M5.BtnA.wasClicked()) {
+      // Stop BFS run
+      bfs_run_phase = BFS_PHASE_DONE;
+      bfs_run_active = false;
+      stopAllMotors();
+      enterScreen(SCREEN_BFS_NAV);
+    }
+
+    // Initialize on first entry
+    if (bfs_run_start_ms == 0) {
+      bfs_run_start_ms = now;
+      bfs_run_start_yaw = imu_yaw;
+      bfs_run_cumulative_yaw_deg = imu_yaw;
+      // Start by computing first segment
+      bfs_run_phase = BFS_PHASE_ARRIVED;  // Will immediately compute first segment
+      Serial.printf("BFS_RUN: init yaw=%.1f path_len=%d path_idx=%d\n",
+                    (double)imu_yaw, (int)bfs_state.path_length, (int)bfs_state.path_index);
+    }
+
+    // Safety timeout: stop BFS run after 60 seconds max
+    if (bfs_run_start_ms > 0 && (now - bfs_run_start_ms) > 60000) {
+      Serial.println("BFS_RUN: SAFETY TIMEOUT");
+      bfs_run_phase = BFS_PHASE_DONE;
+      bfs_run_active = false;
+      stopAllMotors();
+    }
+
+    if (bfs_run_phase == BFS_PHASE_DONE) {
+      stopAllMotors();
+    }
+    else if (bfs_run_phase == BFS_PHASE_ARRIVED) {
+      // Advance to next segment or finish
+      stopAllMotors();
+      Serial.printf("BFS_RUN: ARRIVED idx=%d len=%d\n", (int)bfs_state.path_index, (int)bfs_state.path_length);
+      if (bfs_state.path_index >= bfs_state.path_length - 1) {
+        // Reached final goal
+        bfs_run_phase = BFS_PHASE_DONE;
+        bfs_run_active = false;
+      } else {
+        // Compute heading and distance to next waypoint
+        uint8_t curNode = bfs_state.path[bfs_state.path_index];
+        bfsAdvancePath();
+        uint8_t nextNode = bfs_state.path[bfs_state.path_index];
+
+        float dx = bfs_state.nodes[nextNode].x_m - bfs_state.nodes[curNode].x_m;
+        float dy = bfs_state.nodes[nextNode].y_m - bfs_state.nodes[curNode].y_m;
+        bfs_run_segment_dist_m = sqrtf(dx * dx + dy * dy);
+
+        // Target heading in world frame (degrees, 0=+X, CCW positive)
+        float target_heading_deg = atan2f(dy, dx) * (180.0f / (float)M_PI);
+        bfs_run_target_yaw_deg = target_heading_deg + bfs_run_start_yaw;
+
+        // Reset segment encoder tracking
+        bfs_run_enc_start_L = encoderL_count;
+        bfs_run_enc_start_R = encoderR_count;
+        bfs_run_driven_m = 0.0f;
+
+        bfs_run_phase = BFS_PHASE_TURN;
+        Serial.printf("BFS_RUN: segment %s->%s dist=%.2f heading=%.1f target_yaw=%.1f\n",
+                      bfs_state.nodes[curNode].name, bfs_state.nodes[nextNode].name,
+                      (double)bfs_run_segment_dist_m, (double)(target_heading_deg),
+                      (double)bfs_run_target_yaw_deg);
+      }
+    }
+    else if (bfs_run_phase == BFS_PHASE_TURN) {
+      // Pivot in place to face the next waypoint
+      float yaw_err = bfs_run_target_yaw_deg - imu_yaw;
+      // Normalize to [-180, 180]
+      while (yaw_err > 180.0f) yaw_err -= 360.0f;
+      while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
+        // Close enough, start driving
+        stopAllMotors();
+        delay(100);  // Brief settle
+        bfs_run_enc_start_L = encoderL_count;
+        bfs_run_enc_start_R = encoderR_count;
+        bfs_run_phase = BFS_PHASE_DRIVE;
+        Serial.printf("BFS_RUN: TURN done, starting DRIVE yaw=%.1f err=%.1f\n",
+                      (double)imu_yaw, (double)yaw_err);
+      } else {
+        // Pivot: positive error = turn left (CCW), negative = turn right (CW)
+        int sign = (yaw_err > 0.0f) ? 1 : -1;
+        // Scale PWM by error magnitude for smoother approach
+        float pwmScale = fabsf(yaw_err) / 45.0f;
+        if (pwmScale > 1.0f) pwmScale = 1.0f;
+        if (pwmScale < 0.4f) pwmScale = 0.4f;
+        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
+        if (turnPwm < 80) turnPwm = 80;
+        setMotorsPivotPwm(sign, turnPwm);
+        applyMotorOutputs();
+      }
+    }
+    else if (bfs_run_phase == BFS_PHASE_DRIVE) {
+      // Drive forward toward waypoint with yaw correction
+      const int32_t dL = encoderL_count - bfs_run_enc_start_L;
+      const int32_t dR = encoderR_count - bfs_run_enc_start_R;
+      const float dLcorr = (INVERT_LEFT_ENCODER_COUNT ? -(float)dL : (float)dL);
+      const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
+      const float sL = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
+      const float sR = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
+      bfs_run_driven_m = fabsf(0.5f * (sL + sR));
+
+      // Update total distance for display
+      bfs_run_total_driven_m += 0.0f;  // updated at segment end
+
+      if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
+        // Reached waypoint
+        stopAllMotors();
+        bfs_run_total_driven_m += bfs_run_driven_m;
+        bfs_run_phase = BFS_PHASE_ARRIVED;
+        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f\n",
+                      (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
+                      (double)bfs_run_total_driven_m);
+      } else {
+        // Drive with yaw correction
+        float yaw_err = bfs_run_target_yaw_deg - imu_yaw;
+        while (yaw_err > 180.0f) yaw_err -= 360.0f;
+        while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+        float steerCorr = BFS_DRIVE_STEER_KP * yaw_err;
+        if (steerCorr > 60.0f) steerCorr = 60.0f;
+        if (steerCorr < -60.0f) steerCorr = -60.0f;
+
+        // Brake zone near target
+        float remaining = bfs_run_segment_dist_m - bfs_run_driven_m;
+        float speedFactor = 1.0f;
+        if (remaining < 0.3f) {
+          speedFactor = remaining / 0.3f;
+          if (speedFactor < 0.4f) speedFactor = 0.4f;
+        }
+
+        float basePwm = BFS_DRIVE_PWM * speedFactor;
+        float leftPwm = basePwm + steerCorr + (float)motor_bias_pwm;
+        float rightPwm = basePwm - steerCorr - (float)motor_bias_pwm;
+
+        if (leftPwm < 0.0f) leftPwm = 0.0f;
+        if (rightPwm < 0.0f) rightPwm = 0.0f;
+        if (leftPwm > 255.0f) leftPwm = 255.0f;
+        if (rightPwm > 255.0f) rightPwm = 255.0f;
+
+        setMotorsForwardPwm((uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f));
+        applyMotorOutputs();
+
+        // Periodic debug
+        static unsigned long lastBfsDriveLog = 0;
+        if (now - lastBfsDriveLog > 500) {
+          lastBfsDriveLog = now;
+          const int32_t dbgDL = encoderL_count - bfs_run_enc_start_L;
+          const int32_t dbgDR = encoderR_count - bfs_run_enc_start_R;
+          Serial.printf("BFS_DRIVE: driven=%.2f/%.2f yawErr=%.1f L=%d R=%d encDL=%ld encDR=%ld encOK=%c%c\n",
+                        (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
+                        (double)yaw_err,
+                        (int)motor_l_speed, (int)motor_r_speed,
+                        (long)dbgDL, (long)dbgDR,
+                        encoderL_found ? 'Y' : 'N', encoderR_found ? 'Y' : 'N');
+        }
+      }
+    }
   }
 
   else if (currentScreen == SCREEN_SET_DISTANCE) {
