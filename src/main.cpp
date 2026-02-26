@@ -170,7 +170,6 @@ static uint16_t control_period_ms = CONTROL_PERIOD_MS;
 
 // Double-buffered drawing surface (sprite)
 static M5Canvas ui(&M5.Display);
-#define CX (M5.Display.width()/2)
 
 // I2C speed: higher can reduce loop blocking/phase lag, but only if your wiring/devices are stable.
 // We default to 100kHz because 400kHz can cause intermittent I2C failures on some setups (long wires/noisy power),
@@ -179,7 +178,7 @@ static M5Canvas ui(&M5.Display);
 
 // I2C bus guard delay (µs) between back-to-back transactions.
 // Prevents bus contention when 5 devices share the bus (2 motors, 2 encoders, IMU).
-#define I2C_GUARD_US 150
+#define I2C_GUARD_US 300
 static inline void i2cGuard() { delayMicroseconds(I2C_GUARD_US); }
 
 // I2C consecutive error tracking for automatic bus recovery
@@ -208,14 +207,14 @@ static void savePersistedSettings();
 // ========================================================================
 // BFS GRAPH NAVIGATION CONFIGURATION
 // ========================================================================
-#define BFS_MAX_NODES 16          // Maximum waypoints/rooms in the graph
-#define BFS_MAX_EDGES_PER_NODE 8  // Max adjacent nodes per waypoint
-#define BFS_PATH_MAX_LENGTH 16    // Max steps in a path
+#define BFS_MAX_NODES 64          // Maximum waypoints (up to 8x8 grid)
+#define BFS_MAX_EDGES_PER_NODE 12 // Max adjacent nodes (grid + virtual center/gate nodes)
+#define BFS_PATH_MAX_LENGTH 128   // Max steps in a path (needs room for multi-gate routes)
 
 // Node structure for graph representation
 struct BfsNode {
-  uint8_t id;                       // Node ID (0-15)
-  char name[16];                    // Room/waypoint name
+  uint8_t id;                       // Node ID
+  char name[8];                     // Short label (e.g. "2,3")
   float x_m;                        // X position (meters)
   float y_m;                        // Y position (meters)
   uint8_t neighbors[BFS_MAX_EDGES_PER_NODE];  // Adjacent node IDs
@@ -237,6 +236,313 @@ struct BfsState {
 
 static BfsState bfs_state = {0};
 static bool bfs_initialized = false;
+static uint8_t bfs_end_center_node = 0;  // Virtual node at end square center
+static uint8_t bfs_start_edge_node = 0; // Virtual node at start edge midpoint
+
+// ========================================================================
+// GRID-BASED COURSE CONFIGURATION FOR ROBOT TOUR
+// ========================================================================
+// The course is a grid of intersections. The robot travels along grid lines.
+// Walls block edges between adjacent intersections (entered as H/V separately).
+// Water bottles sit on grid edges and block that edge (entered as H/V separately).
+// Gates are grid squares the robot MUST pass through.
+
+#define GRID_MAX_DIM   8          // Max grid dimension (8x8 = 64 nodes)
+#define MAX_WALLS     32          // Max wall segments
+#define MAX_BOTTLES   16          // Max water bottle positions
+#define MAX_GATES      8          // Max gate positions
+
+struct GridWall {
+  uint8_t r1, c1, r2, c2;        // Between grid point (r1,c1) and (r2,c2)
+};
+
+struct GridBottle {
+  uint8_t r1, c1, r2, c2;        // On edge between (r1,c1) and (r2,c2)
+};
+
+struct GridGate {
+  uint8_t row, col;               // Square index (row, col)
+};
+
+struct GridCourse {
+  uint8_t cols;                   // Grid columns (2-8)
+  uint8_t rows;                   // Grid rows (2-8)
+  uint8_t spacing_cm;             // Distance between grid points (cm), 10-100
+  uint8_t start_r1, start_c1;     // Start edge endpoint 1
+  uint8_t start_r2, start_c2;     // Start edge endpoint 2 (midpoint = start position)
+  uint8_t end_col, end_row;       // End position (square index)
+
+  GridWall walls[MAX_WALLS];
+  uint8_t wall_count;
+
+  GridBottle bottles[MAX_BOTTLES];
+  uint8_t bottle_count;
+
+  GridGate gates[MAX_GATES];
+  uint8_t gate_count;
+};
+
+static GridCourse grid_course;
+static uint8_t bfs_gate_nodes[MAX_GATES]; // Virtual nodes at gate square centers
+
+// Initialize grid_course with sensible defaults
+// Fixed grid: 6 columns x 5 rows of intersections = 5x4 squares = 250x200cm at 50cm spacing
+#define GRID_FIXED_COLS   6
+#define GRID_FIXED_ROWS   5
+#define GRID_FIXED_SPACING_CM 50
+
+static void gridCourseDefaults() {
+  memset(&grid_course, 0, sizeof(grid_course));
+  grid_course.cols = GRID_FIXED_COLS;
+  grid_course.rows = GRID_FIXED_ROWS;
+  grid_course.spacing_cm = GRID_FIXED_SPACING_CM;
+  // Default start: midpoint of top-left horizontal border edge (0,0)-(0,1)
+  grid_course.start_r1 = 0; grid_course.start_c1 = 0;
+  grid_course.start_r2 = 0; grid_course.start_c2 = 1;
+  grid_course.end_col = (GRID_FIXED_COLS - 1) / 2;  // Square column index (0 to cols-2)
+  grid_course.end_row = (GRID_FIXED_ROWS - 1) / 2;  // Square row index (0 to rows-2)
+}
+
+// Convert (row, col) to node index
+static inline uint8_t gridNodeId(uint8_t row, uint8_t col) {
+  return row * grid_course.cols + col;
+}
+
+// Check if a wall exists between two adjacent grid points
+static bool gridHasWall(uint8_t r1, uint8_t c1, uint8_t r2, uint8_t c2) {
+  for (uint8_t i = 0; i < grid_course.wall_count; i++) {
+    const GridWall& w = grid_course.walls[i];
+    if ((w.r1 == r1 && w.c1 == c1 && w.r2 == r2 && w.c2 == c2) ||
+        (w.r1 == r2 && w.c1 == c2 && w.r2 == r1 && w.c2 == c1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Check if a water bottle is on an edge between two adjacent grid points
+static bool gridHasBottle(uint8_t r1, uint8_t c1, uint8_t r2, uint8_t c2) {
+  for (uint8_t i = 0; i < grid_course.bottle_count; i++) {
+    const GridBottle& b = grid_course.bottles[i];
+    if ((b.r1 == r1 && b.c1 == c1 && b.r2 == r2 && b.c2 == c2) ||
+        (b.r1 == r2 && b.c1 == c2 && b.r2 == r1 && b.c2 == c1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Check if a gate exists at a grid square
+static bool gridHasGate(uint8_t row, uint8_t col) {
+  for (uint8_t i = 0; i < grid_course.gate_count; i++) {
+    if (grid_course.gates[i].row == row && grid_course.gates[i].col == col)
+      return true;
+  }
+  return false;
+}
+
+// Toggle a wall between two adjacent grid points (add or remove)
+static void gridToggleWall(uint8_t r1, uint8_t c1, uint8_t r2, uint8_t c2) {
+  // Check if wall already exists, remove it
+  for (uint8_t i = 0; i < grid_course.wall_count; i++) {
+    GridWall& w = grid_course.walls[i];
+    if ((w.r1 == r1 && w.c1 == c1 && w.r2 == r2 && w.c2 == c2) ||
+        (w.r1 == r2 && w.c1 == c2 && w.r2 == r1 && w.c2 == c1)) {
+      // Remove by shifting
+      for (uint8_t j = i; j < grid_course.wall_count - 1; j++)
+        grid_course.walls[j] = grid_course.walls[j + 1];
+      grid_course.wall_count--;
+      return;
+    }
+  }
+  // Add new wall
+  if (grid_course.wall_count < MAX_WALLS) {
+    grid_course.walls[grid_course.wall_count] = {r1, c1, r2, c2};
+    grid_course.wall_count++;
+  }
+}
+
+// Toggle a water bottle on an edge (add or remove)
+static void gridToggleBottle(uint8_t r1, uint8_t c1, uint8_t r2, uint8_t c2) {
+  for (uint8_t i = 0; i < grid_course.bottle_count; i++) {
+    GridBottle& b = grid_course.bottles[i];
+    if ((b.r1 == r1 && b.c1 == c1 && b.r2 == r2 && b.c2 == c2) ||
+        (b.r1 == r2 && b.c1 == c2 && b.r2 == r1 && b.c2 == c1)) {
+      for (uint8_t j = i; j < grid_course.bottle_count - 1; j++)
+        grid_course.bottles[j] = grid_course.bottles[j + 1];
+      grid_course.bottle_count--;
+      return;
+    }
+  }
+  if (grid_course.bottle_count < MAX_BOTTLES) {
+    grid_course.bottles[grid_course.bottle_count] = {r1, c1, r2, c2};
+    grid_course.bottle_count++;
+  }
+}
+
+// Toggle a gate at a grid square (add or remove)
+static void gridToggleGate(uint8_t row, uint8_t col) {
+  for (uint8_t i = 0; i < grid_course.gate_count; i++) {
+    if (grid_course.gates[i].row == row && grid_course.gates[i].col == col) {
+      for (uint8_t j = i; j < grid_course.gate_count - 1; j++)
+        grid_course.gates[j] = grid_course.gates[j + 1];
+      grid_course.gate_count--;
+      return;
+    }
+  }
+  if (grid_course.gate_count < MAX_GATES) {
+    grid_course.gates[grid_course.gate_count] = {row, col};
+    grid_course.gate_count++;
+  }
+}
+
+// Enumerate all possible edge positions for walls/gates
+// Returns total count. Given an index, fills r1,c1,r2,c2.
+static uint16_t gridEdgeCount() {
+  // Horizontal edges: rows * (cols-1) + Vertical edges: (rows-1) * cols
+  uint16_t h = (uint16_t)grid_course.rows * (grid_course.cols > 0 ? grid_course.cols - 1 : 0);
+  uint16_t v = (grid_course.rows > 0 ? grid_course.rows - 1 : 0) * (uint16_t)grid_course.cols;
+  return h + v;
+}
+
+static void gridEdgeFromIndex(uint16_t idx, uint8_t& r1, uint8_t& c1, uint8_t& r2, uint8_t& c2) {
+  uint16_t h = (uint16_t)grid_course.rows * (grid_course.cols > 0 ? grid_course.cols - 1 : 0);
+  if (idx < h) {
+    // Horizontal edge: (row, col) -- (row, col+1)
+    uint8_t cols_m1 = grid_course.cols - 1;
+    r1 = idx / cols_m1;
+    c1 = idx % cols_m1;
+    r2 = r1;
+    c2 = c1 + 1;
+  } else {
+    // Vertical edge: (row, col) -- (row+1, col)
+    uint16_t vi = idx - h;
+    r1 = vi / grid_course.cols;
+    c1 = vi % grid_course.cols;
+    r2 = r1 + 1;
+    c2 = c1;
+  }
+}
+
+// Enumerate all grid positions for bottles
+static uint16_t gridPositionCount() {
+  return (uint16_t)grid_course.rows * grid_course.cols;
+}
+
+static void gridPositionFromIndex(uint16_t idx, uint8_t& row, uint8_t& col) {
+  row = idx / grid_course.cols;
+  col = idx % grid_course.cols;
+}
+
+// ---- Separate horizontal / vertical edge helpers ----
+// Horizontal edges: (r,c)-(r,c+1), count = rows*(cols-1)
+static uint16_t gridHEdgeCount() {
+  return (uint16_t)grid_course.rows * (grid_course.cols > 0 ? grid_course.cols - 1 : 0);
+}
+static void gridHEdgeFromIndex(uint16_t idx, uint8_t& r1, uint8_t& c1, uint8_t& r2, uint8_t& c2) {
+  uint8_t cols_m1 = grid_course.cols - 1;
+  r1 = idx / cols_m1;
+  c1 = idx % cols_m1;
+  r2 = r1;
+  c2 = c1 + 1;
+}
+// Vertical edges: (r,c)-(r+1,c), count = (rows-1)*cols
+static uint16_t gridVEdgeCount() {
+  return (grid_course.rows > 0 ? grid_course.rows - 1 : 0) * (uint16_t)grid_course.cols;
+}
+static void gridVEdgeFromIndex(uint16_t idx, uint8_t& r1, uint8_t& c1, uint8_t& r2, uint8_t& c2) {
+  r1 = idx / grid_course.cols;
+  c1 = idx % grid_course.cols;
+  r2 = r1 + 1;
+  c2 = c1;
+}
+
+// BFS setup step cursor state for wall/bottle/gate editors
+static uint16_t grid_hwall_cursor = 0;
+static uint16_t grid_vwall_cursor = 0;
+static uint16_t grid_hbottle_cursor = 0;
+static uint16_t grid_vbottle_cursor = 0;
+static uint16_t grid_gate_cursor = 0;  // Now cycles squares
+
+// ---- Border edge helpers ----
+// Enumerate all edges on the grid border (perimeter).
+// Goes clockwise: top row L→R, right col T→B, bottom row R→L, left col B→T.
+// Start position is at the midpoint of one of these edges.
+static uint16_t gridBorderEdgeCount() {
+  // Top border: cols-1 horizontal edges
+  // Right border: rows-1 vertical edges
+  // Bottom border: cols-1 horizontal edges
+  // Left border: rows-1 vertical edges
+  return 2 * (grid_course.cols - 1) + 2 * (grid_course.rows - 1);
+}
+
+static void gridBorderEdgeFromIndex(uint16_t idx, uint8_t &r1, uint8_t &c1, uint8_t &r2, uint8_t &c2) {
+  uint8_t cols = grid_course.cols;
+  uint8_t rows = grid_course.rows;
+  uint16_t total = gridBorderEdgeCount();
+  if (total == 0) { r1 = c1 = r2 = c2 = 0; return; }
+  idx = idx % total;
+  uint16_t top = cols - 1;
+  uint16_t right = rows - 1;
+  uint16_t bottom = cols - 1;
+  // Top border: (0,c)-(0,c+1)
+  if (idx < top) { r1 = 0; c1 = idx; r2 = 0; c2 = idx + 1; return; }
+  idx -= top;
+  // Right border: (r,cols-1)-(r+1,cols-1)
+  if (idx < right) { r1 = idx; c1 = cols - 1; r2 = idx + 1; c2 = cols - 1; return; }
+  idx -= right;
+  // Bottom border: (rows-1,c+1)-(rows-1,c) — reversed direction for clockwise
+  if (idx < bottom) { r1 = rows - 1; c1 = cols - 1 - idx; r2 = rows - 1; c2 = cols - 2 - idx; return; }
+  idx -= bottom;
+  // Left border: (r+1,0)-(r,0) — reversed direction for clockwise
+  r1 = rows - 1 - idx; c1 = 0; r2 = rows - 2 - idx; c2 = 0;
+}
+
+static uint16_t gridBorderEdgeIndex(uint8_t r1, uint8_t c1, uint8_t r2, uint8_t c2) {
+  uint8_t cols = grid_course.cols;
+  uint8_t rows = grid_course.rows;
+  // Normalize: try both orderings
+  for (int pass = 0; pass < 2; pass++) {
+    uint8_t a1 = pass ? r2 : r1, b1 = pass ? c2 : c1;
+    uint8_t a2 = pass ? r1 : r2, b2 = pass ? c1 : c2;
+    // Check each border segment
+    uint16_t idx = 0;
+    // Top
+    for (uint8_t c = 0; c < cols - 1; c++, idx++)
+      if (a1 == 0 && b1 == c && a2 == 0 && b2 == c + 1) return idx;
+    // Right
+    for (uint8_t r = 0; r < rows - 1; r++, idx++)
+      if (a1 == r && b1 == cols - 1 && a2 == r + 1 && b2 == cols - 1) return idx;
+    // Bottom (reversed)
+    for (uint8_t c = cols - 1; c > 0; c--, idx++)
+      if (a1 == rows - 1 && b1 == c && a2 == rows - 1 && b2 == c - 1) return idx;
+    // Left (reversed)
+    for (uint8_t r = rows - 1; r > 0; r--, idx++)
+      if (a1 == r && b1 == 0 && a2 == r - 1 && b2 == 0) return idx;
+  }
+  return 0;
+}
+
+// ---- Square center helpers ----
+// Square (sr, sc) has corners at (sr,sc),(sr,sc+1),(sr+1,sc),(sr+1,sc+1).
+// Valid range: sr 0..rows-2, sc 0..cols-2.  Total = (rows-1)*(cols-1).
+static uint16_t gridSquareCount() {
+  return (uint16_t)(grid_course.cols - 1) * (grid_course.rows - 1);
+}
+
+static void gridSquarePosition(uint16_t idx, uint8_t &sqRow, uint8_t &sqCol) {
+  uint8_t sqCols = grid_course.cols - 1;
+  sqRow = idx / sqCols;
+  sqCol = idx % sqCols;
+}
+
+static uint16_t gridSquareIndex(uint8_t sqRow, uint8_t sqCol) {
+  return (uint16_t)sqRow * (grid_course.cols - 1) + sqCol;
+}
+
+// Cursor variables for start (border) and end (square center)
+static uint16_t grid_start_cursor = 0;
+static uint16_t grid_end_cursor = 0;
 
 // Add an edge between two nodes (bidirectional)
 static void bfsAddEdge(uint8_t from_id, uint8_t to_id, float distance_m) {
@@ -250,54 +556,289 @@ static void bfsAddEdge(uint8_t from_id, uint8_t to_id, float distance_m) {
   from->neighbor_count++;
 }
 
-// Initialize the BFS graph with waypoints and connections
+// Build BFS graph from grid_course configuration
+// Creates nodes for each grid intersection, adds edges for adjacent nodes
+// that are not blocked by walls or water bottles.
 static void bfsInitializeGraph() {
-  // Example graph configuration - customize for your competition venue
-  bfs_state.node_count = 4;
-  
-  // Node 0: Start room
-  bfs_state.nodes[0].id = 0;
-  strcpy(bfs_state.nodes[0].name, "Start");
-  bfs_state.nodes[0].x_m = 0.0f;
-  bfs_state.nodes[0].y_m = 0.0f;
-  bfs_state.nodes[0].neighbor_count = 0;
-  
-  // Node 1: Middle room
-  bfs_state.nodes[1].id = 1;
-  strcpy(bfs_state.nodes[1].name, "Middle");
-  bfs_state.nodes[1].x_m = 2.0f;
-  bfs_state.nodes[1].y_m = 0.0f;
-  bfs_state.nodes[1].neighbor_count = 0;
-  
-  // Node 2: End room
-  bfs_state.nodes[2].id = 2;
-  strcpy(bfs_state.nodes[2].name, "End");
-  bfs_state.nodes[2].x_m = 4.0f;
-  bfs_state.nodes[2].y_m = 0.0f;
-  bfs_state.nodes[2].neighbor_count = 0;
-  
-  // Node 3: Side room
-  bfs_state.nodes[3].id = 3;
-  strcpy(bfs_state.nodes[3].name, "Side");
-  bfs_state.nodes[3].x_m = 2.0f;
-  bfs_state.nodes[3].y_m = 2.0f;
-  bfs_state.nodes[3].neighbor_count = 0;
-  
-  // Build edges (connections between rooms)
-  bfsAddEdge(0, 1, 2.0f);  // Start -> Middle: 2m
-  bfsAddEdge(1, 0, 2.0f);  // Middle -> Start: 2m
-  bfsAddEdge(1, 2, 2.0f);  // Middle -> End: 2m
-  bfsAddEdge(2, 1, 2.0f);  // End -> Middle: 2m
-  bfsAddEdge(1, 3, 2.83f); // Middle -> Side: ~2.83m
-  bfsAddEdge(3, 1, 2.83f); // Side -> Middle: ~2.83m
-  
-  bfs_state.current_node = 0;  // Start at node 0
-  bfs_state.goal_node = 2;     // Goal is node 2
+  memset(&bfs_state, 0, sizeof(bfs_state));
+
+  const uint8_t rows = grid_course.rows;
+  const uint8_t cols = grid_course.cols;
+  const float spacing_m = grid_course.spacing_cm / 100.0f;
+
+  bfs_state.node_count = rows * cols;
+  if (bfs_state.node_count > BFS_MAX_NODES) bfs_state.node_count = BFS_MAX_NODES;
+
+  // Create nodes
+  for (uint8_t r = 0; r < rows; r++) {
+    for (uint8_t c = 0; c < cols; c++) {
+      uint8_t id = gridNodeId(r, c);
+      if (id >= BFS_MAX_NODES) continue;
+      bfs_state.nodes[id].id = id;
+      snprintf(bfs_state.nodes[id].name, sizeof(bfs_state.nodes[id].name), "%d,%d", r, c);
+      bfs_state.nodes[id].x_m = c * spacing_m;
+      bfs_state.nodes[id].y_m = r * spacing_m;
+      bfs_state.nodes[id].neighbor_count = 0;
+    }
+  }
+
+  // Add edges between adjacent nodes (skip if wall or bottle blocks the edge)
+  for (uint8_t r = 0; r < rows; r++) {
+    for (uint8_t c = 0; c < cols; c++) {
+      uint8_t id = gridNodeId(r, c);
+      if (id >= BFS_MAX_NODES) continue;
+
+      // Right neighbor
+      if (c + 1 < cols && !gridHasWall(r, c, r, c + 1) && !gridHasBottle(r, c, r, c + 1)) {
+        bfsAddEdge(id, gridNodeId(r, c + 1), spacing_m);
+      }
+      // Left neighbor
+      if (c > 0 && !gridHasWall(r, c, r, c - 1) && !gridHasBottle(r, c, r, c - 1)) {
+        bfsAddEdge(id, gridNodeId(r, c - 1), spacing_m);
+      }
+      // Down neighbor
+      if (r + 1 < rows && !gridHasWall(r, c, r + 1, c) && !gridHasBottle(r, c, r + 1, c)) {
+        bfsAddEdge(id, gridNodeId(r + 1, c), spacing_m);
+      }
+      // Up neighbor
+      if (r > 0 && !gridHasWall(r, c, r - 1, c) && !gridHasBottle(r, c, r - 1, c)) {
+        bfsAddEdge(id, gridNodeId(r - 1, c), spacing_m);
+      }
+    }
+  }
+
+  // --- Virtual start node: midpoint of start border edge ---
+  uint8_t startVirtId = bfs_state.node_count;
+  if (startVirtId < BFS_MAX_NODES) {
+    uint8_t sr1 = grid_course.start_r1, sc1 = grid_course.start_c1;
+    uint8_t sr2 = grid_course.start_r2, sc2 = grid_course.start_c2;
+    bfs_state.nodes[startVirtId].id = startVirtId;
+    snprintf(bfs_state.nodes[startVirtId].name, sizeof(bfs_state.nodes[startVirtId].name), "S");
+    bfs_state.nodes[startVirtId].x_m = (sc1 + sc2) * 0.5f * spacing_m;
+    bfs_state.nodes[startVirtId].y_m = (sr1 + sr2) * 0.5f * spacing_m;
+    bfs_state.nodes[startVirtId].neighbor_count = 0;
+    bfs_state.node_count++;
+    // Connect to both edge endpoints (bidirectional)
+    float half_edge = spacing_m * 0.5f;
+    uint8_t ep1 = gridNodeId(sr1, sc1), ep2 = gridNodeId(sr2, sc2);
+    if (ep1 < rows * cols) {
+      bfsAddEdge(startVirtId, ep1, half_edge);
+      bfsAddEdge(ep1, startVirtId, half_edge);
+    }
+    if (ep2 < rows * cols) {
+      bfsAddEdge(startVirtId, ep2, half_edge);
+      bfsAddEdge(ep2, startVirtId, half_edge);
+    }
+    // Connect to interior nodes adjacent to the border edge.
+    // For a horizontal border edge (sr1==sr2), the interior is one row inward.
+    // For a vertical border edge (sc1==sc2), the interior is one col inward.
+    float diag_dist = sqrtf(0.25f + 1.0f) * spacing_m; // sqrt((0.5)^2 + 1^2) * spacing
+    if (sr1 == sr2) {
+      // Horizontal edge — interior row is inward from the border row
+      int8_t inRow = (sr1 == 0) ? 1 : (int8_t)(sr1 - 1);
+      // Connect to interior nodes at both columns of the edge
+      uint8_t in1 = gridNodeId((uint8_t)inRow, sc1);
+      uint8_t in2 = gridNodeId((uint8_t)inRow, sc2);
+      if (in1 < rows * cols) {
+        bfsAddEdge(startVirtId, in1, diag_dist);
+        bfsAddEdge(in1, startVirtId, diag_dist);
+      }
+      if (in2 < rows * cols) {
+        bfsAddEdge(startVirtId, in2, diag_dist);
+        bfsAddEdge(in2, startVirtId, diag_dist);
+      }
+    } else {
+      // Vertical edge — interior col is inward from the border col
+      int8_t inCol = (sc1 == 0) ? 1 : (int8_t)(sc1 - 1);
+      // Connect to interior nodes at both rows of the edge
+      uint8_t in1 = gridNodeId(sr1, (uint8_t)inCol);
+      uint8_t in2 = gridNodeId(sr2, (uint8_t)inCol);
+      if (in1 < rows * cols) {
+        bfsAddEdge(startVirtId, in1, diag_dist);
+        bfsAddEdge(in1, startVirtId, diag_dist);
+      }
+      if (in2 < rows * cols) {
+        bfsAddEdge(startVirtId, in2, diag_dist);
+        bfsAddEdge(in2, startVirtId, diag_dist);
+      }
+    }
+    bfs_start_edge_node = startVirtId;
+  } else {
+    bfs_start_edge_node = 0;
+  }
+
+  // --- Virtual end node: center of target square ---
+  uint8_t centerId = bfs_state.node_count;
+  if (centerId < BFS_MAX_NODES) {
+    uint8_t er = grid_course.end_row;   // square row
+    uint8_t ec = grid_course.end_col;   // square col
+    bfs_state.nodes[centerId].id = centerId;
+    snprintf(bfs_state.nodes[centerId].name, sizeof(bfs_state.nodes[centerId].name), "E%d,%d", er, ec);
+    bfs_state.nodes[centerId].x_m = (ec + 0.5f) * spacing_m;
+    bfs_state.nodes[centerId].y_m = (er + 0.5f) * spacing_m;
+    bfs_state.nodes[centerId].neighbor_count = 0;
+    bfs_state.node_count++;
+
+    // Connect 4 surrounding corner intersections to center node (bidirectional)
+    float half_diag = spacing_m * 0.7071f;  // sqrt(2)/2 * spacing
+    uint8_t corners[4][2] = {{er, ec}, {er, (uint8_t)(ec+1)}, {(uint8_t)(er+1), ec}, {(uint8_t)(er+1), (uint8_t)(ec+1)}};
+    for (int i = 0; i < 4; i++) {
+      uint8_t cr = corners[i][0], cc = corners[i][1];
+      if (cr < rows && cc < cols) {
+        uint8_t cornerId = gridNodeId(cr, cc);
+        bfsAddEdge(cornerId, centerId, half_diag);
+        bfsAddEdge(centerId, cornerId, half_diag);
+      }
+    }
+    bfs_end_center_node = centerId;
+  } else {
+    bfs_end_center_node = bfs_state.node_count - 1;
+  }
+
+  // --- Virtual gate nodes: center of each gate square ---
+  memset(bfs_gate_nodes, 0, sizeof(bfs_gate_nodes));
+  for (uint8_t gi = 0; gi < grid_course.gate_count; gi++) {
+    uint8_t gateVirtId = bfs_state.node_count;
+    if (gateVirtId >= BFS_MAX_NODES) break;
+    uint8_t gr = grid_course.gates[gi].row;
+    uint8_t gc = grid_course.gates[gi].col;
+    bfs_state.nodes[gateVirtId].id = gateVirtId;
+    snprintf(bfs_state.nodes[gateVirtId].name, sizeof(bfs_state.nodes[gateVirtId].name), "G%d", gi);
+    bfs_state.nodes[gateVirtId].x_m = (gc + 0.5f) * spacing_m;
+    bfs_state.nodes[gateVirtId].y_m = (gr + 0.5f) * spacing_m;
+    bfs_state.nodes[gateVirtId].neighbor_count = 0;
+    bfs_state.node_count++;
+    // Connect to 4 corner intersections (bidirectional)
+    float half_diag = spacing_m * 0.7071f;
+    uint8_t gcorners[4][2] = {{gr, gc}, {gr, (uint8_t)(gc+1)}, {(uint8_t)(gr+1), gc}, {(uint8_t)(gr+1), (uint8_t)(gc+1)}};
+    for (int k = 0; k < 4; k++) {
+      uint8_t cr = gcorners[k][0], cc = gcorners[k][1];
+      if (cr < rows && cc < cols) {
+        uint8_t cornerId = gridNodeId(cr, cc);
+        bfsAddEdge(cornerId, gateVirtId, half_diag);
+        bfsAddEdge(gateVirtId, cornerId, half_diag);
+      }
+    }
+    bfs_gate_nodes[gi] = gateVirtId;
+  }
+
+  bfs_state.current_node = bfs_start_edge_node;
+  bfs_state.goal_node = bfs_end_center_node;
   bfs_state.path_valid = false;
   bfs_state.path_length = 0;
   bfs_state.path_index = 0;
-  
+
   bfs_initialized = true;
+
+  Serial.printf("BFS: grid %dx%d, spacing=%dcm, start=edge(%d,%d)-(%d,%d) end=sq(%d,%d), "
+                "walls=%d, bottles=%d, gates=%d, nodes=%d\n",
+                rows, cols, grid_course.spacing_cm,
+                grid_course.start_r1, grid_course.start_c1,
+                grid_course.start_r2, grid_course.start_c2,
+                grid_course.end_row, grid_course.end_col,
+                grid_course.wall_count, grid_course.bottle_count,
+                grid_course.gate_count, bfs_state.node_count);
+}
+
+// Forward declaration (defined after bfsComputePath)
+static bool bfsComputePath(uint8_t start_node, uint8_t goal_node);
+
+// Compute BFS path visiting all gates (if any) in optimal order.
+// For 0 gates: simple BFS from start to end.
+// For 1+ gates: try all permutations (up to MAX_GATES!) to find shortest total path.
+static bool bfsComputePathWithGates() {
+  uint8_t startId = bfs_start_edge_node;   // Virtual start at edge midpoint
+  uint8_t goalId = bfs_end_center_node;    // Virtual center of end square
+
+  if (grid_course.gate_count == 0) {
+    // Simple BFS
+    return bfsComputePath(startId, goalId);
+  }
+
+  // Collect gate square center virtual nodes as waypoints to visit.
+  uint8_t gate_nodes[MAX_GATES];
+  uint8_t ng = grid_course.gate_count;
+  for (uint8_t i = 0; i < ng; i++) {
+    gate_nodes[i] = bfs_gate_nodes[i];
+  }
+
+  // For small gate counts, try all permutations
+  if (ng > 6) ng = 6;  // Cap at 6! = 720 permutations
+
+  // Generate permutation indices
+  uint8_t perm[MAX_GATES];
+  for (uint8_t i = 0; i < ng; i++) perm[i] = i;
+
+  uint8_t best_order[MAX_GATES];
+  uint8_t best_total_len = 255;
+  bool found = false;
+
+  // Try all permutations using heap's algorithm iteratively
+  uint8_t c[MAX_GATES];
+  memset(c, 0, sizeof(c));
+
+  // Evaluate current permutation
+  auto evalPerm = [&]() {
+    uint8_t total = 0;
+    uint8_t from = startId;
+    for (uint8_t i = 0; i < ng; i++) {
+      if (!bfsComputePath(from, gate_nodes[perm[i]])) return;
+      total += bfs_state.path_length;
+      from = gate_nodes[perm[i]];
+    }
+    if (!bfsComputePath(from, goalId)) return;
+    total += bfs_state.path_length;
+    if (total < best_total_len) {
+      best_total_len = total;
+      memcpy(best_order, perm, ng);
+      found = true;
+    }
+  };
+
+  evalPerm();
+  uint8_t i = 0;
+  while (i < ng) {
+    if (c[i] < i) {
+      if (i % 2 == 0) { uint8_t t = perm[0]; perm[0] = perm[i]; perm[i] = t; }
+      else             { uint8_t t = perm[c[i]]; perm[c[i]] = perm[i]; perm[i] = t; }
+      evalPerm();
+      c[i]++;
+      i = 0;
+    } else {
+      c[i] = 0;
+      i++;
+    }
+  }
+
+  if (!found) return false;
+
+  // Reconstruct the full path using best order
+  // Build concatenated path: start → gate1 → gate2 → ... → goal
+  uint8_t full_path[BFS_PATH_MAX_LENGTH];
+  uint8_t full_len = 0;
+  uint8_t from = startId;
+
+  for (uint8_t i = 0; i < ng; i++) {
+    bfsComputePath(from, gate_nodes[best_order[i]]);
+    // Append path (skip first node if not the first segment to avoid duplicates)
+    uint8_t skip = (i == 0) ? 0 : 1;
+    for (uint8_t j = skip; j < bfs_state.path_length && full_len < BFS_PATH_MAX_LENGTH; j++) {
+      full_path[full_len++] = bfs_state.path[j];
+    }
+    from = gate_nodes[best_order[i]];
+  }
+  // Final segment to goal
+  bfsComputePath(from, goalId);
+  for (uint8_t j = 1; j < bfs_state.path_length && full_len < BFS_PATH_MAX_LENGTH; j++) {
+    full_path[full_len++] = bfs_state.path[j];
+  }
+
+  // Store the full path back
+  memcpy(bfs_state.path, full_path, full_len);
+  bfs_state.path_length = full_len;
+  bfs_state.path_index = 0;
+  bfs_state.path_valid = true;
+  return true;
 }
 
 // Breadth-first search to find shortest path from start to goal
@@ -382,7 +923,7 @@ static void bfsAdvancePath() {
 #define RUN_DISTANCE_MIN_M 6.9f
 #define RUN_DISTANCE_MAX_M 10.1f
 #define RUN_TIME_MIN_S 10.0f
-#define RUN_TIME_MAX_S 20.0f
+#define RUN_TIME_MAX_S 100.0f
 
 // Rules-derived parameter granularity:
 // - Target Distance interval depends on tournament level.
@@ -2070,12 +2611,12 @@ static void showBVSplashScreen() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_BLUE);
   ui.setTextSize(3);
-  ui.drawString("BLUE VALLEY", CX, 80);
-  ui.drawString("NORTH", CX, 110);
+  ui.drawString("BLUE VALLEY", 120, 80);
+  ui.drawString("NORTH", 120, 110);
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString("Science Olympiad", CX, 150);
-  ui.drawString("E.V. 2025-26", CX, 170);
+  ui.drawString("Science Olympiad", 120, 150);
+  ui.drawString("E.V. 2025-26", 120, 170);
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
 }
@@ -2084,16 +2625,16 @@ static void showImuCountdownScreen(int secondsLeft) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("IMU CAL", CX, 25);
+  ui.drawString("IMU CAL", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Keep car still", CX, 55);
-  ui.drawString("Calibration starts in", CX, 80);
+  ui.drawString("Keep car still", 120, 55);
+  ui.drawString("Calibration starts in", 120, 80);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(5);
-  ui.drawString(String(secondsLeft), CX, 140);
+  ui.drawString(String(secondsLeft), 120, 140);
 
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
@@ -2103,18 +2644,18 @@ static void showImuReadyScreen(float biasZ) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
-  ui.drawString("READY TO RACE", CX, 60);
+  ui.drawString("READY TO RACE", 120, 60);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("Gyro Z bias (dps)", CX, 105);
+  ui.drawString("Gyro Z bias (dps)", 120, 105);
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString(String(biasZ, 2), CX, 130);
+  ui.drawString(String(biasZ, 2), 120, 130);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("OK to move car", CX, 200);
+  ui.drawString("OK to move car", 120, 200);
 
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
@@ -2124,22 +2665,22 @@ static void showImuCalScreen(int pct, float biasZ) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("IMU CAL", CX, 25);
+  ui.drawString("IMU CAL", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Keep car still", CX, 55);
+  ui.drawString("Keep car still", 120, 55);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString(String(pct) + "%", CX, 90);
+  ui.drawString(String(pct) + "%", 120, 90);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("Gyro Z bias (dps)", CX, 130);
+  ui.drawString("Gyro Z bias (dps)", 120, 130);
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
-  ui.drawString(String(biasZ, 2), CX, 155);
+  ui.drawString(String(biasZ, 2), 120, 155);
 
   ui.pushSprite(0, 0);
 }
@@ -2453,33 +2994,69 @@ enum ScreenState {
   SCREEN_SET_ENC_CAL,
   SCREEN_SET_CTRL_MODE,
   SCREEN_HW_TEST,
+  SCREEN_IMU_CAL,
   SCREEN_BFS_NAV,
+  SCREEN_BFS_RUN,
 };
 
 static ScreenState currentScreen = SCREEN_MAIN_MENU;
 
-static const int NUM_MENU_ITEMS = 9;
+static const int NUM_MENU_ITEMS = 6;
 static const char* menuNames[NUM_MENU_ITEMS] = {
-  "CAR RUN",
-  "DISTANCE",
+  "BFS NAV",
   "TIME",
-  "CAN DIST",
   "BIAS TEST",
   "ENC CAL",
-  "CTRL MODE",
-  "BFS NAV",
+  "IMU CAL",
   "HW TEST",
 };
 
 static int selectedMenuItem = 0;
 
 // BFS Navigation state
-static uint8_t bfs_start_node = 0;     // Starting waypoint
-static uint8_t bfs_goal_node = 2;      // Goal waypoint
+static uint8_t bfs_start_node = 0;     // Starting waypoint (computed from grid)
+static uint8_t bfs_goal_node = 0;      // Goal waypoint (computed from grid)
 static bool bfs_run_active = false;    // Currently executing BFS path
 static uint8_t bfs_current_target = 0; // Current target waypoint in path
 static float bfs_target_distance = 0.0f;
 static float bfs_target_angle = 0.0f;
+
+// BFS Setup wizard steps (grid size is fixed at 4x5 / 200x250cm):
+//  0 = Start position  (dial cycles border intersections)
+//  1 = End position    (dial cycles square centers)
+//  2 = Walls editor    (dial scrolls edges, click toggles wall)
+//  3 = Bottles editor  (dial scrolls nodes, click toggles bottle)
+//  4 = Gates editor    (dial scrolls edges, click toggles gate)
+//  5 = Confirm / GO    (long-press to start run)
+#define BFS_SETUP_STEP_COUNT 8
+static int bfs_setup_step = 0;
+
+// BFS Run state machine
+enum BfsRunPhase {
+  BFS_PHASE_IDLE = 0,
+  BFS_PHASE_TURN,        // Pivoting to face next waypoint
+  BFS_PHASE_DRIVE,       // Driving toward next waypoint
+  BFS_PHASE_ARRIVED,     // Reached a waypoint, advance path
+  BFS_PHASE_DONE,        // Reached final goal
+};
+static BfsRunPhase bfs_run_phase = BFS_PHASE_IDLE;
+static float bfs_run_start_yaw = 0.0f;       // IMU yaw at start of BFS run
+static float bfs_run_initial_heading_deg = 0.0f; // Grid heading robot faces at start (from border)
+static float bfs_run_target_yaw_deg = 0.0f;  // Target yaw for current segment
+static float bfs_run_segment_dist_m = 0.0f;  // Distance for current segment
+static float bfs_run_driven_m = 0.0f;        // Distance driven in current segment
+static int32_t bfs_run_enc_start_L = 0;
+static int32_t bfs_run_enc_start_R = 0;
+static float bfs_run_total_driven_m = 0.0f;
+static unsigned long bfs_run_start_ms = 0;
+static float bfs_run_cumulative_yaw_deg = 0.0f;  // Accumulated heading from start
+
+// BFS run tuning
+#define BFS_TURN_PWM 120
+#define BFS_TURN_TOLERANCE_DEG 5.0f
+#define BFS_DRIVE_PWM 140
+#define BFS_DRIVE_STEER_KP 3.0f
+#define BFS_ARRIVE_TOLERANCE_M 0.05f
 
 static float runDistanceM = 7.0f;
 static float runTimeS = 15.0f;
@@ -2564,11 +3141,61 @@ static void loadPersistedSettings() {
   canDistanceM = prefs.getFloat("can_dist", canDistanceM);
   if (canDistanceM < CAN_ENABLE_MIN_M) canDistanceM = 0.0f;
 
-  // BFS Navigation settings
-  bfs_start_node = (uint8_t)prefs.getUChar("bfs_start", bfs_start_node);
-  bfs_goal_node = (uint8_t)prefs.getUChar("bfs_goal", bfs_goal_node);
-  if (bfs_start_node >= BFS_MAX_NODES) bfs_start_node = 0;
-  if (bfs_goal_node >= BFS_MAX_NODES) bfs_goal_node = 2;
+  // Grid course settings
+  gridCourseDefaults(); // set defaults first
+  // Grid size is fixed (5x4 squares = 6 cols x 5 rows, 50cm spacing)
+  // Only load user-configurable fields: start edge, end position, walls, bottles, gates
+  grid_course.start_r1 = (uint8_t)prefs.getUChar("gc_sr1", grid_course.start_r1);
+  grid_course.start_c1 = (uint8_t)prefs.getUChar("gc_sc1", grid_course.start_c1);
+  grid_course.start_r2 = (uint8_t)prefs.getUChar("gc_sr2", grid_course.start_r2);
+  grid_course.start_c2 = (uint8_t)prefs.getUChar("gc_sc2", grid_course.start_c2);
+  grid_course.end_col = (uint8_t)prefs.getUChar("gc_ec", grid_course.end_col);
+  grid_course.end_row = (uint8_t)prefs.getUChar("gc_er", grid_course.end_row);
+  // Validate start edge is on border; if invalid, reset to default
+  {
+    bool valid = false;
+    uint16_t bec = gridBorderEdgeCount();
+    for (uint16_t i = 0; i < bec; i++) {
+      uint8_t r1, c1, r2, c2;
+      gridBorderEdgeFromIndex(i, r1, c1, r2, c2);
+      if (r1 == grid_course.start_r1 && c1 == grid_course.start_c1 &&
+          r2 == grid_course.start_r2 && c2 == grid_course.start_c2) {
+        grid_start_cursor = i;
+        valid = true;
+        break;
+      }
+    }
+    if (!valid) {
+      gridBorderEdgeFromIndex(0, grid_course.start_r1, grid_course.start_c1,
+                               grid_course.start_r2, grid_course.start_c2);
+      grid_start_cursor = 0;
+    }
+  }
+  // Clamp end to square range (0 to cols-2, 0 to rows-2)
+  if (grid_course.end_col >= grid_course.cols - 1) grid_course.end_col = grid_course.cols - 2;
+  if (grid_course.end_row >= grid_course.rows - 1) grid_course.end_row = grid_course.rows - 2;
+  grid_end_cursor = gridSquareIndex(grid_course.end_row, grid_course.end_col);
+  // Load walls (packed as 4 bytes each: r1,c1,r2,c2)
+  grid_course.wall_count = (uint8_t)prefs.getUChar("gc_wn", 0);
+  if (grid_course.wall_count > MAX_WALLS) grid_course.wall_count = 0;
+  if (grid_course.wall_count > 0) {
+    prefs.getBytes("gc_wd", grid_course.walls, grid_course.wall_count * sizeof(GridWall));
+  }
+  // Load bottles (packed as 4 bytes each: r1,c1,r2,c2 — edge-based)
+  grid_course.bottle_count = (uint8_t)prefs.getUChar("gc_bn", 0);
+  if (grid_course.bottle_count > MAX_BOTTLES) grid_course.bottle_count = 0;
+  if (grid_course.bottle_count > 0) {
+    prefs.getBytes("gc_bd", grid_course.bottles, grid_course.bottle_count * sizeof(GridBottle));
+  }
+  // Load gates (packed as 2 bytes each: row,col — square-based)
+  grid_course.gate_count = (uint8_t)prefs.getUChar("gc_gn", 0);
+  if (grid_course.gate_count > MAX_GATES) grid_course.gate_count = 0;
+  if (grid_course.gate_count > 0) {
+    prefs.getBytes("gc_gd", grid_course.gates, grid_course.gate_count * sizeof(GridGate));
+  }
+  // BFS start/goal determined at graph build time (virtual nodes)
+  bfs_start_node = 0;
+  bfs_goal_node = 0;
 
   // Enforce competition ranges
   if (runDistanceM < RUN_DISTANCE_MIN_M) runDistanceM = RUN_DISTANCE_MIN_M;
@@ -2608,9 +3235,28 @@ static void savePersistedSettings() {
   prefs.putFloat("run_time", runTimeS);
   prefs.putFloat("can_dist", canDistanceM);
 
-  // BFS Navigation settings
-  prefs.putUChar("bfs_start", bfs_start_node);
-  prefs.putUChar("bfs_goal", bfs_goal_node);
+  // Grid course settings (cols/rows/spacing are fixed, not saved)
+  prefs.putUChar("gc_sr1", grid_course.start_r1);
+  prefs.putUChar("gc_sc1", grid_course.start_c1);
+  prefs.putUChar("gc_sr2", grid_course.start_r2);
+  prefs.putUChar("gc_sc2", grid_course.start_c2);
+  prefs.putUChar("gc_ec", grid_course.end_col);
+  prefs.putUChar("gc_er", grid_course.end_row);
+  // Save walls
+  prefs.putUChar("gc_wn", grid_course.wall_count);
+  if (grid_course.wall_count > 0) {
+    prefs.putBytes("gc_wd", grid_course.walls, grid_course.wall_count * sizeof(GridWall));
+  }
+  // Save bottles
+  prefs.putUChar("gc_bn", grid_course.bottle_count);
+  if (grid_course.bottle_count > 0) {
+    prefs.putBytes("gc_bd", grid_course.bottles, grid_course.bottle_count * sizeof(GridBottle));
+  }
+  // Save gates
+  prefs.putUChar("gc_gn", grid_course.gate_count);
+  if (grid_course.gate_count > 0) {
+    prefs.putBytes("gc_gd", grid_course.gates, grid_course.gate_count * sizeof(GridGate));
+  }
 }
 
 static bool runActive = false;
@@ -3051,7 +3697,7 @@ static void enterScreen(ScreenState next) {
 
   // IMU calibration happens when entering the RUN screen (not on Start).
   // This keeps START latency low and makes calibration explicit.
-  if (next == SCREEN_RUN) {
+  if (next == SCREEN_RUN || next == SCREEN_BFS_RUN) {
     if (imu_present && imu_control_enabled) {
       // Give the car a moment to settle (users often enter RUN while still handling it).
       delay(500);
@@ -3060,6 +3706,15 @@ static void enterScreen(ScreenState next) {
       delay(250);
     }
   }
+
+  // Dedicated IMU CAL screen: run full calibration on entry
+  if (next == SCREEN_IMU_CAL) {
+    if (imu_present) {
+      delay(500);
+      calibrateImuGyroBias();
+    }
+  }
+
   currentScreen = next;
 }
 
@@ -3416,41 +4071,32 @@ static void readWheelEncodersInternal(bool force) {
   encoderL_found = false;
   encoderR_found = false;
 
-  // Read left encoder directly (skip i2cPing — reduces bus traffic by 2 transactions)
-  {
-    Wire.beginTransmission(ENCODER_L_ADDR);
-    Wire.write((uint8_t)0x00);
-    if (Wire.endTransmission(false) == 0) {  // repeated-start, keeps bus held
-      if (Wire.requestFrom((uint8_t)ENCODER_L_ADDR, (size_t)4) == 4 && Wire.available() >= 4) {
-        int32_t value = 0;
-        value |= (int32_t)Wire.read() << 0;
-        value |= (int32_t)Wire.read() << 8;
-        value |= (int32_t)Wire.read() << 16;
-        value |= (int32_t)Wire.read() << 24;
-        encoderL_count = value;
-        encoderL_found = true;
+  // Helper: try reading a 4-byte encoder value with retry
+  auto readEncoder = [](uint8_t addr, int32_t &out_count, bool &out_found) {
+    for (uint8_t attempt = 0; attempt < 3; attempt++) {
+      Wire.beginTransmission(addr);
+      Wire.write((uint8_t)0x00);
+      if (Wire.endTransmission(false) == 0) {
+        if (Wire.requestFrom((uint8_t)addr, (size_t)4) == 4 && Wire.available() >= 4) {
+          int32_t value = 0;
+          value |= (int32_t)Wire.read() << 0;
+          value |= (int32_t)Wire.read() << 8;
+          value |= (int32_t)Wire.read() << 16;
+          value |= (int32_t)Wire.read() << 24;
+          out_count = value;
+          out_found = true;
+          return;
+        }
       }
+      // Failed — flush any leftover bytes and retry
+      while (Wire.available()) Wire.read();
+      delayMicroseconds(200);
     }
-  }
+  };
 
-  i2cGuard();  // pause between encoder reads
-
-  // Read right encoder directly
-  {
-    Wire.beginTransmission(ENCODER_R_ADDR);
-    Wire.write((uint8_t)0x00);
-    if (Wire.endTransmission(false) == 0) {  // repeated-start
-      if (Wire.requestFrom((uint8_t)ENCODER_R_ADDR, (size_t)4) == 4 && Wire.available() >= 4) {
-        int32_t value = 0;
-        value |= (int32_t)Wire.read() << 0;
-        value |= (int32_t)Wire.read() << 8;
-        value |= (int32_t)Wire.read() << 16;
-        value |= (int32_t)Wire.read() << 24;
-        encoderR_count = value;
-        encoderR_found = true;
-      }
-    }
-  }
+  readEncoder(ENCODER_L_ADDR, encoderL_count, encoderL_found);
+  i2cGuard();
+  readEncoder(ENCODER_R_ADDR, encoderR_count, encoderR_found);
 
   i2cGuard();  // settle before next I2C user
 }
@@ -3768,21 +4414,81 @@ static void applyControlModeDialSteps(int detentSteps) {
   }
 }
 
-static void applyBfsDialSteps(int detentSteps, int& bfs_setup_step) {
-  // bfs_setup_step 0 = selecting start node
-  // bfs_setup_step 1 = selecting goal node
+// Helper: clamp an int within [lo, hi]
+static inline int clampInt(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static void applyBfsDialSteps(int detentSteps, int bfs_step) {
   if (detentSteps == 0) return;
-  
-  if (bfs_setup_step == 0) {
-    int32_t next = (int32_t)bfs_start_node + detentSteps;
-    if (next < 0) next = 0;
-    if (next >= (int32_t)bfs_state.node_count) next = bfs_state.node_count - 1;
-    bfs_start_node = (uint8_t)next;
-  } else {
-    int32_t next = (int32_t)bfs_goal_node + detentSteps;
-    if (next < 0) next = 0;
-    if (next >= (int32_t)bfs_state.node_count) next = bfs_state.node_count - 1;
-    bfs_goal_node = (uint8_t)next;
+
+  switch (bfs_step) {
+    case 0: { // Start position (cycle border edge midpoints)
+      int bc = (int)gridBorderEdgeCount();
+      if (bc > 0) {
+        int v = (int)grid_start_cursor + detentSteps;
+        while (v < 0) v += bc;
+        grid_start_cursor = (uint16_t)(v % bc);
+        gridBorderEdgeFromIndex(grid_start_cursor,
+          grid_course.start_r1, grid_course.start_c1,
+          grid_course.start_r2, grid_course.start_c2);
+      }
+      break;
+    }
+    case 1: { // End position (cycle square centers)
+      int sc = (int)gridSquareCount();
+      if (sc > 0) {
+        int v = (int)grid_end_cursor + detentSteps;
+        while (v < 0) v += sc;
+        grid_end_cursor = (uint16_t)(v % sc);
+        gridSquarePosition(grid_end_cursor, grid_course.end_row, grid_course.end_col);
+      }
+      break;
+    }
+    case 2: { // Horizontal walls editor cursor
+      int ec = (int)gridHEdgeCount();
+      if (ec > 0) {
+        int v = (int)grid_hwall_cursor + detentSteps;
+        grid_hwall_cursor = (uint16_t)clampInt(v, 0, ec - 1);
+      }
+      break;
+    }
+    case 3: { // Vertical walls editor cursor
+      int ec = (int)gridVEdgeCount();
+      if (ec > 0) {
+        int v = (int)grid_vwall_cursor + detentSteps;
+        grid_vwall_cursor = (uint16_t)clampInt(v, 0, ec - 1);
+      }
+      break;
+    }
+    case 4: { // Horizontal bottles editor cursor
+      int ec = (int)gridHEdgeCount();
+      if (ec > 0) {
+        int v = (int)grid_hbottle_cursor + detentSteps;
+        grid_hbottle_cursor = (uint16_t)clampInt(v, 0, ec - 1);
+      }
+      break;
+    }
+    case 5: { // Vertical bottles editor cursor
+      int ec = (int)gridVEdgeCount();
+      if (ec > 0) {
+        int v = (int)grid_vbottle_cursor + detentSteps;
+        grid_vbottle_cursor = (uint16_t)clampInt(v, 0, ec - 1);
+      }
+      break;
+    }
+    case 6: { // Gates editor cursor (squares)
+      int sc = (int)gridSquareCount();
+      if (sc > 0) {
+        int v = (int)grid_gate_cursor + detentSteps;
+        grid_gate_cursor = (uint16_t)clampInt(v, 0, sc - 1);
+      }
+      break;
+    }
+    default:
+      break;
   }
   settings_dirty = true;
   settings_dirty_ms = millis();
@@ -3795,20 +4501,20 @@ static void drawMainMenu() {
   // If the critical devices aren't present, do not start the run (safer than open-loop).
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  const int cy = ui.height() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(1);
-  ui.drawString("MENU", cx, 15);
+  ui.drawString("MENU", 120, 15);
 
-  float radius = min(cx, cy) - 50.0f;
+  float radius = 70.0f;
+  float centerX = 120.0f;
+  float centerY = 120.0f;
 
   for (int i = 0; i < NUM_MENU_ITEMS; i++) {
     float angle = (i * (360.0f / NUM_MENU_ITEMS) - 90.0f) * (float)M_PI / 180.0f;
-    float itemX = cx + radius * cosf(angle);
-    float itemY = cy + radius * sinf(angle);
+    float itemX = centerX + radius * cosf(angle);
+    float itemY = centerY + radius * sinf(angle);
 
     if (i == selectedMenuItem) {
       ui.fillCircle(itemX, itemY, 30, TFT_DARKGREEN);
@@ -3826,17 +4532,17 @@ static void drawMainMenu() {
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
-  ui.drawString(menuNames[selectedMenuItem], cx, cy);
+  ui.drawString(menuNames[selectedMenuItem], centerX, centerY);
 
   // Status lines (keep readable; don't cram everything onto one line)
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
   const String line1 = String(runDistanceM, 2) + "m / " + String(runTimeS, 1) + "s";
-  ui.drawString(line1, cx, ui.height() - 40);
+  ui.drawString(line1, 120, 195);
 
   ui.setTextColor(TFT_WHITE);
   const String line2 = (canDistanceM >= CAN_ENABLE_MIN_M) ? (String("CAN DIST: ") + String(canDistanceM, 2) + "m") : String("CAN DIST: OFF");
-  ui.drawString(line2, cx, ui.height() - 15);
+  ui.drawString(line2, 120, 220);
 
   ui.setTextSize(1);
 }
@@ -3845,26 +4551,25 @@ static void drawSetDistance() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("SET DISTANCE", cx, 25);
+  ui.drawString("SET DISTANCE", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", cx, 55);
+  ui.drawString("Turn dial to adjust", 120, 55);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(4);
-  ui.drawString(String(runDistanceM, 2), cx, 115);
+  ui.drawString(String(runDistanceM, 2), 120, 115);
   ui.setTextSize(2);
-  ui.drawString("meters", cx, 155);
+  ui.drawString("meters", 120, 155);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString("Press to save", cx, 210);
+  ui.drawString("Press to save", 120, 210);
   ui.setTextSize(1);
 }
 
@@ -3872,53 +4577,51 @@ static void drawSetControlMode() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("CTRL MODE", cx, 25);
+  ui.drawString("CTRL MODE", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", cx, 55);
-  ui.drawString("Click to save", cx, 70);
+  ui.drawString("Turn dial to adjust", 120, 55);
+  ui.drawString("Click to save", 120, 70);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(3);
-  ui.drawString(controlModeName(control_mode), cx, 125);
+  ui.drawString(controlModeName(control_mode), 120, 125);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString("IMU = gyro heading hold", cx, 170);
-  ui.drawString("ENC = rate match only", cx, 185);
-  ui.drawString("HYBRID = ENC + IMU", cx, 200);
+  ui.drawString("IMU = gyro heading hold", 120, 170);
+  ui.drawString("ENC = rate match only", 120, 185);
+  ui.drawString("HYBRID = ENC + IMU", 120, 200);
 }
 
 static void drawSetTime() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("SET TIME", cx, 25);
+  ui.drawString("SET TIME", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", cx, 55);
+  ui.drawString("Turn dial to adjust", 120, 55);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(4);
-  ui.drawString(String(runTimeS, 1), cx, 115);
+  ui.drawString(String(runTimeS, 1), 120, 115);
   ui.setTextSize(2);
-  ui.drawString("seconds", cx, 155);
+  ui.drawString("seconds", 120, 155);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString("Press to save", cx, 210);
+  ui.drawString("Press to save", 120, 210);
   ui.setTextSize(1);
 }
 
@@ -3926,29 +4629,28 @@ static void drawSetCanDistance() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  const int cx = ui.width() / 2;
-  ui.drawString(FW_VERSION, cx, 2);
+  ui.drawString(FW_VERSION, 120, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("CAN DIST", cx, 25);
+  ui.drawString("CAN DIST", 120, 25);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to adjust", cx, 55);
-  ui.drawString("Distance between", cx, 70);
-  ui.drawString("inside can edges", cx, 85);
-  ui.drawString("0 = straight run", cx, 100);
+  ui.drawString("Turn dial to adjust", 120, 55);
+  ui.drawString("Distance between", 120, 70);
+  ui.drawString("inside can edges", 120, 85);
+  ui.drawString("0 = straight run", 120, 100);
 
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(4);
-  ui.drawString(String(canDistanceM, 2), cx, 115);
+  ui.drawString(String(canDistanceM, 2), 120, 115);
   ui.setTextSize(2);
-  ui.drawString("meters", cx, 155);
+  ui.drawString("meters", 120, 155);
 
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(2);
-  ui.drawString("Press to save", cx, 210);
+  ui.drawString("Press to save", 120, 210);
   ui.setTextSize(1);
 }
 
@@ -4128,49 +4830,487 @@ static void drawRunScreen() {
 }
 
 // ========================================================================
-// BFS NAV DISPLAY SCREEN
+// BFS NAV DISPLAY SCREEN - Grid course setup wizard
 // ========================================================================
-static void drawBfsNavScreen(int bfs_setup_step) {
+
+// Draw a mini grid visualization on the display
+static void drawGridMinimap(int16_t ox, int16_t oy, int16_t w, int16_t h,
+                            int highlightStep = -1) {
+  const uint8_t rows = grid_course.rows;
+  const uint8_t cols = grid_course.cols;
+  if (rows < 2 || cols < 2) return;
+
+  // Vertical layout: row → horizontal (shorter, 4 cells), col → vertical (longer, 5 cells)
+  const int16_t cw = w / (rows - 1);   // horizontal = rows-1 cells
+  const int16_t ch = h / (cols - 1);   // vertical = cols-1 cells
+  const int16_t gw = cw * (rows - 1);
+  const int16_t gh = ch * (cols - 1);
+
+  // Grid-to-screen transform: row→x, col→y (makes 5x4 grid taller than wide)
+  auto g2s = [&](float r, float c, int16_t &sx, int16_t &sy) {
+    sx = ox + (int16_t)(r * cw);
+    sy = oy + (int16_t)(c * ch);
+  };
+
+  // Draw grid lines (faint)
+  for (uint8_t c = 0; c < cols; c++) {
+    int16_t y = oy + c * ch;
+    ui.drawLine(ox, y, ox + gw, y, TFT_DARKGREY);
+  }
+  for (uint8_t r = 0; r < rows; r++) {
+    int16_t x = ox + r * cw;
+    ui.drawLine(x, oy, x, oy + gh, TFT_DARKGREY);
+  }
+
+  // Draw walls as thick red lines
+  for (uint8_t i = 0; i < grid_course.wall_count; i++) {
+    const GridWall& wl = grid_course.walls[i];
+    int16_t x1, y1, x2, y2;
+    g2s(wl.r1, wl.c1, x1, y1);
+    g2s(wl.r2, wl.c2, x2, y2);
+    ui.drawLine(x1, y1, x2, y2, TFT_RED);
+    if (x1 == x2) { // vertical on screen
+      ui.drawLine(x1 - 1, y1, x2 - 1, y2, TFT_RED);
+      ui.drawLine(x1 + 1, y1, x2 + 1, y2, TFT_RED);
+    } else { // horizontal on screen
+      ui.drawLine(x1, y1 - 1, x2, y2 - 1, TFT_RED);
+      ui.drawLine(x1, y1 + 1, x2, y2 + 1, TFT_RED);
+    }
+  }
+
+  // Draw gates as green filled squares
+  for (uint8_t i = 0; i < grid_course.gate_count; i++) {
+    const GridGate& gt = grid_course.gates[i];
+    int16_t x1, y1, x2, y2;
+    g2s(gt.row, gt.col, x1, y1);
+    g2s(gt.row + 1, gt.col + 1, x2, y2);
+    // Semi-transparent green square
+    for (int16_t yy = y1 + 1; yy < y2; yy++)
+      ui.drawLine(x1 + 1, yy, x2 - 1, yy, 0x03E0); // dark green fill
+    ui.drawRect(x1, y1, x2 - x1, y2 - y1, TFT_GREEN);
+  }
+
+  // Draw water bottles as blue dots at edge midpoints
+  for (uint8_t i = 0; i < grid_course.bottle_count; i++) {
+    const GridBottle& bt = grid_course.bottles[i];
+    int16_t x1, y1, x2, y2;
+    g2s(bt.r1, bt.c1, x1, y1);
+    g2s(bt.r2, bt.c2, x2, y2);
+    int16_t mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+    ui.fillCircle(mx, my, 3, TFT_BLUE);
+  }
+
+  // Draw grid intersection dots
+  for (uint8_t r = 0; r < rows; r++) {
+    for (uint8_t c = 0; c < cols; c++) {
+      int16_t px, py;
+      g2s(r, c, px, py);
+      ui.fillCircle(px, py, 2, TFT_WHITE);
+    }
+  }
+
+  // Draw start position at border edge midpoint (green dot)
+  {
+    int16_t sx, sy;
+    g2s((grid_course.start_r1 + grid_course.start_r2) * 0.5f,
+        (grid_course.start_c1 + grid_course.start_c2) * 0.5f, sx, sy);
+    ui.fillCircle(sx, sy, 4, TFT_GREEN);
+  }
+
+  // Draw end position at square center (orange X)
+  {
+    int16_t ex, ey;
+    g2s(grid_course.end_row + 0.5f, grid_course.end_col + 0.5f, ex, ey);
+    ui.fillCircle(ex, ey, 4, TFT_ORANGE);
+    ui.drawLine(ex - 3, ey - 3, ex + 3, ey + 3, TFT_ORANGE);
+    ui.drawLine(ex - 3, ey + 3, ex + 3, ey - 3, TFT_ORANGE);
+  }
+
+  // Highlight current cursor in editor modes
+  if (highlightStep == 2) {
+    // H-Wall editor: highlight horizontal edge under cursor
+    uint8_t r1, c1, r2, c2;
+    gridHEdgeFromIndex(grid_hwall_cursor, r1, c1, r2, c2);
+    int16_t x1, y1, x2, y2;
+    g2s(r1, c1, x1, y1);
+    g2s(r2, c2, x2, y2);
+    int16_t mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+    ui.fillCircle(mx, my, 3, TFT_YELLOW);
+  } else if (highlightStep == 3) {
+    // V-Wall editor: highlight vertical edge under cursor
+    uint8_t r1, c1, r2, c2;
+    gridVEdgeFromIndex(grid_vwall_cursor, r1, c1, r2, c2);
+    int16_t x1, y1, x2, y2;
+    g2s(r1, c1, x1, y1);
+    g2s(r2, c2, x2, y2);
+    int16_t mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+    ui.fillCircle(mx, my, 3, TFT_YELLOW);
+  } else if (highlightStep == 4) {
+    // H-Bottle editor: highlight horizontal edge under cursor
+    uint8_t r1, c1, r2, c2;
+    gridHEdgeFromIndex(grid_hbottle_cursor, r1, c1, r2, c2);
+    int16_t x1, y1, x2, y2;
+    g2s(r1, c1, x1, y1);
+    g2s(r2, c2, x2, y2);
+    int16_t mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+    ui.fillCircle(mx, my, 3, TFT_YELLOW);
+  } else if (highlightStep == 5) {
+    // V-Bottle editor: highlight vertical edge under cursor
+    uint8_t r1, c1, r2, c2;
+    gridVEdgeFromIndex(grid_vbottle_cursor, r1, c1, r2, c2);
+    int16_t x1, y1, x2, y2;
+    g2s(r1, c1, x1, y1);
+    g2s(r2, c2, x2, y2);
+    int16_t mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+    ui.fillCircle(mx, my, 3, TFT_YELLOW);
+  } else if (highlightStep == 6) {
+    // Gate editor: highlight square under cursor
+    uint8_t row, col;
+    gridSquarePosition(grid_gate_cursor, row, col);
+    int16_t x1, y1, x2, y2;
+    g2s(row, col, x1, y1);
+    g2s(row + 1, col + 1, x2, y2);
+    ui.drawRect(x1, y1, x2 - x1, y2 - y1, TFT_YELLOW);
+  }
+}
+
+static void drawImuCalScreen() {
   ui.fillScreen(TFT_BLACK);
+
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("BFS PATHFINDING", 120, 30);
+  ui.drawString("IMU CAL", 120, 20);
 
-  ui.setTextColor(TFT_WHITE);
-  ui.setTextSize(1);
-  
-  // Show current setup step
-  ui.setTextColor(bfs_setup_step == 0 ? TFT_YELLOW : TFT_DARKGREY);
-  ui.drawString("Start Node:", 30, 80);
-  ui.drawString(bfs_state.nodes[bfs_start_node].name, 160, 80);
-  
-  ui.setTextColor(bfs_setup_step == 1 ? TFT_YELLOW : TFT_DARKGREY);
-  ui.drawString("Goal Node:", 30, 110);
-  ui.drawString(bfs_state.nodes[bfs_goal_node].name, 160, 110);
-  
-  // Show all available nodes as reference
-  ui.setTextColor(TFT_DARKGREY);
-  ui.setTextSize(1);
-  ui.drawString("Nodes:", 30, 150);
-  
-  char nodeList[64] = "";
-  for (uint8_t i = 0; i < bfs_state.node_count; i++) {
-    if (i > 0) strcat(nodeList, " ");
-    strcat(nodeList, bfs_state.nodes[i].name);
+  if (!imu_present) {
+    ui.setTextColor(TFT_RED);
+    ui.setTextSize(2);
+    ui.drawString("NO IMU", 120, 120);
+  } else {
+    // Gyro Z bias
+    ui.setTextColor(TFT_DARKGREY);
+    ui.setTextSize(1);
+    ui.drawString("Gyro Z bias (dps)", 120, 50);
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(2);
+    ui.drawString(String(imu_gz_bias_dps, 3), 120, 70);
+
+    // Live gyro Z (corrected)
+    ui.setTextColor(TFT_DARKGREY);
+    ui.setTextSize(1);
+    ui.drawString("Live Gz (dps)", 120, 95);
+    ui.setTextColor(TFT_WHITE);
+    ui.setTextSize(2);
+    ui.drawString(String(imu_gz_dps, 2), 120, 115);
+
+    // Live yaw
+    ui.setTextColor(TFT_DARKGREY);
+    ui.setTextSize(1);
+    ui.drawString("Yaw (deg)", 120, 140);
+    ui.setTextColor(TFT_YELLOW);
+    ui.setTextSize(2);
+    ui.drawString(String(imu_yaw, 1), 120, 160);
+
+    // Raw Gz
+    ui.setTextColor(TFT_DARKGREY);
+    ui.setTextSize(1);
+    ui.drawString("Raw Gz (dps)", 120, 185);
+    ui.setTextColor(TFT_DARKGREY);
+    ui.drawString(String(imu_gz_raw_dps, 2), 120, 198);
   }
-  ui.drawString(nodeList, 30, 165);
-  
-  // Instructions
+
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(1);
-  ui.drawString("Turn dial to select, click to toggle", 30, 190);
-  ui.drawString("Press & hold to start navigation", 30, 205);
+  ui.drawString("Click:recal  Hold:menu", 120, 225);
+}
+
+static void drawBfsNavScreen(int bfs_setup_step) {
+  ui.fillScreen(TFT_BLACK);
+
+  // Step indicator at top
+  char stepBuf[24];
+  snprintf(stepBuf, sizeof(stepBuf), "SETUP %d/%d", bfs_setup_step + 1, BFS_SETUP_STEP_COUNT);
+  ui.setTextColor(TFT_DARKGREY);
+  ui.setTextSize(1);
+  ui.drawString(stepBuf, 120, 12);
+
+  char buf[48];
+
+  switch (bfs_setup_step) {
+    case 0: // Start position (border edge midpoint)
+      ui.setTextColor(TFT_CYAN);
+      ui.setTextSize(2);
+      ui.drawString("START POS", 120, 35);
+      ui.setTextColor(TFT_YELLOW);
+      ui.setTextSize(1);
+      snprintf(buf, sizeof(buf), "Edge (%d,%d)-(%d,%d)",
+               grid_course.start_r1, grid_course.start_c1,
+               grid_course.start_r2, grid_course.start_c2);
+      ui.drawString(buf, 120, 60);
+      ui.setTextColor(TFT_DARKGREY);
+      ui.setTextSize(1);
+      ui.drawString("Border edge midpoint", 120, 80);
+      ui.drawString("5x4 grid, 250x200cm", 120, 95);
+      drawGridMinimap(70, 110, 100, 125);
+      break;
+
+    case 1: // End position (square center)
+      ui.setTextColor(TFT_CYAN);
+      ui.setTextSize(2);
+      ui.drawString("END POS", 120, 35);
+      ui.setTextColor(TFT_YELLOW);
+      ui.setTextSize(2);
+      snprintf(buf, sizeof(buf), "Sq(%d, %d)", grid_course.end_row, grid_course.end_col);
+      ui.drawString(buf, 120, 65);
+      ui.setTextColor(TFT_DARKGREY);
+      ui.setTextSize(1);
+      ui.drawString("Square center", 120, 90);
+      drawGridMinimap(70, 105, 100, 125);
+      break;
+
+    case 2: { // Horizontal walls editor
+      ui.setTextColor(TFT_RED);
+      ui.setTextSize(2);
+      snprintf(buf, sizeof(buf), "H-WALLS (%d)", grid_course.wall_count);
+      ui.drawString(buf, 120, 30);
+
+      uint8_t r1, c1, r2, c2;
+      gridHEdgeFromIndex(grid_hwall_cursor, r1, c1, r2, c2);
+      bool hasWall = gridHasWall(r1, c1, r2, c2);
+
+      ui.setTextColor(hasWall ? TFT_RED : TFT_WHITE);
+      ui.setTextSize(1);
+      snprintf(buf, sizeof(buf), "(%d,%d)-(%d,%d) %s", r1, c1, r2, c2,
+               hasWall ? "[WALL]" : "[open]");
+      ui.drawString(buf, 120, 55);
+
+      drawGridMinimap(70, 70, 100, 125, 2);
+
+      ui.setTextColor(TFT_GREEN);
+      ui.setTextSize(1);
+      ui.drawString("Dial:move Click:toggle", 120, 200);
+      ui.drawString("Hold:next  2s:menu", 120, 215);
+      break;
+    }
+
+    case 3: { // Vertical walls editor
+      ui.setTextColor(TFT_RED);
+      ui.setTextSize(2);
+      snprintf(buf, sizeof(buf), "V-WALLS (%d)", grid_course.wall_count);
+      ui.drawString(buf, 120, 30);
+
+      uint8_t r1, c1, r2, c2;
+      gridVEdgeFromIndex(grid_vwall_cursor, r1, c1, r2, c2);
+      bool hasWall = gridHasWall(r1, c1, r2, c2);
+
+      ui.setTextColor(hasWall ? TFT_RED : TFT_WHITE);
+      ui.setTextSize(1);
+      snprintf(buf, sizeof(buf), "(%d,%d)-(%d,%d) %s", r1, c1, r2, c2,
+               hasWall ? "[WALL]" : "[open]");
+      ui.drawString(buf, 120, 55);
+
+      drawGridMinimap(70, 70, 100, 125, 3);
+
+      ui.setTextColor(TFT_GREEN);
+      ui.setTextSize(1);
+      ui.drawString("Dial:move Click:toggle", 120, 200);
+      ui.drawString("Hold:next  2s:menu", 120, 215);
+      break;
+    }
+
+    case 4: { // Horizontal bottles editor
+      ui.setTextColor(TFT_BLUE);
+      ui.setTextSize(2);
+      snprintf(buf, sizeof(buf), "H-BOTTLES (%d)", grid_course.bottle_count);
+      ui.drawString(buf, 120, 30);
+
+      uint8_t r1, c1, r2, c2;
+      gridHEdgeFromIndex(grid_hbottle_cursor, r1, c1, r2, c2);
+      bool hasBottle = gridHasBottle(r1, c1, r2, c2);
+
+      ui.setTextColor(hasBottle ? TFT_BLUE : TFT_WHITE);
+      ui.setTextSize(1);
+      snprintf(buf, sizeof(buf), "(%d,%d)-(%d,%d) %s", r1, c1, r2, c2,
+               hasBottle ? "[BOTTLE]" : "[empty]");
+      ui.drawString(buf, 120, 55);
+
+      drawGridMinimap(70, 70, 100, 125, 4);
+
+      ui.setTextColor(TFT_GREEN);
+      ui.setTextSize(1);
+      ui.drawString("Dial:move Click:toggle", 120, 200);
+      ui.drawString("Hold:next  2s:menu", 120, 215);
+      break;
+    }
+
+    case 5: { // Vertical bottles editor
+      ui.setTextColor(TFT_BLUE);
+      ui.setTextSize(2);
+      snprintf(buf, sizeof(buf), "V-BOTTLES (%d)", grid_course.bottle_count);
+      ui.drawString(buf, 120, 30);
+
+      uint8_t r1, c1, r2, c2;
+      gridVEdgeFromIndex(grid_vbottle_cursor, r1, c1, r2, c2);
+      bool hasBottle = gridHasBottle(r1, c1, r2, c2);
+
+      ui.setTextColor(hasBottle ? TFT_BLUE : TFT_WHITE);
+      ui.setTextSize(1);
+      snprintf(buf, sizeof(buf), "(%d,%d)-(%d,%d) %s", r1, c1, r2, c2,
+               hasBottle ? "[BOTTLE]" : "[empty]");
+      ui.drawString(buf, 120, 55);
+
+      drawGridMinimap(70, 70, 100, 125, 5);
+
+      ui.setTextColor(TFT_GREEN);
+      ui.setTextSize(1);
+      ui.drawString("Dial:move Click:toggle", 120, 200);
+      ui.drawString("Hold:next  2s:menu", 120, 215);
+      break;
+    }
+
+    case 6: { // Gates editor (squares)
+      ui.setTextColor(TFT_GREEN);
+      ui.setTextSize(2);
+      snprintf(buf, sizeof(buf), "GATES (%d)", grid_course.gate_count);
+      ui.drawString(buf, 120, 30);
+
+      uint8_t row, col;
+      gridSquarePosition(grid_gate_cursor, row, col);
+      bool hasGate = gridHasGate(row, col);
+
+      ui.setTextColor(hasGate ? TFT_GREEN : TFT_WHITE);
+      ui.setTextSize(1);
+      snprintf(buf, sizeof(buf), "Sq(%d,%d) %s", row, col,
+               hasGate ? "[GATE]" : "[none]");
+      ui.drawString(buf, 120, 55);
+
+      drawGridMinimap(70, 70, 100, 125, 6);
+
+      ui.setTextColor(TFT_GREEN);
+      ui.setTextSize(1);
+      ui.drawString("Dial:move Click:toggle", 120, 200);
+      ui.drawString("Hold:next  2s:menu", 120, 215);
+      break;
+    }
+
+    case 7: { // Confirm / GO
+      ui.setTextColor(TFT_CYAN);
+      ui.setTextSize(2);
+      ui.drawString("CONFIRM", 120, 30);
+
+      ui.setTextColor(TFT_WHITE);
+      ui.setTextSize(1);
+      snprintf(buf, sizeof(buf), "Grid: 5x4 (250x200cm)");
+      ui.drawString(buf, 120, 55);
+      snprintf(buf, sizeof(buf), "Start:E(%d,%d)-(%d,%d) End:Sq(%d,%d)",
+               grid_course.start_r1, grid_course.start_c1,
+               grid_course.start_r2, grid_course.start_c2,
+               grid_course.end_row, grid_course.end_col);
+      ui.drawString(buf, 120, 70);
+      snprintf(buf, sizeof(buf), "Walls:%d Bottles:%d Gates:%d",
+               grid_course.wall_count, grid_course.bottle_count,
+               grid_course.gate_count);
+      ui.drawString(buf, 120, 85);
+
+      drawGridMinimap(70, 100, 100, 100);
+
+      ui.setTextColor(TFT_GREEN);
+      ui.setTextSize(1);
+      ui.drawString("Click:GO!  Hold:back", 120, 205);
+      ui.drawString("2s:menu", 120, 218);
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  // Common hint for position steps (0-1)
+  if (bfs_setup_step >= 0 && bfs_setup_step <= 1) {
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(1);
+    ui.drawString("Dial:change  Click:next", 120, 218);
+  }
+}
+
+// ========================================================================
+// BFS RUN DISPLAY SCREEN
+// ========================================================================
+static void drawBfsRunScreen() {
+  ui.fillScreen(TFT_BLACK);
+
+  ui.setTextColor(TFT_CYAN);
+  ui.setTextSize(2);
+  ui.drawString("BFS RUN", 120, 30);
+
+  // Phase indicator
+  const char* phaseStr = "IDLE";
+  uint16_t phaseColor = TFT_DARKGREY;
+  switch (bfs_run_phase) {
+    case BFS_PHASE_TURN:    phaseStr = "TURNING";  phaseColor = TFT_ORANGE;  break;
+    case BFS_PHASE_DRIVE:   phaseStr = "DRIVING";  phaseColor = TFT_GREEN;   break;
+    case BFS_PHASE_ARRIVED: phaseStr = "ARRIVED";  phaseColor = TFT_YELLOW;  break;
+    case BFS_PHASE_DONE:    phaseStr = "DONE!";    phaseColor = TFT_MAGENTA; break;
+    default: break;
+  }
+  ui.setTextColor(phaseColor);
+  ui.setTextSize(2);
+  ui.drawString(phaseStr, 120, 60);
+
+  // Current path progress
+  ui.setTextColor(TFT_WHITE);
+  ui.setTextSize(1);
+  if (bfs_state.path_valid && bfs_state.path_length > 0) {
+    // Show: from -> to  (step N/M)
+    uint8_t fromIdx = (bfs_state.path_index > 0) ? bfs_state.path[bfs_state.path_index - 1]
+                                                  : bfs_state.path[0];
+    uint8_t toIdx = bfs_state.path[bfs_state.path_index];
+    if (bfs_run_phase == BFS_PHASE_DONE) {
+      toIdx = bfs_state.path[bfs_state.path_length - 1];
+      fromIdx = toIdx;
+    }
+    char pathBuf[48];
+    snprintf(pathBuf, sizeof(pathBuf), "%s -> %s",
+             bfs_state.nodes[fromIdx].name, bfs_state.nodes[toIdx].name);
+    ui.drawString(pathBuf, 120, 85);
+
+    char stepBuf[24];
+    snprintf(stepBuf, sizeof(stepBuf), "Step %d / %d",
+             (int)bfs_state.path_index + 1, (int)bfs_state.path_length);
+    ui.drawString(stepBuf, 120, 100);
+  }
+
+  // Segment distance (include current in-progress segment)
+  ui.setTextColor(TFT_WHITE);
+  ui.setTextSize(3);
+  char distBuf[16];
+  float displayDist = bfs_run_total_driven_m + bfs_run_driven_m;
+  snprintf(distBuf, sizeof(distBuf), "%.2fm", (double)displayDist);
+  ui.drawString(distBuf, 120, 135);
+
+  // Elapsed time
+  float elapsed = 0.0f;
+  if (bfs_run_start_ms > 0) {
+    elapsed = (millis() - bfs_run_start_ms) / 1000.0f;
+  }
+  ui.setTextSize(2);
+  char timeBuf[16];
+  snprintf(timeBuf, sizeof(timeBuf), "%.1fs", (double)elapsed);
+  ui.drawString(timeBuf, 120, 165);
+
+  // Yaw info
+  ui.setTextColor(TFT_DARKGREY);
+  ui.setTextSize(1);
+  char yawBuf[32];
+  snprintf(yawBuf, sizeof(yawBuf), "Yaw: %.1f tgt: %.1f",
+           (double)imu_yaw, (double)bfs_run_target_yaw_deg);
+  ui.drawString(yawBuf, 120, 190);
+
+  // Button hint
+  ui.setTextColor(TFT_GREEN);
+  ui.drawString("Click: STOP", 120, 210);
 }
 
 static void renderCurrentScreen() {
-  // BFS Nav screen setup state (persistent across re-renders)
-  static int bfs_setup_step = 0;
-  
   switch (currentScreen) {
     case SCREEN_MAIN_MENU:
       drawMainMenu();
@@ -4199,8 +5339,14 @@ static void renderCurrentScreen() {
     case SCREEN_BFS_NAV:
       drawBfsNavScreen(bfs_setup_step);
       break;
+    case SCREEN_BFS_RUN:
+      drawBfsRunScreen();
+      break;
     case SCREEN_HW_TEST:
       updateDisplay();
+      break;
+    case SCREEN_IMU_CAL:
+      drawImuCalScreen();
       break;
   }
 
@@ -4270,7 +5416,6 @@ void testMotorFormats() {
   Serial.println("\n=== END DIAGNOSTIC ===\n");
 }
 
-#ifndef TEST_BUILD
 void scanI2CBus() {
   Serial.println("\n=== I2C BUS SCAN ===");
   Serial.println("Scanning I2C addresses 0x00-0x7F...\n");
@@ -4299,56 +5444,54 @@ void scanI2CBus() {
   Serial.printf("\nTotal devices found: %d\n", devices_found);
   Serial.println("===========================\n");
 }
-#endif // TEST_BUILD
 
 void updateDisplay() {
   ui.fillScreen(TFT_BLACK);
-  const int cx = ui.width() / 2;
 
   // Title
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("HW TEST", cx, 15);
+  ui.drawString("HW TEST", 120, 15);
 
   // I2C clock status
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(String("I2C: ") + String((unsigned)(i2c_clock_hz / 1000u)) + " kHz", cx, 30);
-  ui.drawString("Hold BtnA: exit", cx, 45);
+  ui.drawString(String("I2C: ") + String((unsigned)(i2c_clock_hz / 1000u)) + " kHz", 120, 30);
+  ui.drawString("Hold BtnA: exit", 120, 45);
  
   // Selected motor
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Motor:", cx, 65);
+  ui.drawString("Motor:", 120, 65);
  
   ui.setTextColor(selected_motor == 0 ? TFT_GREEN : TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString(selected_motor == 0 ? "LEFT" : "RIGHT", cx, 85);
+  ui.drawString(selected_motor == 0 ? "LEFT" : "RIGHT", 120, 85);
  
   // Speed display
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Speed (+/-):", cx, 110);
+  ui.drawString("Speed (+/-):", 120, 110);
  
   ui.setTextColor(TFT_GREEN);
   ui.setTextSize(2);
   char spd_str[16];
   snprintf(spd_str, sizeof(spd_str), "%d", (int)motor_command);
-  ui.drawString(spd_str, cx, 135);
+  ui.drawString(spd_str, 120, 135);
 
   // Legend (use sign for direction)
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
 #if INVERT_MOTOR_DIRECTION
-  ui.drawString("+ = REV   - = FWD", cx, 160);
+  ui.drawString("+ = REV   - = FWD", 120, 160);
 #else
-  ui.drawString("+ = FWD   - = REV", cx, 160);
+  ui.drawString("+ = FWD   - = REV", 120, 160);
 #endif
 
   // Exit hint
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Hold BtnA: MENU", cx, 172);
+  ui.drawString("Hold BtnA: MENU", 120, 172);
 
   // IMU attitude (degrees)
   ui.setTextSize(1);
@@ -4359,10 +5502,10 @@ void updateDisplay() {
     // Display as X/Y/Z degrees for your test harness
     snprintf(imu1, sizeof(imu1), "IMU deg  X:% .1f  Y:% .1f", (double)imu_roll, (double)imu_pitch);
     snprintf(imu2, sizeof(imu2), "         Z:% .1f", (double)imu_yaw);
-    ui.drawString(imu1, cx, 182);
-    ui.drawString(imu2, cx, 194);
+    ui.drawString(imu1, 120, 182);
+    ui.drawString(imu2, 120, 194);
   } else {
-    ui.drawString("IMU deg  X:--  Y:--  Z:--", cx, 188);
+    ui.drawString("IMU deg  X:--  Y:--  Z:--", 120, 188);
   }
 
 
@@ -4375,27 +5518,23 @@ void updateDisplay() {
   else snprintf(lbuf, sizeof(lbuf), "L:--");
   if (encoderR_found) snprintf(rbuf, sizeof(rbuf), "R:%ld", encoderR_count);
   else snprintf(rbuf, sizeof(rbuf), "R:--");
-  ui.drawString(lbuf, cx, 210);
-  ui.drawString(rbuf, cx, 230);
+  ui.drawString(lbuf, 120, 210);
+  ui.drawString(rbuf, 120, 230);
 }
 
 static void showBootMotorTestScreen(const char* line1, const char* line2, const char* line3) {
   ui.fillScreen(TFT_BLACK);
   ui.setTextDatum(middle_center);
 
-  const int cx = ui.width() / 2;
-  const int left_x = cx - 60;
-  const int right_x = cx + 60;
-
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(2);
-  ui.drawString("BOOT MOTOR TEST", cx, 30);
+  ui.drawString("BOOT MOTOR TEST", 120, 30);
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  if (line1) ui.drawString(line1, cx, 80);
-  if (line2) ui.drawString(line2, cx, 100);
-  if (line3) ui.drawString(line3, cx, 120);
+  if (line1) ui.drawString(line1, 120, 80);
+  if (line2) ui.drawString(line2, 120, 100);
+  if (line3) ui.drawString(line3, 120, 120);
 
   ui.setTextColor(TFT_BLUE);
   ui.setTextSize(1);
@@ -4405,8 +5544,8 @@ static void showBootMotorTestScreen(const char* line1, const char* line2, const 
   else snprintf(lbuf, sizeof(lbuf), "L:--");
   if (encoderR_found) snprintf(rbuf, sizeof(rbuf), "R:%ld", encoderR_count);
   else snprintf(rbuf, sizeof(rbuf), "R:--");
-  ui.drawString(lbuf, left_x, 210);
-  ui.drawString(rbuf, right_x, 210);
+  ui.drawString(lbuf, 60, 210);
+  ui.drawString(rbuf, 180, 210);
 
   ui.pushSprite(0, 0);
 }
@@ -4450,7 +5589,6 @@ static void runBootMotorSpinTest() {
   showBootMotorTestScreen("STOPPED", "Boot test complete", "(interactive control disabled)");
 }
 
-#ifndef TEST_BUILD
 void setup() {
   // Initialize serial immediately
   Serial.begin(115200);
@@ -4592,6 +5730,9 @@ void setup() {
  
   boot_ms = millis();
 
+  // Initialize BFS graph for navigation
+  bfsInitializeGraph();
+
   // Safety: ensure motors are stopped on boot.
   motor_enabled = 0;
   motor_command = 0;
@@ -4622,7 +5763,6 @@ void setup() {
   renderCurrentScreen();
 }
 
-#ifndef TEST_BUILD
 void loop() {
   M5.update();
 
@@ -4630,6 +5770,17 @@ void loop() {
   handleSerialCommands();
 
   const unsigned long now = millis();
+
+  // === Track screen changes and reset BFS state ===
+  static ScreenState lastScreen = SCREEN_MAIN_MENU;
+  
+  if (currentScreen != lastScreen) {
+    // Screen changed - reset state
+    if (currentScreen == SCREEN_BFS_NAV) {
+      bfs_setup_step = 0;  // Reset to selecting start node
+    }
+    lastScreen = currentScreen;
+  }
 
 #if RUN_CLOUD_UPLOAD_ENABLE
 #if RUN_CLOUD_UPLOAD_ON_STOP
@@ -4656,7 +5807,8 @@ void loop() {
 
   // Auto-save calibration settings after the dial stops.
   if (settings_dirty && (now - settings_dirty_ms) >= (unsigned long)SETTINGS_AUTOSAVE_IDLE_MS) {
-    if (currentScreen == SCREEN_SET_ENC_CAL || currentScreen == SCREEN_SET_CTRL_MODE) {
+    if (currentScreen == SCREEN_SET_ENC_CAL || currentScreen == SCREEN_SET_CTRL_MODE
+        || currentScreen == SCREEN_BFS_NAV) {
       savePersistedSettings();
       settings_dirty = false;
     }
@@ -4697,8 +5849,6 @@ void loop() {
     stopRun();
     return;
   }
-}
-#endif // TEST_BUILD
 
   // Always keep sensor polling active (I2C)
   readWheelEncoders();
@@ -4837,31 +5987,21 @@ void loop() {
     } else if (clicked) {
       switch (selectedMenuItem) {
         case 0:
-          // Enter Run screen; require explicit start (red button / BtnA) to begin motion.
-          enterScreen(SCREEN_RUN);
-          break;
-        case 1:
-          enterScreen(SCREEN_SET_DISTANCE);
-          break;
-        case 2:
-          enterScreen(SCREEN_SET_TIME);
-          break;
-        case 3:
-          enterScreen(SCREEN_SET_CAN_DISTANCE);
-          break;
-        case 4:
-          enterScreen(SCREEN_BIAS_TEST);
-          break;
-        case 5:
-          enterScreen(SCREEN_SET_ENC_CAL);
-          break;
-        case 6:
-          enterScreen(SCREEN_SET_CTRL_MODE);
-          break;
-        case 7:
           enterScreen(SCREEN_BFS_NAV);
           break;
-        case 8:
+        case 1:
+          enterScreen(SCREEN_SET_TIME);
+          break;
+        case 2:
+          enterScreen(SCREEN_BIAS_TEST);
+          break;
+        case 3:
+          enterScreen(SCREEN_SET_ENC_CAL);
+          break;
+        case 4:
+          enterScreen(SCREEN_IMU_CAL);
+          break;
+        case 5:
           enterScreen(SCREEN_HW_TEST);
           break;
       }
@@ -4872,32 +6012,281 @@ void loop() {
   }
 
   else if (currentScreen == SCREEN_BFS_NAV) {
-    // BFS Navigation setup screen
-    // Dial selects: 0=start node, 1=goal node
-    static int bfs_setup_step = 0;
-    
-    // Use centralized dial handler for node selection
+    // BFS Navigation grid course setup wizard
+    // Dial changes the value for the current setup step
     applyBfsDialSteps(dialSteps, bfs_setup_step);
-    
-    // Button toggles between start and goal selection, long-press to begin navigation
-    if ((now - boot_ms) > 500 && M5.BtnA.wasClicked()) {
-      bfs_setup_step = 1 - bfs_setup_step;  // Toggle between 0 and 1
-    }
-    
+
+    // Long-press tracking
     static bool bfsNavLongPressHandled = false;
-    if (!M5.BtnA.isPressed()) bfsNavLongPressHandled = false;
+    static bool bfsNavExitHandled = false;
+    if (!M5.BtnA.isPressed()) {
+      bfsNavLongPressHandled = false;
+      bfsNavExitHandled = false;
+    }
+
+    // Click behavior depends on current step
+    if ((now - boot_ms) > 500 && M5.BtnA.wasClicked()) {
+      if (bfs_setup_step >= 0 && bfs_setup_step <= 1) {
+        // Position steps 0-1: click advances to next step
+        bfs_setup_step++;
+      } else if (bfs_setup_step == 2) {
+        // H-Wall editor: click toggles wall at cursor
+        uint8_t r1, c1, r2, c2;
+        gridHEdgeFromIndex(grid_hwall_cursor, r1, c1, r2, c2);
+        gridToggleWall(r1, c1, r2, c2);
+      } else if (bfs_setup_step == 3) {
+        // V-Wall editor: click toggles wall at cursor
+        uint8_t r1, c1, r2, c2;
+        gridVEdgeFromIndex(grid_vwall_cursor, r1, c1, r2, c2);
+        gridToggleWall(r1, c1, r2, c2);
+      } else if (bfs_setup_step == 4) {
+        // H-Bottle editor: click toggles bottle at cursor
+        uint8_t r1, c1, r2, c2;
+        gridHEdgeFromIndex(grid_hbottle_cursor, r1, c1, r2, c2);
+        gridToggleBottle(r1, c1, r2, c2);
+      } else if (bfs_setup_step == 5) {
+        // V-Bottle editor: click toggles bottle at cursor
+        uint8_t r1, c1, r2, c2;
+        gridVEdgeFromIndex(grid_vbottle_cursor, r1, c1, r2, c2);
+        gridToggleBottle(r1, c1, r2, c2);
+      } else if (bfs_setup_step == 6) {
+        // Gate editor: click toggles gate at cursor square
+        uint8_t row, col;
+        gridSquarePosition(grid_gate_cursor, row, col);
+        gridToggleGate(row, col);
+      } else if (bfs_setup_step == 7) {
+        // Confirm screen: click starts BFS run
+        bfsInitializeGraph();
+        bfs_start_node = bfs_start_edge_node;
+        bfs_goal_node = bfs_end_center_node;
+        bool pathOk = (grid_course.gate_count > 0) ?
+                       bfsComputePathWithGates() :
+                       bfsComputePath(bfs_start_node, bfs_goal_node);
+        if (pathOk) {
+          bfs_run_active = true;
+          bfs_current_target = bfsGetNextTarget();
+          savePersistedSettings();
+          bfs_run_phase = BFS_PHASE_IDLE;
+          bfs_run_total_driven_m = 0.0f;
+          bfs_run_start_ms = 0;
+          bfs_run_cumulative_yaw_deg = 0.0f;
+          enterScreen(SCREEN_BFS_RUN);
+        }
+      }
+      settings_dirty = true;
+      settings_dirty_ms = millis();
+    }
+
+    // Hold (800ms): advance from editor steps, or start run from confirm
     if (!bfsNavLongPressHandled && M5.BtnA.pressedFor(800)) {
       bfsNavLongPressHandled = true;
-      // Compute path and start navigation
-      if (bfsComputePath(bfs_start_node, bfs_goal_node)) {
-        bfs_run_active = true;
-        bfs_current_target = bfsGetNextTarget();
-        savePersistedSettings();
-        enterScreen(SCREEN_RUN);
+      if (bfs_setup_step >= 2 && bfs_setup_step <= 6) {
+        // Editor steps: advance to next step
+        bfs_setup_step++;
+      } else if (bfs_setup_step == 7) {
+        // Confirm screen: hold goes back one step
+        bfs_setup_step = 6;
       }
     }
-    
+
+    // Very long press (2s): exit back to main menu
+    if (!bfsNavExitHandled && M5.BtnA.pressedFor(2000)) {
+      bfsNavExitHandled = true;
+      savePersistedSettings();
+      enterScreen(SCREEN_MAIN_MENU);
+    }
+
     stopAllMotors();
+  }
+
+  else if (currentScreen == SCREEN_BFS_RUN) {
+    // BFS path-following run screen
+    if ((now - boot_ms) > 500 && M5.BtnA.wasClicked()) {
+      // Stop BFS run
+      bfs_run_phase = BFS_PHASE_DONE;
+      bfs_run_active = false;
+      stopAllMotors();
+      enterScreen(SCREEN_BFS_NAV);
+    }
+
+    // Initialize on first entry
+    if (bfs_run_start_ms == 0) {
+      bfs_run_start_ms = now;
+      bfs_run_start_yaw = imu_yaw;
+      bfs_run_cumulative_yaw_deg = imu_yaw;
+
+      // Compute the grid-frame heading the robot faces at the start position.
+      // The robot is placed at a border edge midpoint, facing INWARD.
+      {
+        uint8_t sr1 = grid_course.start_r1, sc1 = grid_course.start_c1;
+        uint8_t sr2 = grid_course.start_r2, sc2 = grid_course.start_c2;
+        if (sr1 == sr2) {
+          // Horizontal border edge: top (row=0) faces +Y, bottom faces -Y
+          float dr = (sr1 == 0) ? 1.0f : -1.0f;
+          bfs_run_initial_heading_deg = atan2f(dr, 0.0f) * (180.0f / (float)M_PI);
+        } else {
+          // Vertical border edge: left (col=0) faces +X, right faces -X
+          float dc = (sc1 == 0) ? 1.0f : -1.0f;
+          bfs_run_initial_heading_deg = atan2f(0.0f, dc) * (180.0f / (float)M_PI);
+        }
+      }
+
+      // Start by computing first segment
+      bfs_run_phase = BFS_PHASE_ARRIVED;  // Will immediately compute first segment
+      Serial.printf("BFS_RUN: init yaw=%.1f initial_heading=%.1f path_len=%d path_idx=%d\n",
+                    (double)imu_yaw, (double)bfs_run_initial_heading_deg,
+                    (int)bfs_state.path_length, (int)bfs_state.path_index);
+    }
+
+    // Safety timeout: stop BFS run after 120 seconds max
+    if (bfs_run_start_ms > 0 && (now - bfs_run_start_ms) > 120000) {
+      Serial.println("BFS_RUN: SAFETY TIMEOUT");
+      bfs_run_phase = BFS_PHASE_DONE;
+      bfs_run_active = false;
+      stopAllMotors();
+    }
+
+    if (bfs_run_phase == BFS_PHASE_DONE) {
+      stopAllMotors();
+    }
+    else if (bfs_run_phase == BFS_PHASE_ARRIVED) {
+      // Advance to next segment or finish
+      stopAllMotors();
+      Serial.printf("BFS_RUN: ARRIVED idx=%d len=%d\n", (int)bfs_state.path_index, (int)bfs_state.path_length);
+      if (bfs_state.path_index >= bfs_state.path_length - 1) {
+        // Reached final goal
+        bfs_run_phase = BFS_PHASE_DONE;
+        bfs_run_active = false;
+      } else {
+        // Compute heading and distance to next waypoint
+        uint8_t curNode = bfs_state.path[bfs_state.path_index];
+        bfsAdvancePath();
+        uint8_t nextNode = bfs_state.path[bfs_state.path_index];
+
+        float dx = bfs_state.nodes[nextNode].x_m - bfs_state.nodes[curNode].x_m;
+        float dy = bfs_state.nodes[nextNode].y_m - bfs_state.nodes[curNode].y_m;
+        bfs_run_segment_dist_m = sqrtf(dx * dx + dy * dy);
+
+        // Target heading in grid frame (degrees, atan2 convention: Y-down → CW positive)
+        float target_heading_deg = atan2f(dy, dx) * (180.0f / (float)M_PI);
+        // Convert grid heading to IMU yaw:
+        // Grid uses Y-down so atan2 angles increase CW from above.
+        // IMU yaw increases CCW from above.  Negate the grid delta.
+        // At run start, IMU reads start_yaw when robot faces initial_heading_deg.
+        bfs_run_target_yaw_deg = bfs_run_start_yaw - (target_heading_deg - bfs_run_initial_heading_deg);
+
+        // Reset segment encoder tracking
+        bfs_run_enc_start_L = encoderL_count;
+        bfs_run_enc_start_R = encoderR_count;
+        bfs_run_driven_m = 0.0f;
+
+        bfs_run_phase = BFS_PHASE_TURN;
+        Serial.printf("BFS_RUN: segment %s->%s dist=%.2f heading=%.1f target_yaw=%.1f\n",
+                      bfs_state.nodes[curNode].name, bfs_state.nodes[nextNode].name,
+                      (double)bfs_run_segment_dist_m, (double)(target_heading_deg),
+                      (double)bfs_run_target_yaw_deg);
+      }
+    }
+    else if (bfs_run_phase == BFS_PHASE_TURN) {
+      // Pivot in place to face the next waypoint
+      float yaw_err = bfs_run_target_yaw_deg - imu_yaw;
+      // Normalize to [-180, 180]
+      while (yaw_err > 180.0f) yaw_err -= 360.0f;
+      while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
+        // Close enough, start driving
+        stopAllMotors();
+        delay(100);  // Brief settle
+        readWheelEncodersInternal(true);  // Force fresh read after settle
+        bfs_run_enc_start_L = encoderL_count;
+        bfs_run_enc_start_R = encoderR_count;
+        bfs_run_phase = BFS_PHASE_DRIVE;
+        Serial.printf("BFS_RUN: TURN done, starting DRIVE yaw=%.1f err=%.1f encL=%ld encR=%ld\n",
+                      (double)imu_yaw, (double)yaw_err,
+                      (long)encoderL_count, (long)encoderR_count);
+      } else {
+        // Pivot: positive error = turn left (CCW), negative = turn right (CW)
+        int sign = (yaw_err > 0.0f) ? 1 : -1;
+        // Scale PWM by error magnitude for smoother approach
+        float pwmScale = fabsf(yaw_err) / 45.0f;
+        if (pwmScale > 1.0f) pwmScale = 1.0f;
+        if (pwmScale < 0.4f) pwmScale = 0.4f;
+        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
+        if (turnPwm < 80) turnPwm = 80;
+        setMotorsPivotPwm(sign, turnPwm);
+        applyMotorOutputs();
+      }
+    }
+    else if (bfs_run_phase == BFS_PHASE_DRIVE) {
+      // Drive forward toward waypoint with yaw correction
+      const int32_t dL = encoderL_count - bfs_run_enc_start_L;
+      const int32_t dR = encoderR_count - bfs_run_enc_start_R;
+      const float dLcorr = (INVERT_LEFT_ENCODER_COUNT ? -(float)dL : (float)dL);
+      const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
+      const float sL = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
+      const float sR = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
+      bfs_run_driven_m = fabsf(0.5f * (sL + sR));
+
+      if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
+        // Reached waypoint
+        stopAllMotors();
+        delay(150);  // Let robot physically stop before next segment
+        bfs_run_total_driven_m += bfs_run_driven_m;
+        bfs_run_phase = BFS_PHASE_ARRIVED;
+        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f\n",
+                      (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
+                      (double)bfs_run_total_driven_m);
+      } else {
+        // Drive with yaw correction
+        float yaw_err = bfs_run_target_yaw_deg - imu_yaw;
+        while (yaw_err > 180.0f) yaw_err -= 360.0f;
+        while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+        float steerCorr = BFS_DRIVE_STEER_KP * yaw_err;
+        if (steerCorr > 60.0f) steerCorr = 60.0f;
+        if (steerCorr < -60.0f) steerCorr = -60.0f;
+
+        // Brake zone near target — ramp down over last 0.5m
+        float remaining = bfs_run_segment_dist_m - bfs_run_driven_m;
+        float speedFactor = 1.0f;
+        if (remaining < 0.5f) {
+          speedFactor = remaining / 0.5f;
+          if (speedFactor < 0.25f) speedFactor = 0.25f;
+        }
+
+        float basePwm = BFS_DRIVE_PWM * speedFactor;
+        // Ensure minimum PWM is high enough to actually move the robot on the ground
+        if (basePwm < 70.0f) basePwm = 70.0f;
+        // Positive yaw_err → need to turn LEFT (CCW, increase IMU yaw)
+        // → slow left wheel, speed up right wheel
+        float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
+        float rightPwm = basePwm + steerCorr - (float)motor_bias_pwm;
+
+        if (leftPwm < 0.0f) leftPwm = 0.0f;
+        if (rightPwm < 0.0f) rightPwm = 0.0f;
+        if (leftPwm > 255.0f) leftPwm = 255.0f;
+        if (rightPwm > 255.0f) rightPwm = 255.0f;
+
+        setMotorsForwardPwm((uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f));
+        applyMotorOutputs();
+
+        // Periodic debug
+        static unsigned long lastBfsDriveLog = 0;
+        if (now - lastBfsDriveLog > 200) {
+          lastBfsDriveLog = now;
+          const int32_t dbgDL = encoderL_count - bfs_run_enc_start_L;
+          const int32_t dbgDR = encoderR_count - bfs_run_enc_start_R;
+          Serial.printf("BFS_DRIVE: driven=%.3f/%.2f rem=%.2f yawErr=%.1f Lpwm=%d Rpwm=%d encDL=%ld encDR=%ld encOK=%c%c rawL=%ld rawR=%ld\n",
+                        (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
+                        (double)remaining, (double)yaw_err,
+                        (int)(leftPwm + 0.5f), (int)(rightPwm + 0.5f),
+                        (long)dbgDL, (long)dbgDR,
+                        encoderL_found ? 'Y' : 'N', encoderR_found ? 'Y' : 'N',
+                        (long)encoderL_count, (long)encoderR_count);
+        }
+      }
+    }
   }
 
   else if (currentScreen == SCREEN_SET_DISTANCE) {
@@ -6709,6 +8098,26 @@ void loop() {
     }
 
     applyMotorOutputs();
+  }
+
+  else if (currentScreen == SCREEN_IMU_CAL) {
+    // Click: re-run calibration
+    if ((now - boot_ms) > 500 && M5.BtnA.wasClicked()) {
+      if (imu_present) {
+        delay(500);
+        calibrateImuGyroBias();
+        imu_yaw = 0.0f;  // Reset yaw after recalibration
+      }
+    }
+    // Hold: back to menu
+    static bool imuCalLongPressHandled = false;
+    if (!M5.BtnA.isPressed()) imuCalLongPressHandled = false;
+    if (!imuCalLongPressHandled && M5.BtnA.pressedFor(800)) {
+      imuCalLongPressHandled = true;
+      suppressNextClick = true;
+      enterScreen(SCREEN_MAIN_MENU);
+    }
+    stopAllMotors();
   }
 
   // Render the active screen
