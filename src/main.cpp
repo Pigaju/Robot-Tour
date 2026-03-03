@@ -3040,13 +3040,14 @@ enum ScreenState {
   SCREEN_HW_TEST,
   SCREEN_IMU_CAL,
   SCREEN_SELF_TEST,
+  SCREEN_SQUARE_TEST,
   SCREEN_BFS_NAV,
   SCREEN_BFS_RUN,
 };
 
 static ScreenState currentScreen = SCREEN_MAIN_MENU;
 
-static const int NUM_MENU_ITEMS = 7;
+static const int NUM_MENU_ITEMS = 8;
 static const char* menuNames[NUM_MENU_ITEMS] = {
   "BFS NAV",
   "TIME",
@@ -3055,6 +3056,7 @@ static const char* menuNames[NUM_MENU_ITEMS] = {
   "IMU CAL",
   "HW TEST",
   "SELF TEST",
+  "SQ TEST",
 };
 
 static int selectedMenuItem = 0;
@@ -3766,6 +3768,12 @@ static void enterScreen(ScreenState next) {
   if (next == SCREEN_SELF_TEST) {
     extern void selfTestReset();
     selfTestReset();
+  }
+
+  // Reset square test to idle on entry
+  if (next == SCREEN_SQUARE_TEST) {
+    extern void sqTestResetExtern();
+    sqTestResetExtern();
   }
 
   currentScreen = next;
@@ -5792,6 +5800,395 @@ static void drawSelfTestScreen() {
   ui.drawString("Click: retest  Hold: back", 120, 228);
 }
 
+// ========================================================================
+// Square Drive Test
+// Drives a 50cm square (4 sides, 4 right turns) and measures drift.
+// Reports: per-side distance error, heading error, and final position
+// offset from start (how far the robot drifted from a perfect square).
+// ========================================================================
+enum SqTestPhase {
+  SQ_IDLE,
+  SQ_CALIBRATING,   // IMU calibration at start
+  SQ_TURN,          // Pivoting 90° before next side
+  SQ_DRIVE,         // Driving one side of the square
+  SQ_DONE,          // All 4 sides complete — show results
+};
+
+struct SqTestResult {
+  float side_dist_m[4];     // actual distance driven per side
+  float side_dist_err_m[4]; // error vs target per side
+  float heading_after[4];   // IMU yaw after each turn+drive
+  float heading_err[4];     // heading error vs expected
+  float total_dist_m;       // total distance driven
+  float yaw_drift_deg;      // final yaw vs expected (should be ≈ start)
+  float enc_dist_L_m;       // total left encoder distance
+  float enc_dist_R_m;       // total right encoder distance
+  unsigned long elapsed_ms; // total test time
+};
+
+static SqTestPhase sq_phase = SQ_IDLE;
+static SqTestResult sq_result;
+static uint8_t sq_side = 0;                  // current side (0-3)
+static float sq_side_len_m = 0.50f;          // side length (adjustable with dial)
+static float sq_target_yaw = 0.0f;           // target yaw for current turn
+static float sq_start_yaw = 0.0f;            // yaw at test start
+static int32_t sq_enc_start_L = 0;
+static int32_t sq_enc_start_R = 0;
+static int32_t sq_enc_total_start_L = 0;     // encoder snapshot at test start
+static int32_t sq_enc_total_start_R = 0;
+static float sq_driven_m = 0.0f;             // distance driven in current side
+static unsigned long sq_start_ms = 0;
+static unsigned long sq_drive_start_ms = 0;  // for timed fallback
+
+static void sqTestReset() {
+  sq_phase = SQ_IDLE;
+  stopAllMotors();
+}
+
+// Extern wrapper for enterScreen() which is defined before sqTestReset()
+void sqTestResetExtern() { sqTestReset(); }
+
+static void sqTestStart() {
+  memset(&sq_result, 0, sizeof(sq_result));
+  sq_side = 0;
+  sq_phase = SQ_CALIBRATING;
+  sq_start_ms = millis();
+  stopAllMotors();
+  Serial.printf("=== SQUARE TEST START  side=%.2fm ===\n", (double)sq_side_len_m);
+}
+
+// Returns driven distance for current side using adaptive encoder mode
+static float sqComputeDriven() {
+  const int32_t dL = encoderL_count - sq_enc_start_L;
+  const int32_t dR = encoderR_count - sq_enc_start_R;
+  const float dLcorr = (INVERT_LEFT_ENCODER_COUNT  ? -(float)dL : (float)dL);
+  const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
+  const float sL = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
+  const float sR = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
+  switch (enc_mode) {
+    case ENC_MODE_BOTH:       return fabsf(0.5f * (sL + sR));
+    case ENC_MODE_LEFT_ONLY:  return fabsf(sL);
+    case ENC_MODE_RIGHT_ONLY: return fabsf(sR);
+    case ENC_MODE_TIMED: {
+      float elapsed_s = (millis() - sq_drive_start_ms) / 1000.0f;
+      return elapsed_s * ENC_TIMED_SPEED_MPS;
+    }
+  }
+  return 0.0f;
+}
+
+// Called from loop() each tick. Returns true while test is running.
+static bool sqTestTick() {
+  const unsigned long now = millis();
+
+  switch (sq_phase) {
+    case SQ_IDLE:
+    case SQ_DONE:
+      return false;
+
+    case SQ_CALIBRATING: {
+      // Brief IMU calibration
+      if (imu_present) {
+        delay(300);
+        calibrateImuGyroBias();
+        imu_yaw = 0.0f;
+      }
+      readWheelEncodersInternal(true);
+      sq_start_yaw = imu_yaw;
+      sq_target_yaw = sq_start_yaw;  // first side: drive straight ahead
+      sq_enc_total_start_L = encoderL_count;
+      sq_enc_total_start_R = encoderR_count;
+      sq_enc_start_L = encoderL_count;
+      sq_enc_start_R = encoderR_count;
+      sq_driven_m = 0.0f;
+      sq_drive_start_ms = now;
+      sq_phase = SQ_DRIVE;  // start driving first side (no turn needed)
+      Serial.printf("SQ: calibrated yaw=%.1f, starting side 0\n", (double)sq_start_yaw);
+      break;
+    }
+
+    case SQ_TURN: {
+      // Pivot to face the next side (90° right turn each time)
+      float yaw_err = sq_target_yaw - imu_yaw;
+      while (yaw_err > 180.0f) yaw_err -= 360.0f;
+      while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
+        // Turn complete — start driving
+        stopAllMotors();
+        delay(100);
+        readWheelEncodersInternal(true);
+        sq_enc_start_L = encoderL_count;
+        sq_enc_start_R = encoderR_count;
+        sq_driven_m = 0.0f;
+        sq_drive_start_ms = millis();
+        sq_phase = SQ_DRIVE;
+        Serial.printf("SQ: turn done yaw=%.1f target=%.1f, driving side %d\n",
+                      (double)imu_yaw, (double)sq_target_yaw, sq_side);
+      } else {
+        // Pivot
+        int sign = (yaw_err > 0.0f) ? 1 : -1;
+        float pwmScale = fabsf(yaw_err) / 45.0f;
+        if (pwmScale > 1.0f) pwmScale = 1.0f;
+        if (pwmScale < 0.4f) pwmScale = 0.4f;
+        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
+        if (turnPwm < 110) turnPwm = 110;
+        setMotorsPivotPwm(sign, turnPwm);
+        applyMotorOutputs();
+      }
+      break;
+    }
+
+    case SQ_DRIVE: {
+      readWheelEncodersInternal(true);
+      sq_driven_m = sqComputeDriven();
+
+      if (sq_driven_m >= sq_side_len_m - BFS_ARRIVE_TOLERANCE_M) {
+        // Side complete
+        stopAllMotors();
+        delay(150);
+
+        sq_result.side_dist_m[sq_side] = sq_driven_m;
+        sq_result.side_dist_err_m[sq_side] = sq_driven_m - sq_side_len_m;
+        sq_result.heading_after[sq_side] = imu_yaw;
+        // Expected heading after side N: start_yaw - N*90 (turning right = negative yaw for CCW-positive IMU)
+        float expected_yaw = sq_start_yaw - (float)(sq_side) * 90.0f;
+        while (expected_yaw > 180.0f) expected_yaw -= 360.0f;
+        while (expected_yaw < -180.0f) expected_yaw += 360.0f;
+        sq_result.heading_err[sq_side] = imu_yaw - expected_yaw;
+        while (sq_result.heading_err[sq_side] > 180.0f) sq_result.heading_err[sq_side] -= 360.0f;
+        while (sq_result.heading_err[sq_side] < -180.0f) sq_result.heading_err[sq_side] += 360.0f;
+
+        Serial.printf("SQ: side %d done dist=%.3f err=%.3f yaw=%.1f yawErr=%.1f\n",
+                      sq_side, (double)sq_driven_m, (double)sq_result.side_dist_err_m[sq_side],
+                      (double)imu_yaw, (double)sq_result.heading_err[sq_side]);
+
+        sq_side++;
+        if (sq_side >= 4) {
+          // Square complete!
+          sq_result.elapsed_ms = now - sq_start_ms;
+          sq_result.total_dist_m = 0;
+          for (int i = 0; i < 4; i++) sq_result.total_dist_m += sq_result.side_dist_m[i];
+          // Final yaw drift (should be back near start_yaw after 4×90° = 360°)
+          sq_result.yaw_drift_deg = imu_yaw - sq_start_yaw;
+          while (sq_result.yaw_drift_deg > 180.0f) sq_result.yaw_drift_deg -= 360.0f;
+          while (sq_result.yaw_drift_deg < -180.0f) sq_result.yaw_drift_deg += 360.0f;
+          // Encoder totals
+          readWheelEncodersInternal(true);
+          int32_t totDL = encoderL_count - sq_enc_total_start_L;
+          int32_t totDR = encoderR_count - sq_enc_total_start_R;
+          float totDLcorr = (INVERT_LEFT_ENCODER_COUNT ? -(float)totDL : (float)totDL);
+          float totDRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)totDR : (float)totDR);
+          sq_result.enc_dist_L_m = (pulsesPerMeterL > 1.0f) ? (totDLcorr / pulsesPerMeterL) : 0.0f;
+          sq_result.enc_dist_R_m = (pulsesPerMeterR > 1.0f) ? (totDRcorr / pulsesPerMeterR) : 0.0f;
+
+          sq_phase = SQ_DONE;
+          Serial.printf("SQ: DONE total=%.2fm yawDrift=%.1f encL=%.2f encR=%.2f time=%lums\n",
+                        (double)sq_result.total_dist_m, (double)sq_result.yaw_drift_deg,
+                        (double)sq_result.enc_dist_L_m, (double)sq_result.enc_dist_R_m,
+                        sq_result.elapsed_ms);
+        } else {
+          // Turn 90° right for next side
+          // IMU yaw increases CCW, so turning right = decrease yaw
+          sq_target_yaw -= 90.0f;
+          sq_phase = SQ_TURN;
+          Serial.printf("SQ: turning to %.1f for side %d\n", (double)sq_target_yaw, sq_side);
+        }
+      } else {
+        // Drive with yaw correction (same logic as BFS DRIVE)
+        float yaw_err = sq_target_yaw - imu_yaw;
+        while (yaw_err > 180.0f) yaw_err -= 360.0f;
+        while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+        float steerCorr = BFS_DRIVE_STEER_KP * yaw_err;
+        if (steerCorr > 60.0f) steerCorr = 60.0f;
+        if (steerCorr < -60.0f) steerCorr = -60.0f;
+
+        // Brake zone near end of side
+        float remaining = sq_side_len_m - sq_driven_m;
+        float speedFactor = 1.0f;
+        if (remaining < 0.3f) {
+          speedFactor = remaining / 0.3f;
+          if (speedFactor < 0.25f) speedFactor = 0.25f;
+        }
+
+        float basePwm = BFS_DRIVE_PWM * speedFactor;
+        if (basePwm < 110.0f) basePwm = 110.0f;
+
+        float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
+        float rightPwm = basePwm + steerCorr - (float)motor_bias_pwm;
+        if (leftPwm < 0.0f) leftPwm = 0.0f;
+        if (rightPwm < 0.0f) rightPwm = 0.0f;
+        if (leftPwm > 255.0f) leftPwm = 255.0f;
+        if (rightPwm > 255.0f) rightPwm = 255.0f;
+
+        setMotorsForwardPwm((uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f));
+        applyMotorOutputs();
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+  return true;
+}
+
+static void drawSquareTestScreen() {
+  ui.fillScreen(TFT_BLACK);
+  ui.setTextDatum(middle_center);
+
+  ui.setTextColor(TFT_CYAN);
+  ui.setTextSize(2);
+  ui.drawString("SQ TEST", 120, 18);
+
+  if (sq_phase == SQ_IDLE) {
+    ui.setTextColor(TFT_WHITE);
+    ui.setTextSize(1);
+    ui.drawString("Drives a square to", 120, 55);
+    ui.drawString("measure drift/errors", 120, 70);
+
+    ui.setTextColor(TFT_YELLOW);
+    ui.setTextSize(2);
+    char sideBuf[16];
+    snprintf(sideBuf, sizeof(sideBuf), "%.2fm", (double)sq_side_len_m);
+    ui.drawString(sideBuf, 120, 105);
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    ui.drawString("Dial: adjust side len", 120, 128);
+
+    // Show encoder mode
+    const char* modeStr = "???";
+    switch (enc_mode) {
+      case ENC_MODE_BOTH:       modeStr = "Enc: BOTH";  break;
+      case ENC_MODE_LEFT_ONLY:  modeStr = "Enc: LEFT";  break;
+      case ENC_MODE_RIGHT_ONLY: modeStr = "Enc: RIGHT"; break;
+      case ENC_MODE_TIMED:      modeStr = "Enc: TIMED"; break;
+    }
+    ui.setTextColor(enc_mode == ENC_MODE_TIMED ? TFT_RED : TFT_GREEN);
+    ui.drawString(modeStr, 120, 150);
+
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(2);
+    ui.drawString("Click: GO", 120, 185);
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    ui.drawString("Hold: back", 120, 220);
+    return;
+  }
+
+  if (sq_phase == SQ_CALIBRATING) {
+    ui.setTextColor(TFT_YELLOW);
+    ui.setTextSize(2);
+    ui.drawString("Calibrating...", 120, 120);
+    return;
+  }
+
+  if (sq_phase == SQ_TURN || sq_phase == SQ_DRIVE) {
+    // Running — show live status
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(1);
+    char phaseBuf[24];
+    snprintf(phaseBuf, sizeof(phaseBuf), "%s side %d/4",
+             sq_phase == SQ_TURN ? "TURNING" : "DRIVING", sq_side + 1);
+    ui.drawString(phaseBuf, 120, 45);
+
+    ui.setTextColor(TFT_WHITE);
+    ui.setTextSize(2);
+    char distBuf[16];
+    snprintf(distBuf, sizeof(distBuf), "%.3fm", (double)sq_driven_m);
+    ui.drawString(distBuf, 120, 75);
+
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    char yawBuf[32];
+    snprintf(yawBuf, sizeof(yawBuf), "Yaw: %.1f  tgt: %.1f", (double)imu_yaw, (double)sq_target_yaw);
+    ui.drawString(yawBuf, 120, 100);
+
+    // Show completed sides
+    for (int i = 0; i < (int)sq_side; i++) {
+      char buf[32];
+      snprintf(buf, sizeof(buf), "S%d: %.3fm  err:%.3f", i + 1,
+               (double)sq_result.side_dist_m[i], (double)sq_result.side_dist_err_m[i]);
+      ui.setTextColor(fabsf(sq_result.side_dist_err_m[i]) < 0.05f ? TFT_GREEN : TFT_YELLOW);
+      ui.drawString(buf, 120, 125 + i * 15);
+    }
+
+    // Elapsed
+    float elapsed = (millis() - sq_start_ms) / 1000.0f;
+    ui.setTextColor(TFT_DARKGREY);
+    char timeBuf[16];
+    snprintf(timeBuf, sizeof(timeBuf), "%.1fs", (double)elapsed);
+    ui.drawString(timeBuf, 120, 200);
+
+    ui.setTextColor(TFT_RED);
+    ui.drawString("Click: ABORT", 120, 225);
+    return;
+  }
+
+  // SQ_DONE — results screen
+  int y = 40;
+  ui.setTextSize(1);
+
+  // Per-side results
+  for (int i = 0; i < 4; i++) {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "S%d: %.3fm  dErr:%.3f  hErr:%.1f",
+             i + 1, (double)sq_result.side_dist_m[i],
+             (double)sq_result.side_dist_err_m[i],
+             (double)sq_result.heading_err[i]);
+    bool distOk = fabsf(sq_result.side_dist_err_m[i]) < 0.05f;
+    bool headOk = fabsf(sq_result.heading_err[i]) < 10.0f;
+    ui.setTextColor((distOk && headOk) ? TFT_GREEN : TFT_YELLOW);
+    ui.drawString(buf, 120, y);
+    y += 14;
+  }
+
+  y += 4;
+  // Totals
+  char totalBuf[32];
+  snprintf(totalBuf, sizeof(totalBuf), "Total: %.2fm (%.2f exp)",
+           (double)sq_result.total_dist_m, (double)(sq_side_len_m * 4.0f));
+  ui.setTextColor(TFT_WHITE);
+  ui.drawString(totalBuf, 120, y);
+  y += 14;
+
+  // Yaw drift
+  char yawBuf[32];
+  snprintf(yawBuf, sizeof(yawBuf), "Yaw drift: %.1f deg", (double)sq_result.yaw_drift_deg);
+  ui.setTextColor(fabsf(sq_result.yaw_drift_deg) < 15.0f ? TFT_GREEN : TFT_RED);
+  ui.drawString(yawBuf, 120, y);
+  y += 14;
+
+  // Encoder L/R totals
+  char encBuf[48];
+  snprintf(encBuf, sizeof(encBuf), "EncL: %.2fm  EncR: %.2fm",
+           (double)sq_result.enc_dist_L_m, (double)sq_result.enc_dist_R_m);
+  ui.setTextColor(TFT_BLUE);
+  ui.drawString(encBuf, 120, y);
+  y += 14;
+
+  // Time
+  char timeBuf[24];
+  snprintf(timeBuf, sizeof(timeBuf), "Time: %.1fs", sq_result.elapsed_ms / 1000.0f);
+  ui.setTextColor(TFT_DARKGREY);
+  ui.drawString(timeBuf, 120, y);
+  y += 14;
+
+  // Overall verdict
+  float avgDistErr = 0;
+  for (int i = 0; i < 4; i++) avgDistErr += fabsf(sq_result.side_dist_err_m[i]);
+  avgDistErr /= 4.0f;
+  bool pass = avgDistErr < 0.05f && fabsf(sq_result.yaw_drift_deg) < 20.0f;
+  ui.setTextColor(pass ? TFT_GREEN : TFT_RED);
+  ui.setTextSize(2);
+  ui.drawString(pass ? "PASS" : "DRIFT!", 120, y + 5);
+
+  ui.setTextColor(TFT_DARKGREY);
+  ui.setTextSize(1);
+  ui.drawString("Click: retest  Hold: back", 120, 228);
+}
+
 static void renderCurrentScreen() {
   switch (currentScreen) {
     case SCREEN_MAIN_MENU:
@@ -5832,6 +6229,9 @@ static void renderCurrentScreen() {
       break;
     case SCREEN_SELF_TEST:
       drawSelfTestScreen();
+      break;
+    case SCREEN_SQUARE_TEST:
+      drawSquareTestScreen();
       break;
   }
 
@@ -6725,6 +7125,9 @@ void loop() {
           break;
         case 6:
           enterScreen(SCREEN_SELF_TEST);
+          break;
+        case 7:
+          enterScreen(SCREEN_SQUARE_TEST);
           break;
       }
     }
@@ -8997,6 +9400,43 @@ void loop() {
       if (st_phase == ST_IDLE || st_phase == ST_DONE) {
         selfTestStart();
       }
+    }
+  }
+
+  else if (currentScreen == SCREEN_SQUARE_TEST) {
+    // Run the square test state machine
+    if (sq_phase != SQ_IDLE && sq_phase != SQ_DONE) {
+      sqTestTick();
+    }
+
+    // Hold: abort/back to menu
+    static bool sqLongPressHandled = false;
+    if (!M5.BtnA.isPressed()) sqLongPressHandled = false;
+    if (!sqLongPressHandled && M5.BtnA.pressedFor(800)) {
+      sqLongPressHandled = true;
+      suppressNextClick = true;
+      stopAllMotors();
+      sq_phase = SQ_IDLE;
+      enterScreen(SCREEN_MAIN_MENU);
+    }
+
+    // Click actions depend on phase
+    if ((now - boot_ms) > 500 && M5.BtnA.wasClicked() && (now - last_button_ms) > 250) {
+      last_button_ms = now;
+      if (sq_phase == SQ_IDLE || sq_phase == SQ_DONE) {
+        sqTestStart();
+      } else {
+        // Abort running test
+        stopAllMotors();
+        sq_phase = SQ_IDLE;
+      }
+    }
+
+    // Dial adjusts side length only when idle
+    if (sq_phase == SQ_IDLE && dialSteps != 0) {
+      sq_side_len_m += dialSteps * 0.05f;
+      if (sq_side_len_m < 0.20f) sq_side_len_m = 0.20f;
+      if (sq_side_len_m > 2.00f) sq_side_len_m = 2.00f;
     }
   }
 
