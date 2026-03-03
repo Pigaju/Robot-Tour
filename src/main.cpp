@@ -174,7 +174,7 @@ static M5Canvas ui(&M5.Display);
 // I2C speed: higher can reduce loop blocking/phase lag, but only if your wiring/devices are stable.
 // We default to 100kHz because 400kHz can cause intermittent I2C failures on some setups (long wires/noisy power),
 // which is much worse (no encoder updates => no stop, no steering).
-#define I2C_CLOCK_HZ 100000
+#define I2C_CLOCK_HZ 50000
 
 // I2C bus guard delay (µs) between back-to-back transactions.
 // Prevents bus contention when 5 devices share the bus (2 motors, 2 encoders, IMU).
@@ -184,6 +184,50 @@ static inline void i2cGuard() { delayMicroseconds(I2C_GUARD_US); }
 // I2C consecutive error tracking for automatic bus recovery
 static uint16_t i2c_consecutive_errors = 0;
 static uint32_t i2c_total_errors = 0;
+
+// Encoder-specific read failure tracking
+static uint32_t enc_read_attempts = 0;   // total read attempts
+static uint32_t enc_read_failures = 0;   // total failed reads (both encoders)
+static uint32_t enc_read_recoveries = 0; // successful reads after bus recovery
+
+// === Adaptive Encoder Mode ===
+// Determined automatically at boot by spinning each motor and checking which
+// encoders respond under load.  BFS DRIVE uses this to decide its distance
+// source.  Falls back to time-based dead reckoning if neither encoder works.
+enum EncoderMode {
+  ENC_MODE_BOTH,       // Average of left + right
+  ENC_MODE_LEFT_ONLY,  // Only left encoder usable under motor load
+  ENC_MODE_RIGHT_ONLY, // Only right encoder usable under motor load
+  ENC_MODE_TIMED,      // Neither encoder works — estimate distance from time
+};
+static EncoderMode enc_mode = ENC_MODE_RIGHT_ONLY;  // default until boot test runs
+
+// Estimated robot speed (m/s) at BFS_DRIVE_PWM for timed fallback.
+// Calibrate this by measuring actual speed over a known distance.
+static constexpr float ENC_TIMED_SPEED_MPS = 0.30f;
+
+// I2C bus recovery: toggle SCL to release stuck slaves
+static int i2c_sda_pin = -1;  // filled in during setup()
+static int i2c_scl_pin = -1;
+static void i2cBusRecovery() {
+  if (i2c_scl_pin < 0 || i2c_sda_pin < 0) return;
+  // Release Wire so we can bit-bang SCL
+  Wire.end();
+  pinMode(i2c_scl_pin, OUTPUT);
+  pinMode(i2c_sda_pin, INPUT_PULLUP);
+  // Toggle SCL 16 times to clock out any stuck slave
+  for (int i = 0; i < 16; i++) {
+    digitalWrite(i2c_scl_pin, LOW);
+    delayMicroseconds(5);
+    digitalWrite(i2c_scl_pin, HIGH);
+    delayMicroseconds(5);
+  }
+  // Re-init Wire
+  Wire.begin(i2c_sda_pin, i2c_scl_pin);
+  Wire.setTimeOut(20);
+  Wire.setClock(I2C_CLOCK_HZ);
+  delayMicroseconds(500);
+}
 
 static const uint32_t i2c_clock_hz = I2C_CLOCK_HZ;
 
@@ -2525,7 +2569,7 @@ bool encoderL_found = false;
 bool encoderR_found = false;
 
 // Motor control
-uint8_t selected_motor = 0;  // 0=left, 1=right
+uint8_t selected_motor = 0;  // 0=left, 1=right, 2=FIND MIN
 // Per-motor direction (enables true pivot turns)
 // 0=reverse, 1=forward
 uint8_t motor_l_direction = 1;
@@ -2995,13 +3039,14 @@ enum ScreenState {
   SCREEN_SET_CTRL_MODE,
   SCREEN_HW_TEST,
   SCREEN_IMU_CAL,
+  SCREEN_SELF_TEST,
   SCREEN_BFS_NAV,
   SCREEN_BFS_RUN,
 };
 
 static ScreenState currentScreen = SCREEN_MAIN_MENU;
 
-static const int NUM_MENU_ITEMS = 6;
+static const int NUM_MENU_ITEMS = 7;
 static const char* menuNames[NUM_MENU_ITEMS] = {
   "BFS NAV",
   "TIME",
@@ -3009,6 +3054,7 @@ static const char* menuNames[NUM_MENU_ITEMS] = {
   "ENC CAL",
   "IMU CAL",
   "HW TEST",
+  "SELF TEST",
 };
 
 static int selectedMenuItem = 0;
@@ -3049,6 +3095,7 @@ static int32_t bfs_run_enc_start_L = 0;
 static int32_t bfs_run_enc_start_R = 0;
 static float bfs_run_total_driven_m = 0.0f;
 static unsigned long bfs_run_start_ms = 0;
+static unsigned long bfs_run_drive_start_ms = 0;  // for ENC_MODE_TIMED fallback
 static float bfs_run_cumulative_yaw_deg = 0.0f;  // Accumulated heading from start
 
 // BFS run tuning
@@ -3715,6 +3762,12 @@ static void enterScreen(ScreenState next) {
     }
   }
 
+  // Reset self-test to idle on entry
+  if (next == SCREEN_SELF_TEST) {
+    extern void selfTestReset();
+    selfTestReset();
+  }
+
   currentScreen = next;
 }
 
@@ -4061,6 +4114,31 @@ void readWheelEncoders() {
   readWheelEncodersInternal(false);
 }
 
+// Helper: try reading one encoder with retries. Returns true on success.
+static bool readOneEncoder(uint8_t addr, int32_t &out_count) {
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    Wire.beginTransmission(addr);
+    Wire.write((uint8_t)0x00);
+    uint8_t err = Wire.endTransmission(true);  // full stop for cleaner bus release
+    if (err == 0) {
+      delayMicroseconds(50);
+      if (Wire.requestFrom((uint8_t)addr, (size_t)4) == 4 && Wire.available() >= 4) {
+        int32_t value = 0;
+        value |= (int32_t)Wire.read() << 0;
+        value |= (int32_t)Wire.read() << 8;
+        value |= (int32_t)Wire.read() << 16;
+        value |= (int32_t)Wire.read() << 24;
+        out_count = value;
+        return true;
+      }
+    }
+    // Failed — flush any leftover bytes and retry with increasing delay
+    while (Wire.available()) Wire.read();
+    delayMicroseconds(300 * (attempt + 1));
+  }
+  return false;
+}
+
 static void readWheelEncodersInternal(bool force) {
   // Throttle reads to keep I2C stable and avoid spamming errors.
   static unsigned long last_read_ms = 0;
@@ -4068,44 +4146,43 @@ static void readWheelEncodersInternal(bool force) {
   if (!force && (now - last_read_ms < (unsigned long)control_period_ms)) return;
   last_read_ms = now;
 
+  static uint8_t consecutive_enc_fails = 0;
+
+  enc_read_attempts++;
   encoderL_found = false;
   encoderR_found = false;
 
-  // Helper: try reading a 4-byte encoder value with retry
-  auto readEncoder = [](uint8_t addr, int32_t &out_count, bool &out_found) {
-    for (uint8_t attempt = 0; attempt < 3; attempt++) {
-      Wire.beginTransmission(addr);
-      Wire.write((uint8_t)0x00);
-      if (Wire.endTransmission(false) == 0) {
-        if (Wire.requestFrom((uint8_t)addr, (size_t)4) == 4 && Wire.available() >= 4) {
-          int32_t value = 0;
-          value |= (int32_t)Wire.read() << 0;
-          value |= (int32_t)Wire.read() << 8;
-          value |= (int32_t)Wire.read() << 16;
-          value |= (int32_t)Wire.read() << 24;
-          out_count = value;
-          out_found = true;
-          return;
-        }
-      }
-      // Failed — flush any leftover bytes and retry
-      while (Wire.available()) Wire.read();
-      delayMicroseconds(200);
-    }
-  };
-
-  readEncoder(ENCODER_L_ADDR, encoderL_count, encoderL_found);
+  encoderL_found = readOneEncoder(ENCODER_L_ADDR, encoderL_count);
   i2cGuard();
-  readEncoder(ENCODER_R_ADDR, encoderR_count, encoderR_found);
+  encoderR_found = readOneEncoder(ENCODER_R_ADDR, encoderR_count);
+  i2cGuard();
 
-  i2cGuard();  // settle before next I2C user
+  if (!encoderL_found || !encoderR_found) {
+    enc_read_failures++;
+    consecutive_enc_fails++;
+    // If we've failed 5+ times in a row, do a full bus recovery
+    if (consecutive_enc_fails >= 5) {
+      Serial.printf("ENC_I2C: %u consecutive fails — bus recovery!\n", consecutive_enc_fails);
+      i2cBusRecovery();
+      consecutive_enc_fails = 0;
+      // Retry once more after recovery
+      delayMicroseconds(500);
+      if (!encoderL_found) encoderL_found = readOneEncoder(ENCODER_L_ADDR, encoderL_count);
+      i2cGuard();
+      if (!encoderR_found) encoderR_found = readOneEncoder(ENCODER_R_ADDR, encoderR_count);
+      if (encoderL_found || encoderR_found) enc_read_recoveries++;
+    }
+  } else {
+    consecutive_enc_fails = 0;
+  }
 }
 
 void driveMotor(uint8_t motor_addr, uint8_t direction, uint8_t speed) {
   // H-Bridge v1.1 protocol (matches the previously working backup code):
   // Register 0x00: Direction (0=STOP, 1=FORWARD, 2=BACKWARD)
   // Register 0x01: Speed PWM (0-255)
-  // Empirically, PWM below ~51 may stall the motor.
+  // Per-motor minimum PWM to reliably move (from hardware testing):
+  //   Left motor: 100    Right motor: 110
 
   uint8_t reg_dir = 0;
   uint8_t pwm = 0;
@@ -4127,7 +4204,9 @@ void driveMotor(uint8_t motor_addr, uint8_t direction, uint8_t speed) {
     if (motor_addr == MOTOR_R_ADDR) logical_dir = logical_dir ? 0 : 1;
   #endif
     reg_dir = logical_dir ? 1 : 2;
-    pwm = (speed < 51) ? 51 : speed;
+    // Per-motor minimum PWM (just above stall threshold)
+    uint8_t minPwm = 110;
+    pwm = (speed < minPwm) ? minPwm : speed;
   }
 
   uint8_t err_dir = 0;
@@ -4335,13 +4414,27 @@ void applyMotorOutputs() {
 #endif
 }
 
+// === HW TEST auto-find minimum PWM state ===
+static bool hw_find_running = false;   // sweep in progress?
+static uint8_t hw_find_pwm = 0;        // current PWM being tested
+static uint8_t hw_find_motor = 0;      // 0 = testing left, 1 = testing right
+static uint8_t hw_min_pwm_L = 0;       // result: left motor minimum PWM
+static uint8_t hw_min_pwm_R = 0;       // result: right motor minimum PWM
+static int32_t hw_find_enc_snap_L = 0; // encoder snapshot for current step
+static int32_t hw_find_enc_snap_R = 0;
+static unsigned long hw_find_step_ms = 0; // when current step started
+static bool hw_find_done = false;      // sweep completed?
+static const uint8_t HW_FIND_START_PWM = 50;  // start ramp from here
+static const unsigned long HW_FIND_STEP_DURATION_MS = 300; // time at each PWM level
+static const int32_t HW_FIND_PULSE_THRESHOLD = 5; // pulses needed to count as "moving"
+
 static void applyHardwareTestDialSteps(int detentSteps) {
   if (detentSteps == 0) return;
-  const int step_per_detent = 5;
+  if (selected_motor == 2) return;  // ignore dial in FIND MIN mode
+  const int step_per_detent = 1;
   int next_cmd = (int)motor_command + detentSteps * step_per_detent;
   if (next_cmd < -255) next_cmd = -255;
   if (next_cmd > 255) next_cmd = 255;
-  if (abs(next_cmd) < step_per_detent) next_cmd = 0;
   motor_command = (int16_t)next_cmd;
 }
 
@@ -5305,9 +5398,398 @@ static void drawBfsRunScreen() {
            (double)imu_yaw, (double)bfs_run_target_yaw_deg);
   ui.drawString(yawBuf, 120, 190);
 
+  // Encoder health + mode
+  {
+    const char* encModeStr = "???";
+    uint16_t encModeColor = TFT_WHITE;
+    switch (enc_mode) {
+      case ENC_MODE_BOTH:       encModeStr = "ENC:BOTH";  encModeColor = TFT_GREEN;  break;
+      case ENC_MODE_LEFT_ONLY:  encModeStr = "ENC:L";     encModeColor = TFT_YELLOW; break;
+      case ENC_MODE_RIGHT_ONLY: encModeStr = "ENC:R";     encModeColor = TFT_YELLOW; break;
+      case ENC_MODE_TIMED:      encModeStr = "TIMED";     encModeColor = TFT_RED;    break;
+    }
+    ui.setTextColor(encModeColor);
+    ui.setTextSize(1);
+    if (enc_read_attempts > 0) {
+      uint8_t pctOk = (uint8_t)(100u - (100u * enc_read_failures / enc_read_attempts));
+      char encBuf[32];
+      snprintf(encBuf, sizeof(encBuf), "%s %u%% ok", encModeStr, pctOk);
+      ui.drawString(encBuf, 120, 205);
+    } else {
+      ui.drawString(encModeStr, 120, 205);
+    }
+  }
+
   // Button hint
   ui.setTextColor(TFT_GREEN);
-  ui.drawString("Click: STOP", 120, 210);
+  ui.drawString("Click: STOP", 120, 225);
+}
+
+// ========================================================================
+// Automated Self-Test
+// ========================================================================
+enum SelfTestPhase {
+  ST_IDLE,
+  ST_I2C_SCAN,
+  ST_IMU_CHECK,
+  ST_ENC_STATIC,         // Read encoders with motors off
+  ST_MOTOR_L_START,
+  ST_MOTOR_L_RUN,
+  ST_MOTOR_L_STOP,
+  ST_MOTOR_R_START,
+  ST_MOTOR_R_RUN,
+  ST_MOTOR_R_STOP,
+  ST_DONE,
+};
+
+struct SelfTestResult {
+  // I2C scan
+  bool i2c_encL;
+  bool i2c_encR;
+  bool i2c_motorL;
+  bool i2c_motorR;
+  bool i2c_imu;
+  // IMU
+  bool imu_alive;
+  // Encoder static (should not change when motors off)
+  bool enc_static_ok;
+  // Motor + encoder combined
+  bool motorL_i2c_ok;     // motor L responded to I2C commands
+  bool motorL_enc_moved;  // encoder registered movement when motor L ran
+  int32_t motorL_pulses;  // pulses measured on LEFT encoder when LEFT motor ran
+  int32_t motorL_cross;   // pulses measured on RIGHT encoder when LEFT motor ran
+  bool motorR_i2c_ok;
+  bool motorR_enc_moved;
+  int32_t motorR_pulses;  // pulses measured on RIGHT encoder when RIGHT motor ran
+  int32_t motorR_cross;   // pulses measured on LEFT encoder when RIGHT motor ran
+  bool swap_detected;     // true if cross-encoder moved more than same-side encoder
+  // Encoder I2C under load
+  uint32_t enc_reads_total;
+  uint32_t enc_reads_fail;
+  uint8_t enc_pct_ok;
+};
+
+static SelfTestPhase st_phase = ST_IDLE;
+static SelfTestResult st_result;
+static unsigned long st_phase_start_ms = 0;
+static int32_t st_enc_snapshot_L = 0;
+static int32_t st_enc_snapshot_R = 0;
+static uint32_t st_enc_reads = 0;
+static uint32_t st_enc_fails = 0;
+
+static const uint8_t ST_TEST_PWM = 130;       // PWM for motor spin test
+static const unsigned long ST_SPIN_MS = 1500;  // How long to spin each motor
+static const unsigned long ST_SETTLE_MS = 300; // Settle after stop
+
+void selfTestReset() {
+  st_phase = ST_IDLE;
+}
+
+static void selfTestStart() {
+  memset(&st_result, 0, sizeof(st_result));
+  st_phase = ST_I2C_SCAN;
+  st_phase_start_ms = millis();
+  st_enc_reads = 0;
+  st_enc_fails = 0;
+  stopAllMotors();
+  Serial.println("=== SELF TEST START ===");
+}
+
+// Runs one tick of the self-test state machine. Called from loop().
+// Returns true while test is still running.
+static bool selfTestTick() {
+  const unsigned long now = millis();
+  const unsigned long elapsed = now - st_phase_start_ms;
+
+  switch (st_phase) {
+    case ST_IDLE:
+      return false;
+
+    case ST_I2C_SCAN: {
+      // Probe all 5 expected devices
+      auto probe = [](uint8_t addr) -> bool {
+        Wire.beginTransmission(addr);
+        return Wire.endTransmission() == 0;
+      };
+      st_result.i2c_encL = probe(ENCODER_L_ADDR);
+      i2cGuard();
+      st_result.i2c_encR = probe(ENCODER_R_ADDR);
+      i2cGuard();
+      st_result.i2c_motorL = probe(MOTOR_L_ADDR);
+      i2cGuard();
+      st_result.i2c_motorR = probe(MOTOR_R_ADDR);
+      i2cGuard();
+      st_result.i2c_imu = probe(IMU_6886_ADDR);
+      Serial.printf("ST I2C: encL=%d encR=%d motL=%d motR=%d imu=%d\n",
+        st_result.i2c_encL, st_result.i2c_encR,
+        st_result.i2c_motorL, st_result.i2c_motorR, st_result.i2c_imu);
+      st_phase = ST_IMU_CHECK;
+      st_phase_start_ms = now;
+      break;
+    }
+
+    case ST_IMU_CHECK: {
+      float ax, ay, az, gx, gy, gz, temp;
+      st_result.imu_alive = imu_present && imu6886Read(&ax, &ay, &az, &gx, &gy, &gz, &temp);
+      Serial.printf("ST IMU: alive=%d\n", st_result.imu_alive);
+      st_phase = ST_ENC_STATIC;
+      st_phase_start_ms = now;
+      // Take encoder snapshot
+      readWheelEncodersInternal(true);
+      st_enc_snapshot_L = encoderL_count;
+      st_enc_snapshot_R = encoderR_count;
+      break;
+    }
+
+    case ST_ENC_STATIC: {
+      // Wait 500ms with motors off, check encoders didn't drift
+      if (elapsed >= 500) {
+        readWheelEncodersInternal(true);
+        int32_t driftL = abs(encoderL_count - st_enc_snapshot_L);
+        int32_t driftR = abs(encoderR_count - st_enc_snapshot_R);
+        st_result.enc_static_ok = (driftL < 10 && driftR < 10);
+        Serial.printf("ST ENC_STATIC: driftL=%ld driftR=%ld ok=%d\n",
+          (long)driftL, (long)driftR, st_result.enc_static_ok);
+        st_phase = ST_MOTOR_L_START;
+        st_phase_start_ms = now;
+      }
+      break;
+    }
+
+    case ST_MOTOR_L_START: {
+      // Snapshot BOTH encoders, start left motor
+      readWheelEncodersInternal(true);
+      st_enc_snapshot_L = encoderL_count;
+      st_enc_snapshot_R = encoderR_count;
+      st_enc_reads = 0;
+      st_enc_fails = 0;
+      motor_l_direction = 1;
+      motor_l_speed = ST_TEST_PWM;
+      motor_r_direction = 0;
+      motor_r_speed = 0;
+      applyMotorOutputs();
+      st_result.motorL_i2c_ok = (motorL_err_dir == 0 && motorL_err_pwm == 0);
+      Serial.printf("ST MOTOR_L: start pwm=%d i2c_ok=%d\n", ST_TEST_PWM, st_result.motorL_i2c_ok);
+      st_phase = ST_MOTOR_L_RUN;
+      st_phase_start_ms = now;
+      break;
+    }
+
+    case ST_MOTOR_L_RUN: {
+      // Keep reading encoders while motor spins
+      readWheelEncodersInternal(true);
+      st_enc_reads++;
+      if (!encoderL_found) st_enc_fails++;
+      // Accumulate for overall reliability
+      st_result.enc_reads_total += 1;
+      if (!encoderL_found || !encoderR_found) st_result.enc_reads_fail += 1;
+      if (elapsed >= ST_SPIN_MS) {
+        stopAllMotors();
+        delay(50);
+        readWheelEncodersInternal(true);
+        int32_t pulsesL = encoderL_count - st_enc_snapshot_L;
+        int32_t pulsesR = encoderR_count - st_enc_snapshot_R;
+        // Apply inversion
+        if (INVERT_LEFT_ENCODER_COUNT) pulsesL = -pulsesL;
+        if (INVERT_RIGHT_ENCODER_COUNT) pulsesR = -pulsesR;
+        st_result.motorL_pulses = pulsesL;  // same-side encoder
+        st_result.motorL_cross = pulsesR;   // cross encoder
+        st_result.motorL_enc_moved = (abs(pulsesL) > 50);
+        // Detect swap: cross encoder moved more than same-side
+        if (abs(pulsesR) > 50 && abs(pulsesL) < 50) {
+          st_result.swap_detected = true;
+        }
+        Serial.printf("ST MOTOR_L: encL=%ld encR=%ld (cross) moved=%d reads=%lu fails=%lu\n",
+          (long)pulsesL, (long)pulsesR, st_result.motorL_enc_moved,
+          (unsigned long)st_enc_reads, (unsigned long)st_enc_fails);
+        st_phase = ST_MOTOR_L_STOP;
+        st_phase_start_ms = now;
+      }
+      break;
+    }
+
+    case ST_MOTOR_L_STOP: {
+      stopAllMotors();
+      if (elapsed >= ST_SETTLE_MS) {
+        st_phase = ST_MOTOR_R_START;
+        st_phase_start_ms = now;
+      }
+      break;
+    }
+
+    case ST_MOTOR_R_START: {
+      readWheelEncodersInternal(true);
+      st_enc_snapshot_L = encoderL_count;
+      st_enc_snapshot_R = encoderR_count;
+      st_enc_reads = 0;
+      st_enc_fails = 0;
+      motor_l_direction = 0;
+      motor_l_speed = 0;
+      motor_r_direction = 1;
+      motor_r_speed = ST_TEST_PWM;
+      applyMotorOutputs();
+      st_result.motorR_i2c_ok = (motorR_err_dir == 0 && motorR_err_pwm == 0);
+      Serial.printf("ST MOTOR_R: start pwm=%d i2c_ok=%d\n", ST_TEST_PWM, st_result.motorR_i2c_ok);
+      st_phase = ST_MOTOR_R_RUN;
+      st_phase_start_ms = now;
+      break;
+    }
+
+    case ST_MOTOR_R_RUN: {
+      readWheelEncodersInternal(true);
+      st_enc_reads++;
+      if (!encoderR_found) st_enc_fails++;
+      // Accumulate total for final report
+      st_result.enc_reads_total += 1;
+      if (!encoderL_found || !encoderR_found) st_result.enc_reads_fail += 1;
+      if (elapsed >= ST_SPIN_MS) {
+        stopAllMotors();
+        delay(50);
+        readWheelEncodersInternal(true);
+        int32_t pulsesR = encoderR_count - st_enc_snapshot_R;
+        int32_t pulsesL = encoderL_count - st_enc_snapshot_L;
+        if (INVERT_RIGHT_ENCODER_COUNT) pulsesR = -pulsesR;
+        if (INVERT_LEFT_ENCODER_COUNT) pulsesL = -pulsesL;
+        st_result.motorR_pulses = pulsesR;  // same-side encoder
+        st_result.motorR_cross = pulsesL;   // cross encoder
+        st_result.motorR_enc_moved = (abs(pulsesR) > 50);
+        // Detect swap: cross encoder moved more than same-side
+        if (abs(pulsesL) > 50 && abs(pulsesR) < 50) {
+          st_result.swap_detected = true;
+        }
+        Serial.printf("ST MOTOR_R: encR=%ld encL=%ld (cross) moved=%d reads=%lu fails=%lu\n",
+          (long)pulsesR, (long)pulsesL, st_result.motorR_enc_moved,
+          (unsigned long)st_enc_reads, (unsigned long)st_enc_fails);
+        // Compute overall encoder reliability during motor runs
+        if (st_result.enc_reads_total > 0) {
+          st_result.enc_pct_ok = (uint8_t)(100u - (100u * st_result.enc_reads_fail / st_result.enc_reads_total));
+        } else {
+          st_result.enc_pct_ok = 0;
+        }
+        st_phase = ST_MOTOR_R_STOP;
+        st_phase_start_ms = now;
+      }
+      break;
+    }
+
+    case ST_MOTOR_R_STOP: {
+      stopAllMotors();
+      if (elapsed >= ST_SETTLE_MS) {
+        st_phase = ST_DONE;
+        Serial.println("=== SELF TEST DONE ===");
+      }
+      break;
+    }
+
+    case ST_DONE:
+      return false;
+  }
+  return true;
+}
+
+static void drawSelfTestScreen() {
+  ui.fillScreen(TFT_BLACK);
+  ui.setTextDatum(middle_center);
+
+  ui.setTextColor(TFT_CYAN);
+  ui.setTextSize(2);
+  ui.drawString("SELF TEST", 120, 18);
+
+  if (st_phase != ST_DONE && st_phase != ST_IDLE) {
+    // Show progress
+    const char* phaseNames[] = {
+      "Idle", "I2C Scan", "IMU Check", "Enc Static",
+      "Motor L Init", "Motor L Run", "Motor L Stop",
+      "Motor R Init", "Motor R Run", "Motor R Stop", "Done"
+    };
+    ui.setTextColor(TFT_YELLOW);
+    ui.setTextSize(2);
+    ui.drawString(phaseNames[st_phase], 120, 80);
+
+    // Progress bar
+    int progress = ((int)st_phase * 100) / (int)ST_DONE;
+    int barW = (200 * progress) / 100;
+    ui.drawRect(20, 120, 200, 16, TFT_WHITE);
+    ui.fillRect(20, 120, barW, 16, TFT_GREEN);
+
+    ui.setTextColor(TFT_DARKGREY);
+    ui.setTextSize(1);
+    ui.drawString("Testing...", 120, 160);
+    ui.drawString("Hold BtnA: abort", 120, 220);
+    return;
+  }
+
+  if (st_phase == ST_IDLE) {
+    ui.setTextColor(TFT_WHITE);
+    ui.setTextSize(2);
+    ui.drawString("Click: START", 120, 120);
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    ui.drawString("Hold BtnA: back", 120, 220);
+    return;
+  }
+
+  // ST_DONE — show results
+  int y = 38;
+  const int lineH = 17;
+  ui.setTextSize(1);
+
+  // I2C devices
+  auto drawResult = [&](const char* label, bool pass) {
+    ui.setTextColor(pass ? TFT_GREEN : TFT_RED);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%s: %s", label, pass ? "OK" : "FAIL");
+    ui.drawString(buf, 120, y);
+    y += lineH;
+  };
+
+  drawResult("I2C EncL", st_result.i2c_encL);
+  drawResult("I2C EncR", st_result.i2c_encR);
+  drawResult("I2C MotL", st_result.i2c_motorL);
+  drawResult("I2C MotR", st_result.i2c_motorR);
+  drawResult("IMU", st_result.imu_alive);
+  drawResult("Enc Static", st_result.enc_static_ok);
+
+  // Motor tests with pulse counts (same-side / cross-encoder)
+  auto drawMotor = [&](const char* label, bool moved, int32_t pulses, int32_t cross) {
+    ui.setTextColor(moved ? TFT_GREEN : TFT_RED);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%s: %s  L:%ld R:%ld", label, moved ? "OK" : "FAIL", (long)pulses, (long)cross);
+    ui.drawString(buf, 120, y);
+    y += lineH;
+  };
+
+  drawMotor("Mot L", st_result.motorL_enc_moved, st_result.motorL_pulses, st_result.motorL_cross);
+  drawMotor("Mot R", st_result.motorR_enc_moved, st_result.motorR_cross, st_result.motorR_pulses);
+
+  // Swap warning
+  if (st_result.swap_detected) {
+    ui.setTextColor(TFT_RED);
+    ui.drawString("!! ENCODER SWAP !!", 120, y);
+    y += lineH;
+  }
+
+  // Encoder I2C reliability under load
+  uint8_t pct = st_result.enc_pct_ok;
+  ui.setTextColor(pct > 90 ? TFT_GREEN : (pct > 50 ? TFT_YELLOW : TFT_RED));
+  char encBuf[32];
+  snprintf(encBuf, sizeof(encBuf), "Enc I2C: %u%% ok", pct);
+  ui.drawString(encBuf, 120, y);
+  y += lineH;
+
+  // Overall
+  bool allPass = st_result.i2c_encL && st_result.i2c_encR &&
+                 st_result.i2c_motorL && st_result.i2c_motorR &&
+                 st_result.imu_alive && st_result.enc_static_ok &&
+                 st_result.motorL_enc_moved && st_result.motorR_enc_moved &&
+                 pct > 80;
+  ui.setTextColor(allPass ? TFT_GREEN : TFT_RED);
+  ui.setTextSize(2);
+  ui.drawString(allPass ? "ALL PASS" : "FAIL", 120, y + 5);
+
+  ui.setTextColor(TFT_DARKGREY);
+  ui.setTextSize(1);
+  ui.drawString("Click: retest  Hold: back", 120, 228);
 }
 
 static void renderCurrentScreen() {
@@ -5347,6 +5829,9 @@ static void renderCurrentScreen() {
       break;
     case SCREEN_IMU_CAL:
       drawImuCalScreen();
+      break;
+    case SCREEN_SELF_TEST:
+      drawSelfTestScreen();
       break;
   }
 
@@ -5459,67 +5944,126 @@ void updateDisplay() {
   ui.drawString(String("I2C: ") + String((unsigned)(i2c_clock_hz / 1000u)) + " kHz", 120, 30);
   ui.drawString("Hold BtnA: exit", 120, 45);
  
-  // Selected motor
+  // Selected motor / mode
   ui.setTextColor(TFT_YELLOW);
   ui.setTextSize(1);
-  ui.drawString("Motor:", 120, 65);
- 
-  ui.setTextColor(selected_motor == 0 ? TFT_GREEN : TFT_WHITE);
-  ui.setTextSize(2);
-  ui.drawString(selected_motor == 0 ? "LEFT" : "RIGHT", 120, 85);
- 
-  // Speed display
-  ui.setTextColor(TFT_YELLOW);
-  ui.setTextSize(1);
-  ui.drawString("Speed (+/-):", 120, 110);
- 
-  ui.setTextColor(TFT_GREEN);
-  ui.setTextSize(2);
-  char spd_str[16];
-  snprintf(spd_str, sizeof(spd_str), "%d", (int)motor_command);
-  ui.drawString(spd_str, 120, 135);
+  ui.drawString("Mode (click):", 120, 60);
 
-  // Legend (use sign for direction)
-  ui.setTextColor(TFT_WHITE);
-  ui.setTextSize(1);
+  if (selected_motor <= 1) {
+    // --- Manual motor test mode ---
+    ui.setTextColor(selected_motor == 0 ? TFT_GREEN : TFT_WHITE);
+    ui.setTextSize(2);
+    ui.drawString(selected_motor == 0 ? "LEFT" : "RIGHT", 120, 78);
+
+    // Speed display — show commanded and actual (clamped) PWM
+    ui.setTextColor(TFT_YELLOW);
+    ui.setTextSize(1);
+    ui.drawString("Dial: +/- 1 PWM", 120, 96);
+
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(2);
+    // Compute actual clamped PWM that driveMotor() will send
+    uint8_t cmdAbs = (uint8_t)abs((int)motor_command);
+    uint8_t actualPwm = 0;
+    if (cmdAbs > 0) {
+      uint8_t minPwm = 110;
+      actualPwm = (cmdAbs < minPwm) ? minPwm : cmdAbs;
+    }
+    char spd_str[24];
+    snprintf(spd_str, sizeof(spd_str), "%d (=%d)", (int)motor_command, (int)actualPwm);
+    ui.drawString(spd_str, 120, 120);
+
+    // Legend (use sign for direction)
+    ui.setTextColor(TFT_WHITE);
+    ui.setTextSize(1);
 #if INVERT_MOTOR_DIRECTION
-  ui.drawString("+ = REV   - = FWD", 120, 160);
+    ui.drawString("+ = REV   - = FWD", 120, 142);
 #else
-  ui.drawString("+ = FWD   - = REV", 120, 160);
+    ui.drawString("+ = FWD   - = REV", 120, 142);
 #endif
 
-  // Exit hint
-  ui.setTextColor(TFT_YELLOW);
-  ui.setTextSize(1);
-  ui.drawString("Hold BtnA: MENU", 120, 172);
+    // IMU yaw (compact)
+    ui.setTextColor(TFT_DARKGREY);
+    ui.setTextSize(1);
+    if (imu_ok) {
+      char yawBuf[24];
+      snprintf(yawBuf, sizeof(yawBuf), "Yaw: %.1f", (double)imu_yaw);
+      ui.drawString(yawBuf, 120, 158);
+    }
 
-  // IMU attitude (degrees)
-  ui.setTextSize(1);
-  ui.setTextColor(TFT_WHITE);
-  if (imu_ok) {
-    char imu1[48];
-    char imu2[48];
-    // Display as X/Y/Z degrees for your test harness
-    snprintf(imu1, sizeof(imu1), "IMU deg  X:% .1f  Y:% .1f", (double)imu_roll, (double)imu_pitch);
-    snprintf(imu2, sizeof(imu2), "         Z:% .1f", (double)imu_yaw);
-    ui.drawString(imu1, 120, 182);
-    ui.drawString(imu2, 120, 194);
+    // Wheel encoder values
+    ui.setTextColor(TFT_BLUE);
+    ui.setTextSize(2);
+    char lbuf[32];
+    char rbuf[32];
+    if (encoderL_found) snprintf(lbuf, sizeof(lbuf), "L:%ld", (long)encoderL_count);
+    else snprintf(lbuf, sizeof(lbuf), "L:--");
+    if (encoderR_found) snprintf(rbuf, sizeof(rbuf), "R:%ld", (long)encoderR_count);
+    else snprintf(rbuf, sizeof(rbuf), "R:--");
+    ui.drawString(lbuf, 120, 182);
+    ui.drawString(rbuf, 120, 205);
+
+    // Exit hint
+    ui.setTextColor(TFT_DARKGREY);
+    ui.setTextSize(1);
+    ui.drawString("Hold: MENU", 120, 228);
   } else {
-    ui.drawString("IMU deg  X:--  Y:--  Z:--", 120, 188);
+    // --- FIND MIN PWM mode ---
+    ui.setTextColor(TFT_MAGENTA);
+    ui.setTextSize(2);
+    ui.drawString("FIND MIN", 120, 78);
+
+    if (hw_find_running) {
+      // Show sweep progress
+      ui.setTextColor(TFT_YELLOW);
+      ui.setTextSize(1);
+      ui.drawString("Sweeping...", 120, 100);
+      char progBuf[32];
+      snprintf(progBuf, sizeof(progBuf), "Motor %s  PWM %d",
+               hw_find_motor == 0 ? "LEFT" : "RIGHT", (int)hw_find_pwm);
+      ui.setTextSize(2);
+      ui.drawString(progBuf, 120, 125);
+    } else {
+      // Show results or prompt
+      ui.setTextSize(1);
+      if (hw_find_done) {
+        ui.setTextColor(TFT_GREEN);
+        ui.drawString("Results:", 120, 100);
+        ui.setTextSize(2);
+        char rL[24], rR[24];
+        if (hw_min_pwm_L > 0)
+          snprintf(rL, sizeof(rL), "L min: %d", (int)hw_min_pwm_L);
+        else
+          snprintf(rL, sizeof(rL), "L: NO MOVE");
+        if (hw_min_pwm_R > 0)
+          snprintf(rR, sizeof(rR), "R min: %d", (int)hw_min_pwm_R);
+        else
+          snprintf(rR, sizeof(rR), "R: NO MOVE");
+        ui.setTextColor(hw_min_pwm_L > 0 ? TFT_GREEN : TFT_RED);
+        ui.drawString(rL, 120, 125);
+        ui.setTextColor(hw_min_pwm_R > 0 ? TFT_GREEN : TFT_RED);
+        ui.drawString(rR, 120, 155);
+      } else {
+        ui.setTextColor(TFT_WHITE);
+        ui.drawString("Click to start", 120, 110);
+        ui.drawString("auto-sweep", 120, 125);
+        ui.setTextColor(TFT_DARKGREY);
+        ui.drawString("Ramps PWM 50-255", 120, 145);
+        ui.drawString("detects encoder move", 120, 160);
+      }
+    }
+
+    // Encoder values
+    ui.setTextColor(TFT_BLUE);
+    ui.setTextSize(2);
+    char lbuf[32], rbuf[32];
+    if (encoderL_found) snprintf(lbuf, sizeof(lbuf), "L:%ld", (long)encoderL_count);
+    else snprintf(lbuf, sizeof(lbuf), "L:--");
+    if (encoderR_found) snprintf(rbuf, sizeof(rbuf), "R:%ld", (long)encoderR_count);
+    else snprintf(rbuf, sizeof(rbuf), "R:--");
+    ui.drawString(lbuf, 120, 195);
+    ui.drawString(rbuf, 120, 218);
   }
-
-
-  // Wheel encoder values (larger for readability)
-  ui.setTextColor(TFT_BLUE);
-  ui.setTextSize(2);
-  char lbuf[32];
-  char rbuf[32];
-  if (encoderL_found) snprintf(lbuf, sizeof(lbuf), "L:%ld", encoderL_count);
-  else snprintf(lbuf, sizeof(lbuf), "L:--");
-  if (encoderR_found) snprintf(rbuf, sizeof(rbuf), "R:%ld", encoderR_count);
-  else snprintf(rbuf, sizeof(rbuf), "R:--");
-  ui.drawString(lbuf, 120, 210);
-  ui.drawString(rbuf, 120, 230);
 }
 
 static void showBootMotorTestScreen(const char* line1, const char* line2, const char* line3) {
@@ -5587,6 +6131,171 @@ static void runBootMotorSpinTest() {
   Serial.println("=== BOOT MOTOR SPIN TEST DONE ===\n");
 
   showBootMotorTestScreen("STOPPED", "Boot test complete", "(interactive control disabled)");
+}
+
+// ========================================================================
+// Boot-time adaptive encoder auto-test
+// Spins each motor briefly and checks which encoders respond under load.
+// Sets enc_mode so BFS DRIVE uses the best available distance source.
+// Called once from setup() after I2C, motors and encoders are initialised.
+// ========================================================================
+static void bootEncoderAutoTest() {
+  Serial.println("=== BOOT ENCODER AUTO-TEST ===");
+
+  // Show status on display
+  M5.Lcd.fillScreen(TFT_BLACK);
+  M5.Lcd.setTextDatum(MC_DATUM);
+  M5.Lcd.setTextColor(TFT_CYAN);
+  M5.Lcd.setTextSize(2);
+  M5.Lcd.drawString("ENC TEST", 120, 30);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(TFT_WHITE);
+  M5.Lcd.drawString("Testing encoders...", 120, 60);
+
+  // ---- helper lambda: try reading one encoder safely ----
+  auto readEnc = [](uint8_t addr, int32_t &val) -> bool {
+    return readOneEncoder(addr, val);
+  };
+
+  // ---- Phase 1: Read baseline (motors off) ----
+  readWheelEncodersInternal(true);
+  int32_t baseL = encoderL_count;
+  int32_t baseR = encoderR_count;
+  delay(100);
+
+  // ---- Phase 2: Spin LEFT motor, measure BOTH encoders ----
+  readWheelEncodersInternal(true);
+  int32_t preL_L = encoderL_count;
+  int32_t preL_R = encoderR_count;
+
+  motor_l_direction = 1;
+  motor_l_speed = 130;
+  motor_r_direction = 0;
+  motor_r_speed = 0;
+  applyMotorOutputs();
+
+  // Spin for 1 second, reading encoders periodically
+  uint32_t encReadsL = 0, encFailsL_L = 0, encFailsL_R = 0;
+  unsigned long spinStart = millis();
+  while (millis() - spinStart < 1000) {
+    readWheelEncodersInternal(true);
+    encReadsL++;
+    if (!encoderL_found) encFailsL_L++;
+    if (!encoderR_found) encFailsL_R++;
+    delay(20);
+  }
+  stopAllMotors();
+  delay(200);  // settle
+  readWheelEncodersInternal(true);
+
+  int32_t dL_whenMotL = encoderL_count - preL_L;
+  int32_t dR_whenMotL = encoderR_count - preL_R;
+  if (INVERT_LEFT_ENCODER_COUNT)  dL_whenMotL = -dL_whenMotL;
+  if (INVERT_RIGHT_ENCODER_COUNT) dR_whenMotL = -dR_whenMotL;
+
+  Serial.printf("BOOT ENC: motL -> encL=%ld encR=%ld  failsL=%lu failsR=%lu / %lu\n",
+                (long)dL_whenMotL, (long)dR_whenMotL,
+                (unsigned long)encFailsL_L, (unsigned long)encFailsL_R,
+                (unsigned long)encReadsL);
+
+  M5.Lcd.drawString("Left motor done", 120, 80);
+
+  // ---- Phase 3: Spin RIGHT motor, measure BOTH encoders ----
+  readWheelEncodersInternal(true);
+  int32_t preR_L = encoderL_count;
+  int32_t preR_R = encoderR_count;
+
+  motor_l_direction = 0;
+  motor_l_speed = 0;
+  motor_r_direction = 1;
+  motor_r_speed = 130;
+  applyMotorOutputs();
+
+  uint32_t encReadsR = 0, encFailsR_L = 0, encFailsR_R = 0;
+  spinStart = millis();
+  while (millis() - spinStart < 1000) {
+    readWheelEncodersInternal(true);
+    encReadsR++;
+    if (!encoderL_found) encFailsR_L++;
+    if (!encoderR_found) encFailsR_R++;
+    delay(20);
+  }
+  stopAllMotors();
+  delay(200);
+  readWheelEncodersInternal(true);
+
+  int32_t dL_whenMotR = encoderL_count - preR_L;
+  int32_t dR_whenMotR = encoderR_count - preR_R;
+  if (INVERT_LEFT_ENCODER_COUNT)  dL_whenMotR = -dL_whenMotR;
+  if (INVERT_RIGHT_ENCODER_COUNT) dR_whenMotR = -dR_whenMotR;
+
+  Serial.printf("BOOT ENC: motR -> encL=%ld encR=%ld  failsL=%lu failsR=%lu / %lu\n",
+                (long)dL_whenMotR, (long)dR_whenMotR,
+                (unsigned long)encFailsR_L, (unsigned long)encFailsR_R,
+                (unsigned long)encReadsR);
+
+  M5.Lcd.drawString("Right motor done", 120, 100);
+
+  // ---- Phase 4: Decide which encoder(s) actually work under motor load ----
+  // An encoder "works" if it registered ≥ 50 pulses with its own-side motor
+  // AND had < 50% I2C read failures across BOTH motor tests.
+  // We check each encoder's total failure rate across all motor tests.
+  uint32_t totalReads = encReadsL + encReadsR;
+  uint32_t totalFailsL = encFailsL_L + encFailsR_L;
+  uint32_t totalFailsR = encFailsL_R + encFailsR_R;
+
+  // "own-side moved" — did the encoder see pulses when its motor ran?
+  // Because of possible cross-wiring we also check the cross case.
+  bool leftEncMoved  = (abs(dL_whenMotL) > 50) || (abs(dL_whenMotR) > 50);
+  bool rightEncMoved = (abs(dR_whenMotR) > 50) || (abs(dR_whenMotL) > 50);
+
+  // Encoder I2C reliable enough? (> 50% success rate during motor tests)
+  bool leftEncReliable  = (totalReads > 0) && (totalFailsL * 100 / totalReads < 50);
+  bool rightEncReliable = (totalReads > 0) && (totalFailsR * 100 / totalReads < 50);
+
+  bool leftOk  = leftEncMoved  && leftEncReliable;
+  bool rightOk = rightEncMoved && rightEncReliable;
+
+  if (leftOk && rightOk) {
+    enc_mode = ENC_MODE_BOTH;
+  } else if (rightOk) {
+    enc_mode = ENC_MODE_RIGHT_ONLY;
+  } else if (leftOk) {
+    enc_mode = ENC_MODE_LEFT_ONLY;
+  } else {
+    enc_mode = ENC_MODE_TIMED;
+  }
+
+  // ---- Display result ----
+  const char* modeStr = "???";
+  uint16_t modeColor = TFT_WHITE;
+  switch (enc_mode) {
+    case ENC_MODE_BOTH:       modeStr = "BOTH OK";    modeColor = TFT_GREEN;  break;
+    case ENC_MODE_LEFT_ONLY:  modeStr = "LEFT ONLY";  modeColor = TFT_YELLOW; break;
+    case ENC_MODE_RIGHT_ONLY: modeStr = "RIGHT ONLY"; modeColor = TFT_YELLOW; break;
+    case ENC_MODE_TIMED:      modeStr = "TIMED (no enc)"; modeColor = TFT_RED; break;
+  }
+
+  Serial.printf("BOOT ENC: mode=%s  leftOk=%d(moved=%d rel=%d)  rightOk=%d(moved=%d rel=%d)\n",
+                modeStr, leftOk, leftEncMoved, leftEncReliable,
+                rightOk, rightEncMoved, rightEncReliable);
+
+  M5.Lcd.setTextSize(2);
+  M5.Lcd.setTextColor(modeColor);
+  M5.Lcd.drawString(modeStr, 120, 140);
+
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(TFT_WHITE);
+  char buf[48];
+  snprintf(buf, sizeof(buf), "L: %s  R: %s", leftOk ? "OK" : "FAIL", rightOk ? "OK" : "FAIL");
+  M5.Lcd.drawString(buf, 120, 170);
+  snprintf(buf, sizeof(buf), "L pulses: %ld / %ld", (long)dL_whenMotL, (long)dL_whenMotR);
+  M5.Lcd.drawString(buf, 120, 190);
+  snprintf(buf, sizeof(buf), "R pulses: %ld / %ld", (long)dR_whenMotL, (long)dR_whenMotR);
+  M5.Lcd.drawString(buf, 120, 205);
+
+  delay(2000);  // Show result briefly before continuing to menu
+  Serial.println("=== BOOT ENCODER AUTO-TEST DONE ===");
 }
 
 void setup() {
@@ -5686,6 +6395,9 @@ void setup() {
   }
   Wire.setTimeOut(20);
   Wire.setClock(I2C_CLOCK_HZ);
+  // Store pins for bus recovery
+  i2c_sda_pin = ex_sda;
+  i2c_scl_pin = ex_scl;
 #if !SERIAL_QUIET_MODE
   if (ex_sda >= 0 && ex_scl >= 0) {
     Serial.printf("TEST 3: I2C initialized (EX) SDA=%d SCL=%d @%uHz\n", ex_sda, ex_scl, (unsigned)I2C_CLOCK_HZ);
@@ -5697,6 +6409,9 @@ void setup() {
   Wire.begin();
   Wire.setTimeOut(20);
   Wire.setClock(I2C_CLOCK_HZ);
+  // Store default pins for bus recovery (ESP32-S3 defaults)
+  i2c_sda_pin = SDA;
+  i2c_scl_pin = SCL;
 #if !SERIAL_QUIET_MODE
   Serial.printf("TEST 3: I2C initialized (default pins) @%uHz\n", (unsigned)I2C_CLOCK_HZ);
 #endif
@@ -5759,6 +6474,10 @@ void setup() {
   // WARNING: this sends non-zero commands.
   testMotorFormats();
 #endif
+
+  // Adaptive encoder auto-test: spin each motor, detect which encoders work
+  // under load, and select the best distance source for BFS navigation.
+  bootEncoderAutoTest();
  
   renderCurrentScreen();
 }
@@ -6004,6 +6723,9 @@ void loop() {
         case 5:
           enterScreen(SCREEN_HW_TEST);
           break;
+        case 6:
+          enterScreen(SCREEN_SELF_TEST);
+          break;
       }
     }
 
@@ -6114,6 +6836,10 @@ void loop() {
       bfs_run_start_ms = now;
       bfs_run_start_yaw = imu_yaw;
       bfs_run_cumulative_yaw_deg = imu_yaw;
+      // Reset encoder health counters for this run
+      enc_read_attempts = 0;
+      enc_read_failures = 0;
+      enc_read_recoveries = 0;
 
       // Compute the grid-frame heading the robot faces at the start position.
       // The robot is placed at a border edge midpoint, facing INWARD.
@@ -6201,6 +6927,7 @@ void loop() {
         readWheelEncodersInternal(true);  // Force fresh read after settle
         bfs_run_enc_start_L = encoderL_count;
         bfs_run_enc_start_R = encoderR_count;
+        bfs_run_drive_start_ms = millis();  // for ENC_MODE_TIMED fallback
         bfs_run_phase = BFS_PHASE_DRIVE;
         Serial.printf("BFS_RUN: TURN done, starting DRIVE yaw=%.1f err=%.1f encL=%ld encR=%ld\n",
                       (double)imu_yaw, (double)yaw_err,
@@ -6213,20 +6940,40 @@ void loop() {
         if (pwmScale > 1.0f) pwmScale = 1.0f;
         if (pwmScale < 0.4f) pwmScale = 0.4f;
         uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
-        if (turnPwm < 80) turnPwm = 80;
+        if (turnPwm < 110) turnPwm = 110;
         setMotorsPivotPwm(sign, turnPwm);
         applyMotorOutputs();
       }
     }
     else if (bfs_run_phase == BFS_PHASE_DRIVE) {
-      // Drive forward toward waypoint with yaw correction
+      // Force a fresh encoder read every iteration during DRIVE
+      readWheelEncodersInternal(true);
+
+      // Compute distance driven using the best available source (set at boot)
       const int32_t dL = encoderL_count - bfs_run_enc_start_L;
       const int32_t dR = encoderR_count - bfs_run_enc_start_R;
-      const float dLcorr = (INVERT_LEFT_ENCODER_COUNT ? -(float)dL : (float)dL);
+      const float dLcorr = (INVERT_LEFT_ENCODER_COUNT  ? -(float)dL : (float)dL);
       const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
       const float sL = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
       const float sR = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
-      bfs_run_driven_m = fabsf(0.5f * (sL + sR));
+
+      switch (enc_mode) {
+        case ENC_MODE_BOTH:
+          bfs_run_driven_m = fabsf(0.5f * (sL + sR));
+          break;
+        case ENC_MODE_LEFT_ONLY:
+          bfs_run_driven_m = fabsf(sL);
+          break;
+        case ENC_MODE_RIGHT_ONLY:
+          bfs_run_driven_m = fabsf(sR);
+          break;
+        case ENC_MODE_TIMED: {
+          // Dead-reckoning fallback: estimate distance from elapsed time
+          float elapsed_s = (millis() - bfs_run_drive_start_ms) / 1000.0f;
+          bfs_run_driven_m = elapsed_s * ENC_TIMED_SPEED_MPS;
+          break;
+        }
+      }
 
       if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
         // Reached waypoint
@@ -6257,7 +7004,7 @@ void loop() {
 
         float basePwm = BFS_DRIVE_PWM * speedFactor;
         // Ensure minimum PWM is high enough to actually move the robot on the ground
-        if (basePwm < 70.0f) basePwm = 70.0f;
+        if (basePwm < 110.0f) basePwm = 110.0f;
         // Positive yaw_err → need to turn LEFT (CCW, increase IMU yaw)
         // → slow left wheel, speed up right wheel
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
@@ -8069,35 +8816,142 @@ void loop() {
       enterScreen(SCREEN_MAIN_MENU);
     }
 
-    // Button A: switch selected motor (LEFT <-> RIGHT)
+    // Button A click: cycle mode LEFT → RIGHT → FIND MIN
     if ((now - boot_ms) > 500 && M5.BtnA.wasClicked() && (now - last_button_ms) > 250) {
       last_button_ms = now;
-      selected_motor = (selected_motor == 0) ? 1 : 0;
-      stopAllMotors();
+      if (selected_motor == 2 && !hw_find_running && !hw_find_done) {
+        // In FIND MIN mode, clicking starts the sweep
+        hw_find_running = true;
+        hw_find_done = false;
+        hw_find_motor = 0; // start with left motor
+        hw_find_pwm = HW_FIND_START_PWM;
+        hw_min_pwm_L = 0;
+        hw_min_pwm_R = 0;
+        stopAllMotors();
+        delay(100);
+        readWheelEncodersInternal(true);
+        hw_find_enc_snap_L = encoderL_count;
+        hw_find_enc_snap_R = encoderR_count;
+        hw_find_step_ms = millis();
+        // Start first motor at starting PWM
+        motor_l_direction = 1;
+        motor_l_speed = hw_find_pwm;
+        motor_r_direction = 0;
+        motor_r_speed = 0;
+        applyMotorOutputs();
+        Serial.printf("HW_FIND: starting sweep motor=LEFT pwm=%d\n", hw_find_pwm);
+      } else if (selected_motor == 2 && hw_find_done) {
+        // Results shown, click again resets to allow re-run
+        hw_find_done = false;
+      } else {
+        // Cycle mode: 0 → 1 → 2
+        selected_motor = (selected_motor + 1) % 3;
+        stopAllMotors();
+        motor_command = 0;
+        if (selected_motor == 2) {
+          hw_find_running = false;
+          hw_find_done = false;
+        }
+      }
     }
 
-    applyHardwareTestDialSteps(dialSteps);
+    // --- FIND MIN sweep state machine ---
+    if (selected_motor == 2 && hw_find_running) {
+      if (now - hw_find_step_ms >= HW_FIND_STEP_DURATION_MS) {
+        // Read encoders and check for movement
+        readWheelEncodersInternal(true);
+        int32_t deltaL = abs((int32_t)(encoderL_count - hw_find_enc_snap_L));
+        int32_t deltaR = abs((int32_t)(encoderR_count - hw_find_enc_snap_R));
 
-    motor_enabled = (motor_command != 0) ? 1 : 0;
-    uint8_t pwm = (uint8_t)abs((int)motor_command);
-    const uint8_t dir = (motor_command >= 0) ? 1 : 0;
-    motor_l_direction = dir;
-    motor_r_direction = dir;
+        bool moved = false;
+        if (hw_find_motor == 0) {
+          // Testing left motor — check left encoder (or right if cross-wired)
+          moved = (deltaL > HW_FIND_PULSE_THRESHOLD) || (deltaR > HW_FIND_PULSE_THRESHOLD);
+          if (moved) {
+            hw_min_pwm_L = hw_find_pwm;
+            Serial.printf("HW_FIND: LEFT min PWM = %d (dL=%ld dR=%ld)\n",
+                          hw_find_pwm, (long)deltaL, (long)deltaR);
+          }
+        } else {
+          // Testing right motor
+          moved = (deltaL > HW_FIND_PULSE_THRESHOLD) || (deltaR > HW_FIND_PULSE_THRESHOLD);
+          if (moved) {
+            hw_min_pwm_R = hw_find_pwm;
+            Serial.printf("HW_FIND: RIGHT min PWM = %d (dL=%ld dR=%ld)\n",
+                          hw_find_pwm, (long)deltaL, (long)deltaR);
+          }
+        }
 
-    if (motor_enabled) {
-      if (selected_motor == 0) {
-        motor_l_speed = pwm;
-        motor_r_speed = 0;
+        if (moved || hw_find_pwm >= 255) {
+          // Found threshold or reached max — move to next motor or finish
+          stopAllMotors();
+          delay(200);
+          if (hw_find_motor == 0) {
+            // Switch to right motor
+            hw_find_motor = 1;
+            hw_find_pwm = HW_FIND_START_PWM;
+            readWheelEncodersInternal(true);
+            hw_find_enc_snap_L = encoderL_count;
+            hw_find_enc_snap_R = encoderR_count;
+            hw_find_step_ms = millis();
+            motor_l_direction = 0;
+            motor_l_speed = 0;
+            motor_r_direction = 1;
+            motor_r_speed = hw_find_pwm;
+            applyMotorOutputs();
+            Serial.printf("HW_FIND: switching to RIGHT motor pwm=%d\n", hw_find_pwm);
+          } else {
+            // Both done
+            hw_find_running = false;
+            hw_find_done = true;
+            Serial.printf("HW_FIND: DONE  L_min=%d  R_min=%d\n",
+                          (int)hw_min_pwm_L, (int)hw_min_pwm_R);
+          }
+        } else {
+          // No movement yet — increment PWM and continue
+          hw_find_pwm++;
+          readWheelEncodersInternal(true);
+          hw_find_enc_snap_L = encoderL_count;
+          hw_find_enc_snap_R = encoderR_count;
+          hw_find_step_ms = millis();
+          if (hw_find_motor == 0) {
+            motor_l_speed = hw_find_pwm;
+            motor_r_speed = 0;
+          } else {
+            motor_l_speed = 0;
+            motor_r_speed = hw_find_pwm;
+          }
+          motor_l_direction = 1;
+          motor_r_direction = 1;
+          applyMotorOutputs();
+        }
+      }
+    }
+    // --- Normal manual motor control (modes 0 and 1) ---
+    else if (selected_motor <= 1) {
+      applyHardwareTestDialSteps(dialSteps);
+
+      motor_enabled = (motor_command != 0) ? 1 : 0;
+      uint8_t pwm = (uint8_t)abs((int)motor_command);
+      const uint8_t dir = (motor_command >= 0) ? 1 : 0;
+      motor_l_direction = dir;
+      motor_r_direction = dir;
+
+      if (motor_enabled) {
+        if (selected_motor == 0) {
+          motor_l_speed = pwm;
+          motor_r_speed = 0;
+        } else {
+          motor_l_speed = 0;
+          motor_r_speed = pwm;
+        }
       } else {
         motor_l_speed = 0;
-        motor_r_speed = pwm;
+        motor_r_speed = 0;
       }
-    } else {
-      motor_l_speed = 0;
-      motor_r_speed = 0;
-    }
 
-    applyMotorOutputs();
+      applyMotorOutputs();
+    }
   }
 
   else if (currentScreen == SCREEN_IMU_CAL) {
@@ -8118,6 +8972,32 @@ void loop() {
       enterScreen(SCREEN_MAIN_MENU);
     }
     stopAllMotors();
+  }
+
+  else if (currentScreen == SCREEN_SELF_TEST) {
+    // Run the self-test state machine
+    if (st_phase != ST_IDLE && st_phase != ST_DONE) {
+      selfTestTick();
+    }
+
+    // Hold: abort/back to menu
+    static bool stLongPressHandled = false;
+    if (!M5.BtnA.isPressed()) stLongPressHandled = false;
+    if (!stLongPressHandled && M5.BtnA.pressedFor(800)) {
+      stLongPressHandled = true;
+      suppressNextClick = true;
+      stopAllMotors();
+      st_phase = ST_IDLE;
+      enterScreen(SCREEN_MAIN_MENU);
+    }
+
+    // Click: start test (if idle or done)
+    if ((now - boot_ms) > 500 && M5.BtnA.wasClicked() && (now - last_button_ms) > 250) {
+      last_button_ms = now;
+      if (st_phase == ST_IDLE || st_phase == ST_DONE) {
+        selfTestStart();
+      }
+    }
   }
 
   // Render the active screen
