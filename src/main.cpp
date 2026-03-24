@@ -3,7 +3,8 @@
 #include <math.h>
 #include <string.h>
 #include <Preferences.h>
-#include <SPIFFS.h>
+#include <FFat.h>
+#define SPIFFS FFat   // Board has FFat partition, not SPIFFS
 #include <esp_system.h>
 
 #include <time.h>
@@ -11,151 +12,16 @@
 
 #include <esp_heap_caps.h>
 
-// Optional WiFi + cloud uploader (posts the saved CSV to a webhook)
-// Disabled for track testing (keeps firmware focused on control + local logging).
-#define RUN_CLOUD_UPLOAD_ENABLE 0
+// WiFi + cloud upload removed — all logging is local SPIFFS only.
+// Use the Python tool (tools/download_logs.py) to pull logs over serial.
 
-#if RUN_CLOUD_UPLOAD_ENABLE
-  #include <WiFi.h>
-  #include <WiFiClientSecure.h>
-  #include <HTTPClient.h>
-
-  // Keep credentials out of the repo: create include/wifi_secrets.h locally.
-  // It should define:
-  //   #define WIFI_SSID "..."
-  //   #define WIFI_PASSWORD "..."
-  //   #define CLOUD_UPLOAD_URL "https://script.google.com/macros/s/.../exec"
-  #if __has_include("wifi_secrets.h")
-    #include "wifi_secrets.h"
-  #endif
-  #ifndef WIFI_SSID
-    #define WIFI_SSID ""
-  #endif
-  #ifndef WIFI_PASSWORD
-    #define WIFI_PASSWORD ""
-  #endif
-  #ifndef CLOUD_UPLOAD_URL
-    #define CLOUD_UPLOAD_URL ""
-  #endif
-
-  #define CLOUD_UPLOAD_CONNECT_TIMEOUT_MS 12000
-  #define CLOUD_UPLOAD_HTTP_TIMEOUT_MS 20000
-  #define CLOUD_UPLOAD_VERIFY_TLS 0
+// Firmware version
+// FW_VERSION defined near top
+  // Auto-encoder calibration routines removed — manual tuning via ENC CAL screen.
+// Provide a default firmware version string if the build system hasn't set one.
+#ifndef FW_VERSION
+#define FW_VERSION "unknown"
 #endif
-
-// Forward declarations (needed because menu helpers appear before some defs)
-void stopAllMotors();
-void applyMotorOutputs();
-void updateDisplay();
-void readWheelEncoders();
-static void readWheelEncodersForce();
-static void updateMotorDiagnostics();
-
-#if RUN_CLOUD_UPLOAD_ENABLE
-static bool cloudUploadLastRunCsv();
-#endif
-
-// Firmware ID (update this when behavior changes)
-// Robot Tour Event: BFS-based graph navigation system
-// v1.0: Initial Robot Tour port with BFS pathfinding
-#define FW_VERSION "v1_robot_tour_bfs_2026-02-14"
-
-// ========================================================================
-// BFS NAVIGATION SYSTEM FOR ROBOT TOUR
-// ========================================================================
-// Graph-based pathfinding for navigating waypoints/rooms
-// The robot builds a BFS tree from start to goal and follows the path
-
-// Hardware-specific direction fix:
-// If the car drives backwards when commanded forward, flip this.
-#define INVERT_MOTOR_DIRECTION 1
-
-// Chassis/mounting fix:
-// If left/right motors are mirrored, you may need one side reversed so that
-// a logical "forward" command makes both wheels propel forward.
-#define INVERT_LEFT_MOTOR_DIRECTION 1
-// If the *right* motor needs reversing to match "forward".
-#define INVERT_RIGHT_MOTOR_DIRECTION 1
-
-// Dial direction: set so turning RIGHT increases values.
-// If the dial feels backwards, flip this to -1.
-#define DIAL_DIRECTION -1
-
-// Safety/diagnostic toggles
-#define RUN_I2C_SCAN_ON_BOOT 0
-#define RUN_MOTOR_DIAGNOSTIC_ON_BOOT 0
-
-// Cloud upload behavior
-// - ON_STOP: automatically upload /runlog_last.csv after each run ends
-// - DEFERRED: do the HTTP work later in loop() (avoids blocking stopRun())
-#define RUN_CLOUD_UPLOAD_ON_STOP 1
-#define RUN_CLOUD_UPLOAD_DEFERRED 1
-#define RUN_CLOUD_UPLOAD_MAX_RETRIES 3
-#define RUN_CLOUD_UPLOAD_RETRY_MS 5000
-
-// Hardware pins
-#define ENCODER_PIN_A 41
-#define ENCODER_PIN_B 40
-
-// I2C addresses
-// Canonical mapping (matches prior working encoder test + M5Unit-Hbridge examples)
-// - Left Encoder: 0x59
-// - Right Encoder: 0x58
-// - Left HBridge: 0x21
-// - Right HBridge: 0x20
-//
-// If your physical wiring is swapped, flip these toggles to keep the UI labels sane.
-#define SWAP_ENCODERS 1
-#define SWAP_MOTORS 0
-
-// Some encoder modules are mounted such that "forward" motion reports negative counts.
-// If RUN distance does not increase but encoder counts do change, try flipping one of these.
-#define INVERT_LEFT_ENCODER_COUNT 0
-#define INVERT_RIGHT_ENCODER_COUNT 1
-
-#if SWAP_ENCODERS
-#define ENCODER_L_ADDR 0x58
-#define ENCODER_R_ADDR 0x59
-#else
-#define ENCODER_L_ADDR 0x59
-#define ENCODER_R_ADDR 0x58
-#endif
-
-#if SWAP_MOTORS
-#define MOTOR_L_ADDR 0x20
-#define MOTOR_R_ADDR 0x21
-#else
-#define MOTOR_L_ADDR 0x21
-#define MOTOR_R_ADDR 0x20
-#endif
-
-// Boot-time motor spin test (to validate I2C write format)
-// This runs once in setup(): start motor, wait 5s, stop.
-// Set to 1 only when you want to run the boot-only spin test.
-#define RUN_BOOT_MOTOR_SPIN_TEST 0
-#define BOOT_TEST_MOTOR_ADDR MOTOR_R_ADDR
-#define BOOT_TEST_DIRECTION 1 // 1=forward
-#define BOOT_TEST_PWM 140
-#define BOOT_TEST_DURATION_MS 5000
-
-// Use M5Unified's external I2C pin mapping (Port A) for Wire.
-// This matches M5's Unit HBridge docs/examples (device lives on PORT.A).
-#define USE_M5_EX_I2C_PINS 1
-
-// Display refresh (ms). Rendering is double-buffered via sprite to reduce flicker.
-#define DISPLAY_REFRESH_MS 100
-
-// Master quiet mode: set to 1 to silence all boot/setup Serial output.
-// Only run logs will be printed (for post-run analysis).
-#define SERIAL_QUIET_MODE 1
-
-// Start-path diagnostics (helps debug "red button does nothing")
-// - Prints a few key lines to Serial on start/stop attempts
-// - Logs the same lines to SPIFFS so you can retrieve them even if live monitor is flaky
-#define RUN_START_DEBUG_SERIAL 1
-#define RUN_START_DEBUG_SPIFFS 1
-
-// Set to 1 to periodically print diagnostic status over Serial.
 // Keep this OFF during normal runs; it can flood the terminal.
 #define SERIAL_STATUS_SPAM 0
 
@@ -237,6 +103,25 @@ static const uint32_t i2c_clock_hz = I2C_CLOCK_HZ;
 #define RUN_NO_MOTION_TIMEOUT_MS 1200
 #define RUN_NO_MOTION_MIN_PULSES 8
 
+// Display refresh interval (ms)
+#ifndef DISPLAY_REFRESH_MS
+#define DISPLAY_REFRESH_MS 50
+#endif
+
+// Boot test defaults (safe fallbacks if not provided elsewhere)
+#ifndef BOOT_TEST_MOTOR_ADDR
+#define BOOT_TEST_MOTOR_ADDR MOTOR_L_ADDR
+#endif
+#ifndef BOOT_TEST_DIRECTION
+#define BOOT_TEST_DIRECTION 1
+#endif
+#ifndef BOOT_TEST_PWM
+#define BOOT_TEST_PWM 80
+#endif
+#ifndef BOOT_TEST_DURATION_MS
+#define BOOT_TEST_DURATION_MS 500
+#endif
+
 // External buttons on the black digital connector (PORT.B).
 // Blue button wired to PORT.B IN, Red button wired to PORT.B OUT.
 static int extBlueBtnPin = -1;
@@ -251,9 +136,9 @@ static void savePersistedSettings();
 // ========================================================================
 // BFS GRAPH NAVIGATION CONFIGURATION
 // ========================================================================
-#define BFS_MAX_NODES 64          // Maximum waypoints (up to 8x8 grid)
+#define BFS_MAX_NODES 128         // Maximum waypoints (grid + center sub-nodes + virtual)
 #define BFS_MAX_EDGES_PER_NODE 12 // Max adjacent nodes (grid + virtual center/gate nodes)
-#define BFS_PATH_MAX_LENGTH 128   // Max steps in a path (needs room for multi-gate routes)
+#define BFS_PATH_MAX_LENGTH 256   // Max steps in a path (needs room for multi-gate routes)
 
 // Node structure for graph representation
 struct BfsNode {
@@ -273,9 +158,10 @@ struct BfsState {
   uint8_t current_node;             // Current position in graph
   uint8_t goal_node;                // Target position
   uint8_t path[BFS_PATH_MAX_LENGTH];
-  uint8_t path_length;
-  uint8_t path_index;               // Current step along path
+  uint16_t path_length;
+  uint16_t path_index;              // Current step along path
   bool path_valid;
+  float path_dist_m;                // Total physical distance of last computed path
 };
 
 static BfsState bfs_state = {0};
@@ -324,10 +210,12 @@ struct GridCourse {
 
   GridGate gates[MAX_GATES];
   uint8_t gate_count;
+  int8_t last_gate_idx;           // -1 = auto (optimize), 0+ = index into gates[] that must be visited last
 };
 
 static GridCourse grid_course;
 static uint8_t bfs_gate_nodes[MAX_GATES]; // Virtual nodes at gate square centers
+static uint8_t bfs_sq_center[GRID_MAX_DIM][GRID_MAX_DIM]; // Center sub-node ID for each square (row,col)
 
 // Initialize grid_course with sensible defaults
 // Fixed grid: 6 columns x 5 rows of intersections = 5x4 squares = 250x200cm at 50cm spacing
@@ -345,6 +233,7 @@ static void gridCourseDefaults() {
   grid_course.start_r2 = 0; grid_course.start_c2 = 1;
   grid_course.end_col = (GRID_FIXED_COLS - 1) / 2;  // Square column index (0 to cols-2)
   grid_course.end_row = (GRID_FIXED_ROWS - 1) / 2;  // Square row index (0 to rows-2)
+  grid_course.last_gate_idx = -1; // Auto (optimize all permutations)
 }
 
 // Convert (row, col) to node index
@@ -360,6 +249,8 @@ static bool gridHasWall(uint8_t r1, uint8_t c1, uint8_t r2, uint8_t c2) {
         (w.r1 == r2 && w.c1 == c2 && w.r2 == r1 && w.c2 == c1)) {
       return true;
     }
+
+    // (Stall detection relocated to IMU/control update; removed from gridHasWall.)
   }
   return false;
 }
@@ -588,6 +479,70 @@ static uint16_t gridSquareIndex(uint8_t sqRow, uint8_t sqCol) {
 static uint16_t grid_start_cursor = 0;
 static uint16_t grid_end_cursor = 0;
 
+// --- Wall clearance helper ---
+// Returns the minimum distance from a point (px,py) to the line segment (ax,ay)-(bx,by).
+static float pointToSegmentDist(float px, float py, float ax, float ay, float bx, float by) {
+  float dx = bx - ax, dy = by - ay;
+  float lenSq = dx * dx + dy * dy;
+  if (lenSq < 1e-12f) return sqrtf((px - ax) * (px - ax) + (py - ay) * (py - ay));
+  float t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+  if (t < 0.0f) t = 0.0f;
+  if (t > 1.0f) t = 1.0f;
+  float cx = ax + t * dx, cy = ay + t * dy;
+  return sqrtf((px - cx) * (px - cx) + (py - cy) * (py - cy));
+}
+
+// Check if two line segments cross in their interiors (excluding endpoints).
+static bool segmentsCross(float ax, float ay, float bx, float by,
+                          float cx, float cy, float dx, float dy) {
+  float d1x = bx - ax, d1y = by - ay;
+  float d2x = dx - cx, d2y = dy - cy;
+  float denom = d1x * d2y - d1y * d2x;
+  if (fabsf(denom) < 1e-8f) return false; // parallel
+  float t = ((cx - ax) * d2y - (cy - ay) * d2x) / denom;
+  float u = ((cx - ax) * d1y - (cy - ay) * d1x) / denom;
+  return t > 0.01f && t < 0.99f && u > 0.01f && u < 0.99f;
+}
+
+// Check if edge from A to B is clear of all walls & bottles.
+// Uses crossing test for walls sharing an endpoint with the edge,
+// and sample-point clearance check for other walls.
+static bool bfsEdgeClearOfWalls(float ax_m, float ay_m, float bx_m, float by_m, float clearance_m) {
+  const float spacing_m = grid_course.spacing_cm / 100.0f;
+
+  // Helper lambda: check one obstacle segment against the edge
+  auto checkObstacle = [&](float wx1, float wy1, float wx2, float wy2) -> bool {
+    // Always block if segments cross in their interiors
+    if (segmentsCross(ax_m, ay_m, bx_m, by_m, wx1, wy1, wx2, wy2)) return false;
+    // Check clearance at sample points along the edge (including near endpoints)
+    for (int s = 0; s <= 4; s++) {
+      float t = s * 0.25f;
+      float px = ax_m + t * (bx_m - ax_m);
+      float py = ay_m + t * (by_m - ay_m);
+      float dist = pointToSegmentDist(px, py, wx1, wy1, wx2, wy2);
+      if (dist < clearance_m - 0.001f) return false;
+    }
+    // Also check clearance of edge from wall/bottle endpoints (corners)
+    float dEp1 = pointToSegmentDist(wx1, wy1, ax_m, ay_m, bx_m, by_m);
+    if (dEp1 < clearance_m - 0.001f) return false;
+    float dEp2 = pointToSegmentDist(wx2, wy2, ax_m, ay_m, bx_m, by_m);
+    if (dEp2 < clearance_m - 0.001f) return false;
+    return true;
+  };
+
+  for (uint8_t i = 0; i < grid_course.wall_count; i++) {
+    const GridWall& w = grid_course.walls[i];
+    if (!checkObstacle(w.c1 * spacing_m, w.r1 * spacing_m, w.c2 * spacing_m, w.r2 * spacing_m))
+      return false;
+  }
+  for (uint8_t i = 0; i < grid_course.bottle_count; i++) {
+    const GridBottle& b = grid_course.bottles[i];
+    if (!checkObstacle(b.c1 * spacing_m, b.r1 * spacing_m, b.c2 * spacing_m, b.r2 * spacing_m))
+      return false;
+  }
+  return true;
+}
+
 // Add an edge between two nodes (bidirectional)
 static void bfsAddEdge(uint8_t from_id, uint8_t to_id, float distance_m) {
   if (from_id >= BFS_MAX_NODES || to_id >= BFS_MAX_NODES) return;
@@ -600,11 +555,24 @@ static void bfsAddEdge(uint8_t from_id, uint8_t to_id, float distance_m) {
   from->neighbor_count++;
 }
 
+// Add an edge between two nodes only if it clears all walls by the required margin.
+// clearance_m <= 0 skips the check (used for start node connections outside the grid).
+static void bfsAddEdgeIfClear(uint8_t from_id, uint8_t to_id, float distance_m, float clearance_m) {
+  if (from_id >= BFS_MAX_NODES || to_id >= BFS_MAX_NODES) return;
+  if (clearance_m > 0.0f) {
+    float ax = bfs_state.nodes[from_id].x_m, ay = bfs_state.nodes[from_id].y_m;
+    float bx = bfs_state.nodes[to_id].x_m,   by = bfs_state.nodes[to_id].y_m;
+    if (!bfsEdgeClearOfWalls(ax, ay, bx, by, clearance_m)) return;
+  }
+  bfsAddEdge(from_id, to_id, distance_m);
+}
+
 // Build BFS graph from grid_course configuration
 // Creates nodes for each grid intersection, adds edges for adjacent nodes
 // that are not blocked by walls or water bottles.
 static void bfsInitializeGraph() {
   memset(&bfs_state, 0, sizeof(bfs_state));
+  memset(bfs_sq_center, 0xFF, sizeof(bfs_sq_center)); // 0xFF = no center node
 
   const uint8_t rows = grid_course.rows;
   const uint8_t cols = grid_course.cols;
@@ -613,7 +581,7 @@ static void bfsInitializeGraph() {
   bfs_state.node_count = rows * cols;
   if (bfs_state.node_count > BFS_MAX_NODES) bfs_state.node_count = BFS_MAX_NODES;
 
-  // Create nodes
+  // Create grid intersection nodes
   for (uint8_t r = 0; r < rows; r++) {
     for (uint8_t c = 0; c < cols; c++) {
       uint8_t id = gridNodeId(r, c);
@@ -626,32 +594,100 @@ static void bfsInitializeGraph() {
     }
   }
 
-  // Add edges between adjacent nodes (skip if wall or bottle blocks the edge)
+  // Wall clearance: 0.25m from any wall/bottle segment (robot half-width + margin)
+  const float clearance_m = 0.25f;
+
+  // Add cardinal edges between adjacent grid nodes (skip if wall/bottle blocks)
   for (uint8_t r = 0; r < rows; r++) {
     for (uint8_t c = 0; c < cols; c++) {
       uint8_t id = gridNodeId(r, c);
       if (id >= BFS_MAX_NODES) continue;
+      if (c + 1 < cols && !gridHasWall(r, c, r, c + 1) && !gridHasBottle(r, c, r, c + 1))
+        bfsAddEdgeIfClear(id, gridNodeId(r, c + 1), spacing_m, clearance_m);
+      if (c > 0 && !gridHasWall(r, c, r, c - 1) && !gridHasBottle(r, c, r, c - 1))
+        bfsAddEdgeIfClear(id, gridNodeId(r, c - 1), spacing_m, clearance_m);
+      if (r + 1 < rows && !gridHasWall(r, c, r + 1, c) && !gridHasBottle(r, c, r + 1, c))
+        bfsAddEdgeIfClear(id, gridNodeId(r + 1, c), spacing_m, clearance_m);
+      if (r > 0 && !gridHasWall(r, c, r - 1, c) && !gridHasBottle(r, c, r - 1, c))
+        bfsAddEdgeIfClear(id, gridNodeId(r - 1, c), spacing_m, clearance_m);
+    }
+  }
 
-      // Right neighbor
-      if (c + 1 < cols && !gridHasWall(r, c, r, c + 1) && !gridHasBottle(r, c, r, c + 1)) {
-        bfsAddEdge(id, gridNodeId(r, c + 1), spacing_m);
+  // --- Direct diagonal edges across each grid square ---
+  float full_diag = spacing_m * 1.4142f;  // sqrt(2) * spacing
+  for (uint8_t r = 0; r + 1 < rows; r++) {
+    for (uint8_t c = 0; c + 1 < cols; c++) {
+      uint8_t tl = gridNodeId(r, c), tr = gridNodeId(r, c + 1);
+      uint8_t bl = gridNodeId(r + 1, c), br = gridNodeId(r + 1, c + 1);
+      if (tl < BFS_MAX_NODES && br < BFS_MAX_NODES) {
+        bfsAddEdgeIfClear(tl, br, full_diag, clearance_m);
+        bfsAddEdgeIfClear(br, tl, full_diag, clearance_m);
       }
-      // Left neighbor
-      if (c > 0 && !gridHasWall(r, c, r, c - 1) && !gridHasBottle(r, c, r, c - 1)) {
-        bfsAddEdge(id, gridNodeId(r, c - 1), spacing_m);
+      if (tr < BFS_MAX_NODES && bl < BFS_MAX_NODES) {
+        bfsAddEdgeIfClear(tr, bl, full_diag, clearance_m);
+        bfsAddEdgeIfClear(bl, tr, full_diag, clearance_m);
       }
-      // Down neighbor
-      if (r + 1 < rows && !gridHasWall(r, c, r + 1, c) && !gridHasBottle(r, c, r + 1, c)) {
-        bfsAddEdge(id, gridNodeId(r + 1, c), spacing_m);
+    }
+  }
+
+  // --- Center sub-nodes: one at the center of every grid square ---
+  // Enables routing through square centers (0.25m from grid edges).
+  float half_diag = spacing_m * 0.7071f;  // sqrt(2)/2 * spacing
+  for (uint8_t r = 0; r + 1 < rows; r++) {
+    for (uint8_t c = 0; c + 1 < cols; c++) {
+      uint8_t cid = bfs_state.node_count;
+      if (cid >= BFS_MAX_NODES) break;
+      bfs_state.nodes[cid].id = cid;
+      snprintf(bfs_state.nodes[cid].name, sizeof(bfs_state.nodes[cid].name), "c%d%d", r, c);
+      bfs_state.nodes[cid].x_m = (c + 0.5f) * spacing_m;
+      bfs_state.nodes[cid].y_m = (r + 0.5f) * spacing_m;
+      bfs_state.nodes[cid].neighbor_count = 0;
+      bfs_state.node_count++;
+      bfs_sq_center[r][c] = cid;
+
+      // Connect center to its 4 corner intersections (bidirectional, with wall clearance)
+      uint8_t corners[4][2] = {
+        {r, c}, {r, (uint8_t)(c+1)},
+        {(uint8_t)(r+1), c}, {(uint8_t)(r+1), (uint8_t)(c+1)}
+      };
+      for (int k = 0; k < 4; k++) {
+        uint8_t cr = corners[k][0], cc = corners[k][1];
+        if (cr < rows && cc < cols) {
+          uint8_t cornerId = gridNodeId(cr, cc);
+          bfsAddEdgeIfClear(cid, cornerId, half_diag, clearance_m);
+          bfsAddEdgeIfClear(cornerId, cid, half_diag, clearance_m);
+        }
       }
-      // Up neighbor
-      if (r > 0 && !gridHasWall(r, c, r - 1, c) && !gridHasBottle(r, c, r - 1, c)) {
-        bfsAddEdge(id, gridNodeId(r - 1, c), spacing_m);
+    }
+  }
+
+  // --- Center-to-center edges for adjacent squares ---
+  for (uint8_t r = 0; r + 1 < rows; r++) {
+    for (uint8_t c = 0; c + 1 < cols; c++) {
+      uint8_t cid = bfs_sq_center[r][c];
+      if (cid == 0xFF) continue;
+      // Right neighbor center: center(r, c+1)
+      if (c + 2 < cols) {
+        uint8_t rid = bfs_sq_center[r][c + 1];
+        if (rid != 0xFF) {
+          bfsAddEdgeIfClear(cid, rid, spacing_m, clearance_m);
+          bfsAddEdgeIfClear(rid, cid, spacing_m, clearance_m);
+        }
+      }
+      // Down neighbor center: center(r+1, c)
+      if (r + 2 < rows) {
+        uint8_t did = bfs_sq_center[r + 1][c];
+        if (did != 0xFF) {
+          bfsAddEdgeIfClear(cid, did, spacing_m, clearance_m);
+          bfsAddEdgeIfClear(did, cid, spacing_m, clearance_m);
+        }
       }
     }
   }
 
   // --- Virtual start node: midpoint of start border edge ---
+  // Start node is on the boundary — skip clearance check for its connections
+  // since the robot enters from outside the grid.
   uint8_t startVirtId = bfs_state.node_count;
   if (startVirtId < BFS_MAX_NODES) {
     uint8_t sr1 = grid_course.start_r1, sc1 = grid_course.start_c1;
@@ -662,7 +698,7 @@ static void bfsInitializeGraph() {
     bfs_state.nodes[startVirtId].y_m = (sr1 + sr2) * 0.5f * spacing_m;
     bfs_state.nodes[startVirtId].neighbor_count = 0;
     bfs_state.node_count++;
-    // Connect to both edge endpoints (bidirectional)
+    // Connect to both edge endpoints (no clearance — start is on boundary)
     float half_edge = spacing_m * 0.5f;
     uint8_t ep1 = gridNodeId(sr1, sc1), ep2 = gridNodeId(sr2, sc2);
     if (ep1 < rows * cols) {
@@ -673,37 +709,22 @@ static void bfsInitializeGraph() {
       bfsAddEdge(startVirtId, ep2, half_edge);
       bfsAddEdge(ep2, startVirtId, half_edge);
     }
-    // Connect to interior nodes adjacent to the border edge.
-    // For a horizontal border edge (sr1==sr2), the interior is one row inward.
-    // For a vertical border edge (sc1==sc2), the interior is one col inward.
-    float diag_dist = sqrtf(0.25f + 1.0f) * spacing_m; // sqrt((0.5)^2 + 1^2) * spacing
+    // Connect to adjacent square center (most direct entry path)
     if (sr1 == sr2) {
-      // Horizontal edge — interior row is inward from the border row
-      int8_t inRow = (sr1 == 0) ? 1 : (int8_t)(sr1 - 1);
-      // Connect to interior nodes at both columns of the edge
-      uint8_t in1 = gridNodeId((uint8_t)inRow, sc1);
-      uint8_t in2 = gridNodeId((uint8_t)inRow, sc2);
-      if (in1 < rows * cols) {
-        bfsAddEdge(startVirtId, in1, diag_dist);
-        bfsAddEdge(in1, startVirtId, diag_dist);
-      }
-      if (in2 < rows * cols) {
-        bfsAddEdge(startVirtId, in2, diag_dist);
-        bfsAddEdge(in2, startVirtId, diag_dist);
+      uint8_t sqRow = (sr1 == 0) ? 0 : (uint8_t)(sr1 - 1);
+      uint8_t minC = (sc1 < sc2) ? sc1 : sc2;
+      if (sqRow < rows - 1 && minC < cols - 1 && bfs_sq_center[sqRow][minC] != 0xFF) {
+        float d = spacing_m * 0.5f;
+        bfsAddEdge(startVirtId, bfs_sq_center[sqRow][minC], d);
+        bfsAddEdge(bfs_sq_center[sqRow][minC], startVirtId, d);
       }
     } else {
-      // Vertical edge — interior col is inward from the border col
-      int8_t inCol = (sc1 == 0) ? 1 : (int8_t)(sc1 - 1);
-      // Connect to interior nodes at both rows of the edge
-      uint8_t in1 = gridNodeId(sr1, (uint8_t)inCol);
-      uint8_t in2 = gridNodeId(sr2, (uint8_t)inCol);
-      if (in1 < rows * cols) {
-        bfsAddEdge(startVirtId, in1, diag_dist);
-        bfsAddEdge(in1, startVirtId, diag_dist);
-      }
-      if (in2 < rows * cols) {
-        bfsAddEdge(startVirtId, in2, diag_dist);
-        bfsAddEdge(in2, startVirtId, diag_dist);
+      uint8_t sqCol = (sc1 == 0) ? 0 : (uint8_t)(sc1 - 1);
+      uint8_t minR = (sr1 < sr2) ? sr1 : sr2;
+      if (minR < rows - 1 && sqCol < cols - 1 && bfs_sq_center[minR][sqCol] != 0xFF) {
+        float d = spacing_m * 0.5f;
+        bfsAddEdge(startVirtId, bfs_sq_center[minR][sqCol], d);
+        bfsAddEdge(bfs_sq_center[minR][sqCol], startVirtId, d);
       }
     }
     bfs_start_edge_node = startVirtId;
@@ -711,59 +732,70 @@ static void bfsInitializeGraph() {
     bfs_start_edge_node = 0;
   }
 
-  // --- Virtual end node: center of target square ---
-  uint8_t centerId = bfs_state.node_count;
-  if (centerId < BFS_MAX_NODES) {
-    uint8_t er = grid_course.end_row;   // square row
-    uint8_t ec = grid_course.end_col;   // square col
-    bfs_state.nodes[centerId].id = centerId;
-    snprintf(bfs_state.nodes[centerId].name, sizeof(bfs_state.nodes[centerId].name), "E%d,%d", er, ec);
-    bfs_state.nodes[centerId].x_m = (ec + 0.5f) * spacing_m;
-    bfs_state.nodes[centerId].y_m = (er + 0.5f) * spacing_m;
-    bfs_state.nodes[centerId].neighbor_count = 0;
-    bfs_state.node_count++;
-
-    // Connect 4 surrounding corner intersections to center node (bidirectional)
-    float half_diag = spacing_m * 0.7071f;  // sqrt(2)/2 * spacing
-    uint8_t corners[4][2] = {{er, ec}, {er, (uint8_t)(ec+1)}, {(uint8_t)(er+1), ec}, {(uint8_t)(er+1), (uint8_t)(ec+1)}};
-    for (int i = 0; i < 4; i++) {
-      uint8_t cr = corners[i][0], cc = corners[i][1];
-      if (cr < rows && cc < cols) {
-        uint8_t cornerId = gridNodeId(cr, cc);
-        bfsAddEdge(cornerId, centerId, half_diag);
-        bfsAddEdge(centerId, cornerId, half_diag);
+  // --- Virtual end node: reuse center sub-node of target square ---
+  {
+    uint8_t er = grid_course.end_row;
+    uint8_t ec = grid_course.end_col;
+    if (er < rows - 1 && ec < cols - 1 && bfs_sq_center[er][ec] != 0xFF) {
+      bfs_end_center_node = bfs_sq_center[er][ec];
+      snprintf(bfs_state.nodes[bfs_end_center_node].name,
+               sizeof(bfs_state.nodes[bfs_end_center_node].name), "E%d,%d", er, ec);
+    } else {
+      uint8_t centerId = bfs_state.node_count;
+      if (centerId < BFS_MAX_NODES) {
+        bfs_state.nodes[centerId].id = centerId;
+        snprintf(bfs_state.nodes[centerId].name, sizeof(bfs_state.nodes[centerId].name), "E%d,%d", er, ec);
+        bfs_state.nodes[centerId].x_m = (ec + 0.5f) * spacing_m;
+        bfs_state.nodes[centerId].y_m = (er + 0.5f) * spacing_m;
+        bfs_state.nodes[centerId].neighbor_count = 0;
+        bfs_state.node_count++;
+        float hd = spacing_m * 0.7071f;
+        uint8_t corners[4][2] = {{er, ec}, {er, (uint8_t)(ec+1)}, {(uint8_t)(er+1), ec}, {(uint8_t)(er+1), (uint8_t)(ec+1)}};
+        for (int i = 0; i < 4; i++) {
+          uint8_t cr2 = corners[i][0], cc2 = corners[i][1];
+          if (cr2 < rows && cc2 < cols) {
+            uint8_t cid2 = gridNodeId(cr2, cc2);
+            bfsAddEdge(cid2, centerId, hd);
+            bfsAddEdge(centerId, cid2, hd);
+          }
+        }
+        bfs_end_center_node = centerId;
+      } else {
+        bfs_end_center_node = bfs_state.node_count - 1;
       }
     }
-    bfs_end_center_node = centerId;
-  } else {
-    bfs_end_center_node = bfs_state.node_count - 1;
   }
 
-  // --- Virtual gate nodes: center of each gate square ---
+  // --- Virtual gate nodes: reuse center sub-nodes of gate squares ---
   memset(bfs_gate_nodes, 0, sizeof(bfs_gate_nodes));
   for (uint8_t gi = 0; gi < grid_course.gate_count; gi++) {
-    uint8_t gateVirtId = bfs_state.node_count;
-    if (gateVirtId >= BFS_MAX_NODES) break;
     uint8_t gr = grid_course.gates[gi].row;
     uint8_t gc = grid_course.gates[gi].col;
-    bfs_state.nodes[gateVirtId].id = gateVirtId;
-    snprintf(bfs_state.nodes[gateVirtId].name, sizeof(bfs_state.nodes[gateVirtId].name), "G%d", gi);
-    bfs_state.nodes[gateVirtId].x_m = (gc + 0.5f) * spacing_m;
-    bfs_state.nodes[gateVirtId].y_m = (gr + 0.5f) * spacing_m;
-    bfs_state.nodes[gateVirtId].neighbor_count = 0;
-    bfs_state.node_count++;
-    // Connect to 4 corner intersections (bidirectional)
-    float half_diag = spacing_m * 0.7071f;
-    uint8_t gcorners[4][2] = {{gr, gc}, {gr, (uint8_t)(gc+1)}, {(uint8_t)(gr+1), gc}, {(uint8_t)(gr+1), (uint8_t)(gc+1)}};
-    for (int k = 0; k < 4; k++) {
-      uint8_t cr = gcorners[k][0], cc = gcorners[k][1];
-      if (cr < rows && cc < cols) {
-        uint8_t cornerId = gridNodeId(cr, cc);
-        bfsAddEdge(cornerId, gateVirtId, half_diag);
-        bfsAddEdge(gateVirtId, cornerId, half_diag);
+    if (gr < rows - 1 && gc < cols - 1 && bfs_sq_center[gr][gc] != 0xFF) {
+      bfs_gate_nodes[gi] = bfs_sq_center[gr][gc];
+      snprintf(bfs_state.nodes[bfs_gate_nodes[gi]].name,
+               sizeof(bfs_state.nodes[bfs_gate_nodes[gi]].name), "G%d", gi);
+    } else {
+      uint8_t gateVirtId = bfs_state.node_count;
+      if (gateVirtId >= BFS_MAX_NODES) break;
+      bfs_state.nodes[gateVirtId].id = gateVirtId;
+      snprintf(bfs_state.nodes[gateVirtId].name, sizeof(bfs_state.nodes[gateVirtId].name), "G%d", gi);
+      bfs_state.nodes[gateVirtId].x_m = (gc + 0.5f) * spacing_m;
+      bfs_state.nodes[gateVirtId].y_m = (gr + 0.5f) * spacing_m;
+      bfs_state.nodes[gateVirtId].neighbor_count = 0;
+      bfs_state.node_count++;
+      float hd = spacing_m * 0.7071f;
+      uint8_t gcorners[4][2] = {{gr, gc}, {gr, (uint8_t)(gc+1)}, {(uint8_t)(gr+1), gc}, {(uint8_t)(gr+1), (uint8_t)(gc+1)}};
+      for (int k = 0; k < 4; k++) {
+        uint8_t cr2 = gcorners[k][0], cc2 = gcorners[k][1];
+        if (cr2 < rows && cc2 < cols) {
+          uint8_t cid2 = gridNodeId(cr2, cc2);
+          bfsAddEdgeIfClear(cid2, gateVirtId, hd, clearance_m);
+          bfsAddEdgeIfClear(gateVirtId, cid2, hd, clearance_m);
+        }
       }
+      bfs_gate_nodes[gi] = gateVirtId;
     }
-    bfs_gate_nodes[gi] = gateVirtId;
   }
 
   bfs_state.current_node = bfs_start_edge_node;
@@ -774,9 +806,9 @@ static void bfsInitializeGraph() {
 
   bfs_initialized = true;
 
-  Serial.printf("BFS: grid %dx%d, spacing=%dcm, start=edge(%d,%d)-(%d,%d) end=sq(%d,%d), "
+  Serial.printf("BFS: grid %dx%d, spacing=%dcm, clearance=%.0fcm, start=edge(%d,%d)-(%d,%d) end=sq(%d,%d), "
                 "walls=%d, bottles=%d, gates=%d, nodes=%d\n",
-                rows, cols, grid_course.spacing_cm,
+                rows, cols, grid_course.spacing_cm, (double)(clearance_m * 100),
                 grid_course.start_r1, grid_course.start_c1,
                 grid_course.start_r2, grid_course.start_c2,
                 grid_course.end_row, grid_course.end_col,
@@ -787,9 +819,12 @@ static void bfsInitializeGraph() {
 // Forward declaration (defined after bfsComputePath)
 static bool bfsComputePath(uint8_t start_node, uint8_t goal_node);
 
+static void bfsSimplifyPath();  // forward declaration
+
 // Compute BFS path visiting all gates (if any) in optimal order.
 // For 0 gates: simple BFS from start to end.
 // For 1+ gates: try all permutations (up to MAX_GATES!) to find shortest total path.
+// If last_gate_idx is set (>= 0), that gate is forced last; only remaining gates are permuted.
 static bool bfsComputePathWithGates() {
   uint8_t startId = bfs_start_edge_node;   // Virtual start at edge midpoint
   uint8_t goalId = bfs_end_center_node;    // Virtual center of end square
@@ -809,39 +844,59 @@ static bool bfsComputePathWithGates() {
   // For small gate counts, try all permutations
   if (ng > 6) ng = 6;  // Cap at 6! = 720 permutations
 
-  // Generate permutation indices
+  // If a last gate is pinned, separate it out; only permute the rest
+  int8_t pinned_last = grid_course.last_gate_idx;
+  if (pinned_last >= ng) pinned_last = -1; // invalid → auto
+
+  // Build indices to permute (excluding pinned gate if any)
   uint8_t perm[MAX_GATES];
-  for (uint8_t i = 0; i < ng; i++) perm[i] = i;
+  uint8_t np = 0; // number of gates to permute
+  for (uint8_t i = 0; i < ng; i++) {
+    if ((int8_t)i != pinned_last) {
+      perm[np++] = i;
+    }
+  }
 
   uint8_t best_order[MAX_GATES];
-  uint8_t best_total_len = 255;
+  float best_total_dist = 1e9f;
   bool found = false;
 
-  // Try all permutations using heap's algorithm iteratively
-  uint8_t c[MAX_GATES];
-  memset(c, 0, sizeof(c));
-
-  // Evaluate current permutation
+  // Evaluate current permutation of the non-pinned gates,
+  // then append the pinned gate (if any) at the end.
   auto evalPerm = [&]() {
-    uint8_t total = 0;
+    float totalDist = 0.0f;
     uint8_t from = startId;
-    for (uint8_t i = 0; i < ng; i++) {
+    // Visit permuted gates first
+    for (uint8_t i = 0; i < np; i++) {
       if (!bfsComputePath(from, gate_nodes[perm[i]])) return;
-      total += bfs_state.path_length;
+      totalDist += bfs_state.path_dist_m;
       from = gate_nodes[perm[i]];
     }
+    // Visit pinned last gate
+    if (pinned_last >= 0) {
+      if (!bfsComputePath(from, gate_nodes[pinned_last])) return;
+      totalDist += bfs_state.path_dist_m;
+      from = gate_nodes[pinned_last];
+    }
+    // Final leg to goal
     if (!bfsComputePath(from, goalId)) return;
-    total += bfs_state.path_length;
-    if (total < best_total_len) {
-      best_total_len = total;
-      memcpy(best_order, perm, ng);
+    totalDist += bfs_state.path_dist_m;
+    if (totalDist < best_total_dist) {
+      best_total_dist = totalDist;
+      // Store full order: permuted gates + pinned gate
+      for (uint8_t i = 0; i < np; i++) best_order[i] = perm[i];
+      if (pinned_last >= 0) best_order[np] = (uint8_t)pinned_last;
       found = true;
     }
   };
 
+  // Try all permutations using Heap's algorithm iteratively
+  uint8_t c[MAX_GATES];
+  memset(c, 0, sizeof(c));
+
   evalPerm();
   uint8_t i = 0;
-  while (i < ng) {
+  while (i < np) {
     if (c[i] < i) {
       if (i % 2 == 0) { uint8_t t = perm[0]; perm[0] = perm[i]; perm[i] = t; }
       else             { uint8_t t = perm[c[i]]; perm[c[i]] = perm[i]; perm[i] = t; }
@@ -859,21 +914,21 @@ static bool bfsComputePathWithGates() {
   // Reconstruct the full path using best order
   // Build concatenated path: start → gate1 → gate2 → ... → goal
   uint8_t full_path[BFS_PATH_MAX_LENGTH];
-  uint8_t full_len = 0;
+  uint16_t full_len = 0;
   uint8_t from = startId;
 
   for (uint8_t i = 0; i < ng; i++) {
     bfsComputePath(from, gate_nodes[best_order[i]]);
     // Append path (skip first node if not the first segment to avoid duplicates)
     uint8_t skip = (i == 0) ? 0 : 1;
-    for (uint8_t j = skip; j < bfs_state.path_length && full_len < BFS_PATH_MAX_LENGTH; j++) {
+    for (uint16_t j = skip; j < bfs_state.path_length && full_len < BFS_PATH_MAX_LENGTH; j++) {
       full_path[full_len++] = bfs_state.path[j];
     }
     from = gate_nodes[best_order[i]];
   }
   // Final segment to goal
   bfsComputePath(from, goalId);
-  for (uint8_t j = 1; j < bfs_state.path_length && full_len < BFS_PATH_MAX_LENGTH; j++) {
+  for (uint16_t j = 1; j < bfs_state.path_length && full_len < BFS_PATH_MAX_LENGTH; j++) {
     full_path[full_len++] = bfs_state.path[j];
   }
 
@@ -882,68 +937,131 @@ static bool bfsComputePathWithGates() {
   bfs_state.path_length = full_len;
   bfs_state.path_index = 0;
   bfs_state.path_valid = true;
+  bfsSimplifyPath();
   return true;
 }
 
-// Breadth-first search to find shortest path from start to goal
+// Dijkstra's algorithm to find shortest-distance path from start to goal.
+// Uses the physical distances stored in each node's distances[] array.
 static bool bfsComputePath(uint8_t start_node, uint8_t goal_node) {
   if (start_node >= BFS_MAX_NODES || goal_node >= BFS_MAX_NODES) return false;
-  
-  // Queue for BFS (using circular buffer)
-  uint8_t queue[BFS_MAX_NODES * 2];
-  uint8_t queue_front = 0, queue_rear = 0;
-  
-  // Visited tracking
+
+  float dist[BFS_MAX_NODES];
   bool visited[BFS_MAX_NODES];
   uint8_t parent[BFS_MAX_NODES];
-  
-  memset(visited, false, sizeof(visited));
-  memset(parent, 0xFF, sizeof(parent));
-  
-  // Start BFS
-  queue[queue_rear++] = start_node;
-  visited[start_node] = true;
-  
-  while (queue_front < queue_rear) {
-    uint8_t current = queue[queue_front++];
-    
-    if (current == goal_node) {
-      // Reconstruct path
-      bfs_state.path_length = 0;
-      uint8_t node = goal_node;
-      
-      while (node != 0xFF && bfs_state.path_length < BFS_PATH_MAX_LENGTH) {
-        bfs_state.path[bfs_state.path_length++] = node;
-        node = parent[node];
+
+  for (uint8_t i = 0; i < BFS_MAX_NODES; i++) {
+    dist[i] = 1e9f;
+    visited[i] = false;
+    parent[i] = 0xFF;
+  }
+  dist[start_node] = 0.0f;
+
+  for (uint8_t iter = 0; iter < bfs_state.node_count; iter++) {
+    // Find unvisited node with smallest distance
+    uint8_t u = 0xFF;
+    float best = 1e9f;
+    for (uint8_t i = 0; i < bfs_state.node_count; i++) {
+      if (!visited[i] && dist[i] < best) {
+        best = dist[i];
+        u = i;
       }
-      
-      // Reverse path (was built backwards)
-      for (uint8_t i = 0; i < bfs_state.path_length / 2; i++) {
-        uint8_t tmp = bfs_state.path[i];
-        bfs_state.path[i] = bfs_state.path[bfs_state.path_length - 1 - i];
-        bfs_state.path[bfs_state.path_length - 1 - i] = tmp;
-      }
-      
-      bfs_state.path_index = 0;
-      bfs_state.path_valid = true;
-      return true;
     }
-    
-    // Explore neighbors
-    BfsNode* node_ptr = &bfs_state.nodes[current];
+    if (u == 0xFF) break;  // no reachable unvisited nodes
+    visited[u] = true;
+
+    if (u == goal_node) break;  // found shortest path to goal
+
+    // Relax neighbors
+    BfsNode* node_ptr = &bfs_state.nodes[u];
     for (uint8_t i = 0; i < node_ptr->neighbor_count; i++) {
-      uint8_t neighbor = node_ptr->neighbors[i];
-      if (!visited[neighbor]) {
-        visited[neighbor] = true;
-        parent[neighbor] = current;
-        if (queue_rear < sizeof(queue)) {
-          queue[queue_rear++] = neighbor;
-        }
+      uint8_t v = node_ptr->neighbors[i];
+      float w = node_ptr->distances[i];
+      if (w <= 0.0f) w = 0.001f;  // safety: avoid zero-weight edges
+      float alt = dist[u] + w;
+      if (alt < dist[v]) {
+        dist[v] = alt;
+        parent[v] = u;
       }
     }
   }
-  
-  return false;  // No path found
+
+  if (!visited[goal_node] && dist[goal_node] >= 1e9f) return false;
+
+  // Reconstruct path
+  bfs_state.path_length = 0;
+  uint8_t node = goal_node;
+  while (node != 0xFF && bfs_state.path_length < BFS_PATH_MAX_LENGTH) {
+    bfs_state.path[bfs_state.path_length++] = node;
+    node = parent[node];
+  }
+
+  // Reverse path (was built backwards)
+  for (uint16_t i = 0; i < bfs_state.path_length / 2; i++) {
+    uint8_t tmp = bfs_state.path[i];
+    bfs_state.path[i] = bfs_state.path[bfs_state.path_length - 1 - i];
+    bfs_state.path[bfs_state.path_length - 1 - i] = tmp;
+  }
+
+  bfs_state.path_index = 0;
+  bfs_state.path_valid = true;
+  bfs_state.path_dist_m = dist[goal_node];
+  return true;
+}
+
+// Check if a node is a gate or end center that must be kept as a waypoint.
+static bool bfsIsImportantNode(uint8_t nodeId) {
+  if (nodeId == bfs_end_center_node) return true;
+  for (uint8_t gi = 0; gi < grid_course.gate_count; gi++) {
+    if (nodeId == bfs_gate_nodes[gi]) return true;
+  }
+  return false;
+}
+
+// Remove collinear intermediate waypoints so the robot drives straight through
+// instead of stopping at every grid intersection on a straight line.
+// Gate centers and end center are always kept (robot must physically visit them).
+static void bfsSimplifyPath() {
+  if (!bfs_state.path_valid || bfs_state.path_length < 3) return;
+
+  uint8_t simplified[BFS_PATH_MAX_LENGTH];
+  uint16_t slen = 0;
+
+  simplified[slen++] = bfs_state.path[0];  // always keep start
+
+  for (uint16_t i = 1; i < bfs_state.path_length - 1; i++) {
+    const uint8_t prev = simplified[slen - 1];
+    const uint8_t cur  = bfs_state.path[i];
+    const uint8_t next = bfs_state.path[i + 1];
+
+    // Always keep gate/end centers — robot must drive into these
+    if (bfsIsImportantNode(cur)) {
+      simplified[slen++] = cur;
+      continue;
+    }
+
+    // Check collinearity: cross product of (cur-prev) x (next-prev) ≈ 0
+    float ax = bfs_state.nodes[cur].x_m  - bfs_state.nodes[prev].x_m;
+    float ay = bfs_state.nodes[cur].y_m  - bfs_state.nodes[prev].y_m;
+    float bx = bfs_state.nodes[next].x_m - bfs_state.nodes[prev].x_m;
+    float by = bfs_state.nodes[next].y_m - bfs_state.nodes[prev].y_m;
+    float cross = ax * by - ay * bx;
+
+    if (fabsf(cross) > 0.001f) {
+      // Not collinear — keep this waypoint (direction change needed)
+      simplified[slen++] = cur;
+    }
+    // else: collinear — skip this intermediate node
+  }
+
+  simplified[slen++] = bfs_state.path[bfs_state.path_length - 1];  // always keep goal
+
+  if (slen < bfs_state.path_length) {
+    Serial.printf("BFS: simplified path %d -> %d waypoints\n",
+                  bfs_state.path_length, slen);
+    memcpy(bfs_state.path, simplified, slen);
+    bfs_state.path_length = slen;
+  }
 }
 
 // Get next target node along the computed path
@@ -1052,13 +1170,7 @@ static bool lastRunWasCanMode = false;
 // (now - runStartMs) is no longer within the short startup window.
 static bool runControlResetRequest = false;
 
-#if RUN_CLOUD_UPLOAD_ENABLE
-// Deferred cloud-upload state (so we can retry uploads without blocking stopRun())
-static bool cloudUploadPending = false;
-static uint8_t cloudUploadAttempts = 0;
-static unsigned long cloudUploadNextAttemptMs = 0;
-static bool cloudUploadLastOk = false;
-#endif
+
 
 // External start debug (counters + last levels)
 static uint32_t dbg_redClicks = 0;
@@ -1164,6 +1276,10 @@ struct RunLogSample {
   uint8_t regL_pwm;
   uint8_t regR_dir;
   uint8_t regR_pwm;
+
+  // Telemetry: left/right wheel distance (m) from encoders for 10Hz CSV
+  float distL;
+  float distR;
 };
 
 // Per-loop I2C timing diagnostics (captured outside the control loop, logged inside it)
@@ -1199,6 +1315,9 @@ static uint8_t runMetaLastSavedLastOk = 0;
 static bool runWarnEncMissing = false;
 static bool runWarnNoMotion = false;
 static bool runWarnLoggingDisabled = false;
+static bool runWarnTooFast = false;
+// Indicates whether a stall cutoff has been latched during the run (prevents re-arming)
+static bool stall_cutoff_latched = false;
 
 // Keep SPIFFS from filling up with old logs.
 #ifndef RUNLOG_KEEP_FILES_MAX
@@ -1393,14 +1512,7 @@ static void printSpiffsUsageToSerial(const char* tag) {
   Serial.printf("%s: total=%u used=%u free=%u\n", tag, (unsigned)total, (unsigned)used, (unsigned)freeB);
 }
 
-static void trySyncTimeWithNtpQuick() {
-  // Sync system UTC time via NTP when WiFi is available.
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  const unsigned long t0 = millis();
-  while (!timeIsValidUtc() && (millis() - t0) < 1500) {
-    delay(25);
-  }
-}
+
 
 static void printRunMetaToSerial(const char* tag) {
   Serial.printf("%s id=%lu fw=%s mode=%s dist=%.3f time=%.3f can=%.3f ppm=%.1f ppmL=%.1f ppmR=%.1f mtr_bias=%d i2c_hz=%lu ctrl_ms=%u imu_present=%u imu_ok_start=%u lock_pwm=%u lock_pwm_val=%.1f softstart_ms=%u\n",
@@ -1530,7 +1642,7 @@ static void runLogStreamBegin() {
                             (unsigned)freeB);
   }
     runLogStreamFile.println(
-      "t_ms,meters,forwardM,yawRelDeg,yawErrDeg,targetYawDeg,yawI,gz_dps,gzRaw_dps,gzBias_dps,actualRate,leftRate,rightRate,speedErr,basePWM,corrRaw,corrFiltered,corrOut,canPhase,turnTargetDeg,turnImuDeg,turnEncDeg,turnFusedDeg,braking,lPwm,rPwm,mL_err_dir,mL_err_pwm,mR_err_dir,mR_err_pwm,lateralM,remainingM,nomTargetRate,effTargetRate,targetRatePps,actualRatePps,speedI,steerI,encTrimPwm,loopDtMs,corrUsed,motorBiasPwm,satShift,imuReadUs,motorWriteUs,cmdL_dir,cmdR_dir,regL_dir,regL_pwm,regR_dir,regR_pwm");
+      "t_ms,meters,forwardM,currentYaw,targetYaw,yawErrDeg,yawI,gz_dps,gzRaw_dps,gzBias_dps,actualRate,leftRate,rightRate,speedErr,basePWM,corrRaw,corrFiltered,corrOut,canPhase,turnTargetDeg,turnImuDeg,turnEncDeg,turnFusedDeg,braking,lPwm,rPwm,mL_err_dir,mL_err_pwm,mR_err_dir,mR_err_pwm,lateralM,remainingM,nomTargetRate,effTargetRate,targetRatePps,actualRatePps,speedI,steerI,encTrimPwm,loopDtMs,corrUsed,motorBiasPwm,satShift,imuReadUs,motorWriteUs,cmdL_dir,cmdR_dir,regL_dir,regL_pwm,regR_dir,regR_pwm,distL,distR");
   runLogStreamFile.flush();
   runLogStreamOpen = true;
 
@@ -1543,15 +1655,15 @@ static void runLogStreamAppend(const RunLogSample& s) {
   if (!runLogStreamOpen) return;
   if (!runLogStreamFile) return;
 
-  char line[720];
+  char line[768];
   snprintf(line, sizeof(line),
-           "%lu,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.4f,%.4f,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%u,%u,%u,%u,%u",
+           "%lu,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.4f,%.4f,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%u,%u,%u,%u,%u,%.4f,%.4f",
            (unsigned long)s.t_ms,
            (double)s.meters,
            (double)s.forwardM,
            (double)s.yawRelDeg,
-           (double)s.yawErrDeg,
            (double)s.targetYawDeg,
+           (double)s.yawErrDeg,
            (double)s.yawIntegral,
            (double)s.gz_dps,
            (double)s.gz_raw_dps,
@@ -1596,7 +1708,9 @@ static void runLogStreamAppend(const RunLogSample& s) {
            (unsigned)s.regL_dir,
            (unsigned)s.regL_pwm,
            (unsigned)s.regR_dir,
-           (unsigned)s.regR_pwm);
+           (unsigned)s.regR_pwm,
+           (double)s.distL,
+           (double)s.distR);
 
   runLogStreamFile.println(line);
   runLogStreamLines++;
@@ -1663,17 +1777,17 @@ static void runLogPrintCsvToSerial() {
   Serial.println("LOG_BEGIN");
   printRunMetaToSerial("TEST_BEGIN");
     Serial.println(
-      "t_ms,meters,forwardM,yawRelDeg,yawErrDeg,targetYawDeg,yawI,gz_dps,gzRaw_dps,gzBias_dps,actualRate,leftRate,rightRate,speedErr,basePWM,corrRaw,corrFiltered,corrOut,canPhase,turnTargetDeg,turnImuDeg,turnEncDeg,turnFusedDeg,braking,lPwm,rPwm,mL_err_dir,mL_err_pwm,mR_err_dir,mR_err_pwm,lateralM,remainingM,nomTargetRate,effTargetRate,targetRatePps,actualRatePps,speedI,steerI,encTrimPwm,loopDtMs,corrUsed,motorBiasPwm,satShift,imuReadUs,motorWriteUs,cmdL_dir,cmdR_dir,regL_dir,regL_pwm,regR_dir,regR_pwm");
+      "t_ms,meters,forwardM,currentYaw,targetYaw,yawErrDeg,yawI,gz_dps,gzRaw_dps,gzBias_dps,actualRate,leftRate,rightRate,speedErr,basePWM,corrRaw,corrFiltered,corrOut,canPhase,turnTargetDeg,turnImuDeg,turnEncDeg,turnFusedDeg,braking,lPwm,rPwm,mL_err_dir,mL_err_pwm,mR_err_dir,mR_err_pwm,lateralM,remainingM,nomTargetRate,effTargetRate,targetRatePps,actualRatePps,speedI,steerI,encTrimPwm,loopDtMs,corrUsed,motorBiasPwm,satShift,imuReadUs,motorWriteUs,cmdL_dir,cmdR_dir,regL_dir,regL_pwm,regR_dir,regR_pwm,distL,distR");
   for (uint16_t i = 0; i < runLogCount; i++) {
     const RunLogSample& s = runLog[i];
     Serial.printf(
-      "%lu,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.4f,%.4f,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%u,%u,%u,%u,%u\n",
+      "%lu,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.4f,%.4f,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%u,%u,%u,%u,%u,%.4f,%.4f\n",
                   (unsigned long)s.t_ms,
                   (double)s.meters,
                   (double)s.forwardM,
                   (double)s.yawRelDeg,
-                  (double)s.yawErrDeg,
                   (double)s.targetYawDeg,
+                  (double)s.yawErrDeg,
                   (double)s.yawIntegral,
                   (double)s.gz_dps,
                   (double)s.gz_raw_dps,
@@ -1718,7 +1832,9 @@ static void runLogPrintCsvToSerial() {
                   (unsigned)s.regL_dir,
                   (unsigned)s.regL_pwm,
                   (unsigned)s.regR_dir,
-                  (unsigned)s.regR_pwm);
+                  (unsigned)s.regR_pwm,
+                  (double)s.distL,
+                  (double)s.distR);
   }
   printRunMetaToSerial("TEST_END");
   Serial.printf("LOG_END samples=%u overflow=%s stop=%s\n",
@@ -1788,18 +1904,18 @@ static void runLogSaveToSpiffs() {
       f.printf("# spiffs_total=%u spiffs_used=%u spiffs_free=%u\n", (unsigned)total, (unsigned)used, (unsigned)freeB);
     }
     f.println(
-      "t_ms,meters,forwardM,yawRelDeg,yawErrDeg,targetYawDeg,yawI,gz_dps,gzRaw_dps,gzBias_dps,actualRate,leftRate,rightRate,speedErr,basePWM,corrRaw,corrFiltered,corrOut,canPhase,turnTargetDeg,turnImuDeg,turnEncDeg,turnFusedDeg,braking,lPwm,rPwm,mL_err_dir,mL_err_pwm,mR_err_dir,mR_err_pwm,lateralM,remainingM,nomTargetRate,effTargetRate,targetRatePps,actualRatePps,speedI,steerI,encTrimPwm,loopDtMs,corrUsed,motorBiasPwm,satShift,imuReadUs,motorWriteUs,cmdL_dir,cmdR_dir,regL_dir,regL_pwm,regR_dir,regR_pwm");
+      "t_ms,meters,forwardM,currentYaw,targetYaw,yawErrDeg,yawI,gz_dps,gzRaw_dps,gzBias_dps,actualRate,leftRate,rightRate,speedErr,basePWM,corrRaw,corrFiltered,corrOut,canPhase,turnTargetDeg,turnImuDeg,turnEncDeg,turnFusedDeg,braking,lPwm,rPwm,mL_err_dir,mL_err_pwm,mR_err_dir,mR_err_pwm,lateralM,remainingM,nomTargetRate,effTargetRate,targetRatePps,actualRatePps,speedI,steerI,encTrimPwm,loopDtMs,corrUsed,motorBiasPwm,satShift,imuReadUs,motorWriteUs,cmdL_dir,cmdR_dir,regL_dir,regL_pwm,regR_dir,regR_pwm,distL,distR");
     for (uint16_t i = 0; i < runLogCount; i++) {
       const RunLogSample& s = runLog[i];
-      char line[720];
+      char line[768];
       snprintf(line, sizeof(line),
-           "%lu,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.4f,%.4f,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%u,%u,%u,%u,%u",
+           "%lu,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.4f,%.4f,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%u,%u,%u,%u,%u,%.4f,%.4f",
                (unsigned long)s.t_ms,
                (double)s.meters,
                (double)s.forwardM,
                (double)s.yawRelDeg,
-               (double)s.yawErrDeg,
                (double)s.targetYawDeg,
+               (double)s.yawErrDeg,
                (double)s.yawIntegral,
                (double)s.gz_dps,
                (double)s.gz_raw_dps,
@@ -1844,7 +1960,9 @@ static void runLogSaveToSpiffs() {
                (unsigned)s.regL_dir,
                (unsigned)s.regL_pwm,
                (unsigned)s.regR_dir,
-               (unsigned)s.regR_pwm);
+               (unsigned)s.regR_pwm,
+               (double)s.distL,
+               (double)s.distR);
       f.println(line);
     }
     f.printf("# TEST_END id=%lu samples=%u overflow=%s stop=%s max_ctrl_dt_ms=%lu max_ctrl_dt_at_ms=%lu ctrl_overruns=%lu ctrl_stalls200ms=%lu\n",
@@ -2131,14 +2249,9 @@ static void startDebugDumpSpiffsTailToSerial(uint16_t lastLines) {
     return;
   }
 
-  // Tail by scanning newline offsets (same approach as runlog tail).
+  // Tail by scanning newline offsets — static buffer avoids heap fragmentation
+  static size_t nlOff[2001];
   const size_t cap = (size_t)lastLines + 1;
-  size_t* nlOff = (size_t*)malloc(sizeof(size_t) * cap);
-  if (!nlOff) {
-    Serial.println("StartDebug: tail OOM");
-    f.close();
-    return;
-  }
   size_t nlCount = 0;
   size_t pos = 0;
   while (f.available()) {
@@ -2157,7 +2270,6 @@ static void startDebugDumpSpiffsTailToSerial(uint16_t lastLines) {
   } else {
     start = 0;
   }
-  free(nlOff);
 
   f.seek(start, SeekSet);
   Serial.printf("STARTDBG_TAIL_BEGIN lines=%u offset=%u file=/start_debug.txt\n",
@@ -2179,7 +2291,7 @@ static void runLogDumpSpiffsTailToSerial(uint16_t lastLines) {
     return;
   }
   if (lastLines == 0) lastLines = 1;
-  if (lastLines > 5000) lastLines = 5000;
+  if (lastLines > 2000) lastLines = 2000;
 
   File f = SPIFFS.open("/runlog_last.csv", "r");
   if (!f) {
@@ -2188,14 +2300,9 @@ static void runLogDumpSpiffsTailToSerial(uint16_t lastLines) {
   }
 
   // Find the starting offset of the last N lines by scanning once.
-  // Keep a ring buffer of newline offsets.
+  // Static ring buffer avoids heap fragmentation.
+  static size_t nlOff[2001];
   const size_t cap = (size_t)lastLines + 1;
-  size_t* nlOff = (size_t*)malloc(sizeof(size_t) * cap);
-  if (!nlOff) {
-    Serial.println("RunLog: tail OOM");
-    f.close();
-    return;
-  }
   size_t nlCount = 0;
   size_t pos = 0;
   while (f.available()) {
@@ -2214,7 +2321,6 @@ static void runLogDumpSpiffsTailToSerial(uint16_t lastLines) {
   } else {
     start = 0;
   }
-  free(nlOff);
 
   f.seek(start, SeekSet);
   Serial.printf("LOG_TAIL_BEGIN lines=%u offset=%u file=/runlog_last.csv\n",
@@ -2230,126 +2336,11 @@ static void runLogDumpSpiffsTailToSerial(uint16_t lastLines) {
   Serial.println("LOG_TAIL_END");
 }
 
-#if RUN_CLOUD_UPLOAD_ENABLE
-static bool cloudUploadLastRunCsv() {
-  if (!spiffs_ok) {
-    Serial.println("CloudUpload: SPIFFS not available");
-    return false;
-  }
-  if (strlen(WIFI_SSID) == 0 || strlen(WIFI_PASSWORD) == 0) {
-    Serial.println("CloudUpload: WiFi credentials not configured (see include/wifi_secrets.h)");
-    return false;
-  }
-  if (strlen(CLOUD_UPLOAD_URL) == 0) {
-    Serial.println("CloudUpload: CLOUD_UPLOAD_URL not configured (see include/wifi_secrets.h)");
-    return false;
-  }
-
-  // Apps Script web apps commonly respond to POST with a 302 redirect to a
-  // script.googleusercontent.com URL. That redirected URL is typically GET/HEAD
-  // only (POST returns 405). The correct flow is:
-  //   1) POST to /exec
-  //   2) If 302 + Location, GET the Location to read the script response.
-
-  File f = SPIFFS.open("/runlog_last.csv", "r");
-  if (!f) {
-    Serial.println("CloudUpload: no saved file (/runlog_last.csv)");
-    return false;
-  }
-
-  const String url = String(CLOUD_UPLOAD_URL);
-
-  WiFi.mode(WIFI_STA);
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    const unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - t0) < CLOUD_UPLOAD_CONNECT_TIMEOUT_MS) {
-      delay(50);
-    }
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("CloudUpload: WiFi connect failed");
-    f.close();
-    return false;
-  }
-
-  // If time isn't set yet, try a quick NTP sync before uploading.
-  if (!timeIsValidUtc()) {
-    trySyncTimeWithNtpQuick();
-  }
-
-  WiFiClientSecure client;
-#if CLOUD_UPLOAD_VERIFY_TLS
-  // If you want verification, set a root CA cert here.
-#else
-  client.setInsecure();
-#endif
-
-  HTTPClient http;
-  http.setTimeout(CLOUD_UPLOAD_HTTP_TIMEOUT_MS);
-
-  const char* hdrs[] = {"Location"};
-  http.collectHeaders(hdrs, 1);
-
-  if (!http.begin(client, url)) {
-    Serial.println("CloudUpload: http.begin failed");
-    http.end();
-    f.close();
-    return false;
-  }
-
-  http.addHeader("Content-Type", "text/csv");
-  const int code = http.sendRequest("POST", &f, (size_t)f.size());
-  const String location = http.header("Location");
-  Serial.printf("CloudUpload: HTTP %d\n", code);
-  const String resp = http.getString();
-  if (resp.length() > 0) {
-    Serial.print("CloudUpload resp: ");
-    Serial.println(resp);
-  }
-  http.end();
-  f.close();
-
-  if (code >= 200 && code < 300) return true;
-
-  if ((code == 301 || code == 302 || code == 303 || code == 307 || code == 308) && location.length() > 0) {
-    HTTPClient http2;
-    http2.setTimeout(CLOUD_UPLOAD_HTTP_TIMEOUT_MS);
-    if (!http2.begin(client, location)) {
-      Serial.println("CloudUpload: http.begin (redirect) failed");
-      http2.end();
-      return false;
-    }
-    const int code2 = http2.GET();
-    Serial.printf("CloudUpload: HTTP %d\n", code2);
-    const String resp2 = http2.getString();
-    if (resp2.length() > 0) {
-      Serial.print("CloudUpload resp: ");
-      Serial.println(resp2);
-    }
-    http2.end();
-    return (code2 >= 200 && code2 < 300);
-  }
-
-  return false;
-}
-#endif
-
 static void handleSerialCommands() {
   // Non-blocking line reader for simple commands.
-  // Commands:
-  // - dump     : dump last saved SPIFFS log to Serial
-  // - dumpid N : dump a specific per-run SPIFFS log (e.g., /runlog_12.csv)
-  // - tail [N] : dump last N lines of the saved SPIFFS log
-  // - listlogs : list runlog files present on SPIFFS
-  // - dump_ram : dump current RAM buffer to Serial
-  // - startdump     : dump /start_debug.txt
-  // - starttail [N] : tail last N lines of /start_debug.txt
-  // - status   : log status
-  // (I2C speed is fixed in firmware)
-  // - format_spiffs : FORMAT SPIFFS (erases files)
-  // - upload   : upload last saved SPIFFS log to cloud (requires WiFi config)
-  // - help     : list commands
+  // Commands: dump | dumpid N | tail [N] | listlogs | dump_ram | startdump |
+  //           starttail [N] | status | format_spiffs | download_all | delete_all |
+  //           ping | help
   static char buf[64];
   static uint8_t n = 0;
 
@@ -2452,10 +2443,6 @@ static void handleSerialCommands() {
           formatUtcIso8601((time_t)epoch, iso, sizeof(iso));
           Serial.printf("TIME_SET epoch=%lu utc=%s\n", epoch, iso);
         }
-#if RUN_CLOUD_UPLOAD_ENABLE
-      } else if (strcmp(p, "upload") == 0) {
-        cloudUploadLastRunCsv();
-#endif
       } else if (strcmp(p, "status") == 0) {
         Serial.printf("FW: %s\n", FW_VERSION);
         Serial.printf("RunLog: ram_samples=%u overflow=%s spiffs=%s\n",
@@ -2494,23 +2481,83 @@ static void handleSerialCommands() {
                       lastRunStopReason ? lastRunStopReason : "?",
                       (double)lastRunElapsedS);
         Serial.printf("I2C: clock_hz=%u\n", (unsigned)i2c_clock_hz);
-#if RUN_CLOUD_UPLOAD_ENABLE
-        Serial.printf("CloudUpload: pending=%u attempts=%u last_ok=%u\n",
-                      cloudUploadPending ? 1u : 0u,
-                      (unsigned)cloudUploadAttempts,
-                      cloudUploadLastOk ? 1u : 0u);
-#endif
+      } else if (strcmp(p, "partinfo") == 0) {
+        esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, NULL);
+        while (it) {
+          const esp_partition_t* pp = esp_partition_get(it);
+          Serial.printf("PART: label=%s type=0x%02x subtype=0x%02x offset=0x%06x size=0x%06x\n",
+                        pp->label, pp->type, pp->subtype, (unsigned)pp->address, (unsigned)pp->size);
+          it = esp_partition_next(it);
+        }
+        esp_partition_iterator_release(it);
+        Serial.printf("FFat_ok=%d\n", spiffs_ok ? 1 : 0);
       } else if (strcmp(p, "format_spiffs") == 0) {
         Serial.println("FORMAT SPIFFS: erasing filesystem...");
+        SPIFFS.end();  // unmount first so format works from any state
         const bool ok = SPIFFS.format();
-        spiffs_ok = SPIFFS.begin(false);
+        spiffs_ok = SPIFFS.begin(true);
         Serial.printf("FORMAT SPIFFS: %s  mount=%s\n", ok ? "OK" : "FAIL", spiffs_ok ? "OK" : "FAIL");
+      } else if (strcmp(p, "download_all") == 0) {
+        // Dump every runlog file for the Python tool to capture
+        if (!spiffs_ok) {
+          Serial.println("DOWNLOAD_ALL: SPIFFS not available");
+        } else {
+          Serial.println("DOWNLOAD_ALL_BEGIN");
+          File root = SPIFFS.open("/");
+          File f = root.openNextFile();
+          while (f) {
+            const char* nm = f.name();
+            if (nm && strstr(nm, "runlog") && strstr(nm, ".csv")) {
+              Serial.printf("FILE_BEGIN %s %u\n", nm, (unsigned)f.size());
+              while (f.available()) {
+                char buf512[512];
+                const int n2 = f.read((uint8_t*)buf512, sizeof(buf512) - 1);
+                if (n2 <= 0) break;
+                buf512[n2] = 0;
+                Serial.print(buf512);
+              }
+              Serial.println();
+              Serial.printf("FILE_END %s\n", nm);
+            }
+            f.close();
+            f = root.openNextFile();
+          }
+          root.close();
+          Serial.println("DOWNLOAD_ALL_END");
+        }
+      } else if (strcmp(p, "delete_all") == 0) {
+        // Delete all runlog CSV files from SPIFFS
+        if (!spiffs_ok) {
+          Serial.println("DELETE_ALL: SPIFFS not available");
+        } else {
+          Serial.println("DELETE_ALL_BEGIN");
+          // Collect filenames first (can't delete while iterating)
+          char paths[32][32];
+          int count = 0;
+          File root = SPIFFS.open("/");
+          File f = root.openNextFile();
+          while (f && count < 32) {
+            const char* nm = f.name();
+            if (nm && strstr(nm, "runlog") && strstr(nm, ".csv")) {
+              snprintf(paths[count], sizeof(paths[count]), "/%s", nm);
+              // Handle names that already have leading /
+              if (nm[0] == '/') snprintf(paths[count], sizeof(paths[count]), "%s", nm);
+              count++;
+            }
+            f.close();
+            f = root.openNextFile();
+          }
+          root.close();
+          for (int i2 = 0; i2 < count; i2++) {
+            const bool ok2 = SPIFFS.remove(paths[i2]);
+            Serial.printf("DELETE %s %s\n", paths[i2], ok2 ? "OK" : "FAIL");
+          }
+          Serial.printf("DELETE_ALL_END count=%d\n", count);
+        }
+      } else if (strcmp(p, "ping") == 0) {
+        Serial.println("PONG");
       } else if (strcmp(p, "help") == 0 || strcmp(p, "?") == 0) {
-#if RUN_CLOUD_UPLOAD_ENABLE
-        Serial.println("Commands: help | status | dump | dumpid <id> | listlogs | dellog <id> | setepoch <unix_s> | tail [N] | dump_ram | startdump | starttail [N] | format_spiffs | upload");
-#else
-        Serial.println("Commands: help | status | dump | dumpid <id> | listlogs | dellog <id> | setepoch <unix_s> | tail [N] | dump_ram | startdump | starttail [N] | format_spiffs");
-#endif
+        Serial.println("Commands: help | status | dump | dumpid <id> | listlogs | dellog <id> | setepoch <unix_s> | tail [N] | dump_ram | startdump | starttail [N] | format_spiffs | download_all | delete_all | ping");
       } else {
         Serial.printf("Unknown command: '%s' (type 'help')\n", p);
       }
@@ -2567,6 +2614,9 @@ int32_t encoderL_count = 0;
 int32_t encoderR_count = 0;
 bool encoderL_found = false;
 bool encoderR_found = false;
+// Encoder-calibration UI: start counts when entering enc-cal screen
+static int32_t encCal_start_L = 0;
+static int32_t encCal_start_R = 0;
 
 // Motor control
 uint8_t selected_motor = 0;  // 0=left, 1=right, 2=FIND MIN
@@ -2576,21 +2626,30 @@ uint8_t motor_l_direction = 1;
 uint8_t motor_r_direction = 1;
 int16_t motor_command = 0;   // -255..255 (HW test screen; sign = direction, 0 = stop)
 uint8_t motor_enabled = 0;   // 0=stopped, 1=running (derived from motor_command)
-uint8_t motor_l_speed = 0;
-uint8_t motor_r_speed = 0;
+// motor_l_speed and motor_r_speed moved to top-level
 
 // RUN screen fixed PWM
 #define RUN_PWM 255
 
-// IMU attitude (degrees)
+// IMU attitude (degrees) and raw acceleration (g)
 static bool imu_ok = false;
 static float imu_pitch = 0.0f;
 static float imu_roll = 0.0f;
 static float imu_yaw = 0.0f;
+// imu_ax_g and imu_ay_g moved to top-level
+static float imu_az_g = 0.0f;
 static float imu_gz_dps = 0.0f;
-static float imu_gz_bias_dps = 0.0f;
 static float imu_gz_raw_dps = 0.0f;
 static float imu_gz_still_err_dps = 0.0f;
+// Missing gyro bias variable (declared/used in several places)
+static float imu_gz_bias_dps = 0.0f;
+// Timestamp for gyro yaw integration (file-scope so helpers can use it)
+static uint32_t lastYawUs = 0;
+// Forward accel axes (used by IMU+encoder fusion)
+static float imu_ax_g = 0.0f;
+static float imu_ay_g = 0.0f;
+
+// Stall detection latched flag moved to top-level (stall_cutoff_latched)
 // UI/diagnostic: true while we're actively refining gyro bias while stopped.
 static bool imu_bias_refining = false;
 
@@ -2613,6 +2672,50 @@ static void persistImuGyroBiasIfNeeded() {
   imu_bias_last_saved_dps = imu_gz_bias_dps;
   imu_bias_last_save_ms = now;
 }
+
+// --- Cross-file symbols & macros (minimal declarations to satisfy references) ---
+#ifndef ENCODER_L_ADDR
+#define ENCODER_L_ADDR 0x58
+#define ENCODER_R_ADDR 0x59
+#endif
+
+#ifndef MOTOR_L_ADDR
+#define MOTOR_L_ADDR 0x21
+#define MOTOR_R_ADDR 0x20
+#endif
+
+#ifndef INVERT_LEFT_ENCODER_COUNT
+#define INVERT_LEFT_ENCODER_COUNT 0
+#endif
+#ifndef INVERT_RIGHT_ENCODER_COUNT
+#define INVERT_RIGHT_ENCODER_COUNT 0
+#endif
+
+#ifndef ENCODER_PIN_A
+#define ENCODER_PIN_A 41
+#define ENCODER_PIN_B 40
+#endif
+
+#ifndef DIAL_DIRECTION
+#define DIAL_DIRECTION -1
+#endif
+
+// Pulses-per-meter globals (ensure available to this compilation unit)
+volatile float pulsesPerMeterL = 895.0f;
+volatile float pulsesPerMeterR = 865.0f;
+volatile float pulsesPerMeter  = 880.0f;
+
+// Motor speed variables may be defined in another translation unit; declare extern.
+extern volatile int motor_l_speed;
+extern volatile int motor_r_speed;
+
+// Forward declarations for functions defined later but used earlier
+void stopAllMotors();
+static void brakeToStop(uint8_t brakePwm, unsigned long maxBrakeMs);
+void applyMotorOutputs();
+static void readWheelEncodersForce();
+void readWheelEncoders();
+static void calibrateImuGyroBias();
 
 // Enable IMU influence on driving control (straight heading-hold + CAN IMU path).
 // Set false only when testing encoder-only behavior.
@@ -2655,12 +2758,33 @@ static void showBVSplashScreen() {
   ui.fillScreen(TFT_BLACK);
   ui.setTextColor(TFT_BLUE);
   ui.setTextSize(3);
-  ui.drawString("BLUE VALLEY", 120, 80);
-  ui.drawString("NORTH", 120, 110);
+  ui.drawString("BLUE VALLEY", 120, 60);
+  ui.drawString("NORTH", 120, 90);
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
-  ui.drawString("Science Olympiad", 120, 150);
-  ui.drawString("E.V. 2025-26", 120, 170);
+  ui.drawString("Science Olympiad", 120, 125);
+  ui.drawString("Robot Tour. 2025-26", 120, 145);
+
+  // --- Duck mascot ---
+  {
+    const int dx = 120, dy = 190; // center of duck
+    // Body (yellow ellipse)
+    ui.fillEllipse(dx, dy + 10, 10, 7, TFT_YELLOW);
+    // Head (smaller circle)
+    ui.fillCircle(dx + 9, dy + 2, 6, TFT_YELLOW);
+    // Eye
+    ui.fillCircle(dx + 11, dy, 1, TFT_BLACK);
+    // Beak (orange triangle)
+    ui.fillTriangle(dx + 15, dy + 2,
+                    dx + 15, dy + 5,
+                    dx + 20, dy + 3, TFT_ORANGE);
+    // Wing
+    ui.fillEllipse(dx - 2, dy + 10, 5, 4, 0xFD60);
+    // Feet
+    ui.drawLine(dx - 4, dy + 17, dx - 7, dy + 20, TFT_ORANGE);
+    ui.drawLine(dx + 2, dy + 17, dx - 1, dy + 20, TFT_ORANGE);
+  }
+
   ui.setTextSize(1);
   ui.pushSprite(0, 0);
 }
@@ -2735,80 +2859,84 @@ static void showImuCalScreen(int pct, float biasZ) {
 // bias uncorrected, causing steady yaw drift and steering off the line.
 #define IMU_GZ_BIAS_CLAMP_DPS 12.0f
 
-static void calibrateImuGyroBias() {
-  const float prevBias = imu_gz_bias_dps;
+// Two-stage pre-start calibration driven from SCREEN_CALIBRATE / runImuCalibration().
+// Stage 1: 1.5s hands-off wait. Stage 2: 1000 gyro Z samples, then average.
+static bool imuCal_running = false;
+static bool imuCal_done = false;
+static unsigned long imuCal_stage_start_ms = 0;
+static int imuCal_stage = 0;   // 0=idle, 1=hands-off wait, 2=sampling, 3=done
+static int imuCal_samples = 0;
+static double imuCal_sumGz = 0.0;
+// Legacy/UI-facing calibration flags (some screens reference these names)
+static bool imu_calibrating = false;
+static int imu_cal_progress = 0;
+
+void runImuCalibration() {
+  const unsigned long now = millis();
+
+  if (!imuCal_running) {
+    imuCal_running = true;
+    imuCal_done = false;
+    imuCal_stage = 1;
+    imuCal_stage_start_ms = now;
+    imuCal_samples = 0;
+    imuCal_sumGz = 0.0;
+    imu_calibrating = true;
+    imu_cal_progress = 0;
+  }
+
   if (!imu_present) {
-    showImuCalScreen(0, 0.0f);
-    delay(200);
+    imuCal_done = true;
+    imuCal_running = false;
+    imu_calibrating = false;
+    imu_cal_progress = 100;
     return;
   }
 
-  const unsigned long start = millis();
-  unsigned long lastSample = 0;
-  int samples = 0;
-  double sumGz = 0.0;
-  double sumSq = 0.0;
-  float minGz = 1e9f;
-  float maxGz = -1e9f;
-
-  while (millis() - start < (unsigned long)IMU_GYRO_CAL_MS) {
-    const unsigned long now = millis();
-    if (now - lastSample < (unsigned long)IMU_GYRO_CAL_SAMPLE_MS) {
-      delay(1);
-      continue;
+  if (imuCal_stage == 1) {
+    // Stage 1: hands-off wait (STAY STILL) using millis().
+    unsigned long elapsed = now - imuCal_stage_start_ms;
+    imu_cal_progress = (int)((elapsed * 15u) / 1500u); // 0-15% during stage 1
+    if (imu_cal_progress > 15) imu_cal_progress = 15;
+    if ((now - imuCal_stage_start_ms) >= 1500u) {
+      imuCal_stage = 2;
+      imuCal_stage_start_ms = now;
     }
-    lastSample = now;
-
-    float ax_g = 0.0f, ay_g = 0.0f, az_g = 0.0f;
-    float gx_dps = 0.0f, gy_dps = 0.0f, gz_dps_local = 0.0f;
-    float temp_c = 0.0f;
-    const bool ok = imu6886Read(&ax_g, &ay_g, &az_g, &gx_dps, &gy_dps, &gz_dps_local, &temp_c);
-    if (ok) {
-      sumGz += (double)gz_dps_local;
-      sumSq += (double)gz_dps_local * (double)gz_dps_local;
-      samples += 1;
-      if (gz_dps_local < minGz) minGz = gz_dps_local;
-      if (gz_dps_local > maxGz) maxGz = gz_dps_local;
-    }
-
-    const int pct = (int)((100.0f * (float)(now - start)) / (float)IMU_GYRO_CAL_MS);
-    const float estBias = (samples > 0) ? (float)(sumGz / (double)samples) : 0.0f;
-    showImuCalScreen(pct < 100 ? pct : 100, estBias);
-  }
-
-  // Only accept the estimated bias if readings were stable.
-  // If the car is touched/moved during calibration, keep the previous (persisted) bias.
-  if (samples >= 80) {
-    const double mean = sumGz / (double)samples;
-    const double var = (sumSq / (double)samples) - (mean * mean);
-    const float stddev = (var > 0.0) ? (float)sqrt(var) : 0.0f;
-    const float span = (maxGz > minGz) ? (maxGz - minGz) : 0.0f;
-
-    // Large-but-stable offsets are valid; don't require small magnitude.
-    const bool stable = (stddev <= 0.80f) && (span <= 6.0f);
-    if (stable) {
-      imu_gz_bias_dps = (float)mean;
+  } else if (imuCal_stage == 2) {
+    // Stage 2: accumulate 1000 gyro Z samples.
+    if (imuCal_samples < 1000) {
+      float ax_g = 0.0f, ay_g = 0.0f, az_g = 0.0f;
+      float gx_dps = 0.0f, gy_dps = 0.0f, gz_dps_local = 0.0f;
+      float temp_c = 0.0f;
+      const bool ok = imu6886Read(&ax_g, &ay_g, &az_g, &gx_dps, &gy_dps, &gz_dps_local, &temp_c);
+      if (ok) {
+        imuCal_sumGz += (double)gz_dps_local;
+        imuCal_samples += 1;
+        imu_cal_progress = 15 + (imuCal_samples * 85) / 1000; // 15-100%
+        if (imu_cal_progress > 100) imu_cal_progress = 100;
+      }
     } else {
-      imu_gz_bias_dps = prevBias;
+      // Finalize bias.
+      const double avg = (imuCal_samples > 0) ? (imuCal_sumGz / (double)imuCal_samples) : 0.0;
+      imu_gz_bias_dps = (float)avg;
+
+      // Clamp to sane range.
+      if (fabsf(imu_gz_bias_dps) > 20.0f) {
+        Serial.printf("WARN: IMU gyro bias %.2f dps too large; forcing 0\n", (double)imu_gz_bias_dps);
+        imu_gz_bias_dps = 0.0f;
+      }
+      if (imu_gz_bias_dps > IMU_GZ_BIAS_CLAMP_DPS) imu_gz_bias_dps = IMU_GZ_BIAS_CLAMP_DPS;
+      if (imu_gz_bias_dps < -IMU_GZ_BIAS_CLAMP_DPS) imu_gz_bias_dps = -IMU_GZ_BIAS_CLAMP_DPS;
+
+      imuCal_stage = 3;
+      imuCal_done = true;
+      imuCal_running = false;
+      imu_calibrating = false;
+      imu_cal_progress = 100;
+      persistImuGyroBiasIfNeeded();
+      Serial.printf("IMU CAL DONE bias=%.3f dps\n", (double)imu_gz_bias_dps);
     }
-  } else {
-    imu_gz_bias_dps = prevBias;
   }
-
-  // Sanity: if the estimated bias is wildly large, something was moving or scaling is wrong.
-  // Use 0 so we don't destroy heading hold.
-  if (fabsf(imu_gz_bias_dps) > 20.0f) {
-    Serial.printf("WARN: IMU gyro bias %.2f dps too large; forcing 0\n", (double)imu_gz_bias_dps);
-    imu_gz_bias_dps = 0.0f;
-  }
-
-  // Normal clamp: keeps yaw integration from going unstable even if calibration was imperfect.
-  if (imu_gz_bias_dps > IMU_GZ_BIAS_CLAMP_DPS) imu_gz_bias_dps = IMU_GZ_BIAS_CLAMP_DPS;
-  if (imu_gz_bias_dps < -IMU_GZ_BIAS_CLAMP_DPS) imu_gz_bias_dps = -IMU_GZ_BIAS_CLAMP_DPS;
-  showImuCalScreen(100, imu_gz_bias_dps);
-  delay(250);
-
-  persistImuGyroBiasIfNeeded();
 }
 
 static void quickCalibrateImuGyroBiasForRunStart() {
@@ -3024,6 +3152,9 @@ static bool imu6886Read(float* ax_g, float* ay_g, float* az_g,
   return true;
 }
 
+// calibrateImuGyroBias() is implemented below after the UI draw helpers so
+// it can update the calibration screen live during the blocking routine.
+
 // ========================================================================
 // Screen / menu state (pulled from backup_jan4, simplified)
 // ========================================================================
@@ -3041,13 +3172,17 @@ enum ScreenState {
   SCREEN_IMU_CAL,
   SCREEN_SELF_TEST,
   SCREEN_SQUARE_TEST,
+  SCREEN_STRAIGHT_TEST,
+  SCREEN_TURN_TEST,
   SCREEN_BFS_NAV,
   SCREEN_BFS_RUN,
+  SCREEN_CALIBRATE,
 };
 
 static ScreenState currentScreen = SCREEN_MAIN_MENU;
+static ScreenState imuCal_next_screen = SCREEN_MAIN_MENU;
 
-static const int NUM_MENU_ITEMS = 8;
+static const int NUM_MENU_ITEMS = 10;
 static const char* menuNames[NUM_MENU_ITEMS] = {
   "BFS NAV",
   "TIME",
@@ -3057,6 +3192,8 @@ static const char* menuNames[NUM_MENU_ITEMS] = {
   "HW TEST",
   "SELF TEST",
   "SQ TEST",
+  "STRAIGHT",
+  "TURN 90",
 };
 
 static int selectedMenuItem = 0;
@@ -3084,10 +3221,13 @@ enum BfsRunPhase {
   BFS_PHASE_IDLE = 0,
   BFS_PHASE_TURN,        // Pivoting to face next waypoint
   BFS_PHASE_DRIVE,       // Driving toward next waypoint
+  BFS_PHASE_BRAKE,       // Brief electronic brake after drive/turn
+  BFS_PHASE_SETTLE,      // Wait for motion/accel to settle before next turn/drive
   BFS_PHASE_ARRIVED,     // Reached a waypoint, advance path
   BFS_PHASE_DONE,        // Reached final goal
 };
 static BfsRunPhase bfs_run_phase = BFS_PHASE_IDLE;
+static BfsRunPhase bfs_run_after_brake_phase = BFS_PHASE_IDLE;
 static float bfs_run_start_yaw = 0.0f;       // IMU yaw at start of BFS run
 static float bfs_run_initial_heading_deg = 0.0f; // Grid heading robot faces at start (from border)
 static float bfs_run_target_yaw_deg = 0.0f;  // Target yaw for current segment
@@ -3098,14 +3238,60 @@ static int32_t bfs_run_enc_start_R = 0;
 static float bfs_run_total_driven_m = 0.0f;
 static unsigned long bfs_run_start_ms = 0;
 static unsigned long bfs_run_drive_start_ms = 0;  // for ENC_MODE_TIMED fallback
+static unsigned long bfs_run_brake_start_ms = 0;
+static unsigned long bfs_run_settle_start_ms = 0;
 static float bfs_run_cumulative_yaw_deg = 0.0f;  // Accumulated heading from start
+static bool bfs_drive_pd_first = true;            // Reset PD state on first DRIVE iteration of each segment
+static unsigned long bfs_turn_first_in_tol_ms = 0; // For turn settle hold (like turn test)
+static unsigned long bfs_turn_start_ms = 0;         // When current TURN phase started
 
 // BFS run tuning
-#define BFS_TURN_PWM 120
-#define BFS_TURN_TOLERANCE_DEG 5.0f
-#define BFS_DRIVE_PWM 140
+#define BFS_TURN_PWM 130
+#define BFS_TURN_TOLERANCE_DEG 2.0f
+#define BFS_TURN_SETTLE_MS 300
+#define BFS_TURN_CRAWL_DEG 15.0f
+#define BFS_TURN_CRAWL_PWM 115
+#define BFS_DRIVE_PWM 120
 #define BFS_DRIVE_STEER_KP 3.0f
-#define BFS_ARRIVE_TOLERANCE_M 0.05f
+#define BFS_DRIVE_STEER_KD 0.8f
+#define BFS_ARRIVE_TOLERANCE_M 0.08f
+
+// Unified encoder odometry helper for BFS navigation.
+// Uses left and right encoder distances (meters) and handles right-encoder sign.
+static float getAverageDistanceMeters() {
+  const int32_t dL = encoderL_count - bfs_run_enc_start_L;
+  const int32_t dR = encoderR_count - bfs_run_enc_start_R;
+
+  float distL_m = 0.0f;
+  float distR_m = 0.0f;
+
+  if (pulsesPerMeterL > 1.0f) {
+    const float dLcorr = INVERT_LEFT_ENCODER_COUNT ? -(float)dL : (float)dL;
+    distL_m = dLcorr / pulsesPerMeterL;
+  }
+  if (pulsesPerMeterR > 1.0f) {
+    // Apply sign inversion for the right encoder so forward motion aligns with left.
+    const float dRcorr = INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR;
+    distR_m = dRcorr / pulsesPerMeterR;
+  }
+
+  switch (enc_mode) {
+    case ENC_MODE_BOTH: {
+      const float avg = 0.5f * (distL_m + distR_m);
+      return avg;
+    }
+    case ENC_MODE_LEFT_ONLY:
+      return fabsf(distL_m);
+    case ENC_MODE_RIGHT_ONLY:
+      return fabsf(distR_m);
+    case ENC_MODE_TIMED: {
+      const float elapsed_s = (millis() - bfs_run_drive_start_ms) / 1000.0f;
+      return (elapsed_s > 0.0f) ? (elapsed_s * ENC_TIMED_SPEED_MPS) : 0.0f;
+    }
+    default:
+      return 0.0f;
+  }
+}
 
 static float runDistanceM = 7.0f;
 static float runTimeS = 15.0f;
@@ -3123,15 +3309,14 @@ static constexpr float CAN_ENABLE_MIN_M = 0.05f;
 // 2026-01-21 new motors: 10.0m roll test -> L=18988, R=-18990 (with INVERT_RIGHT_ENCODER_COUNT=1)
 // => avg path pulses ~= 18989 over 10m => ~1899 pulses/m.
 // Per-wheel calibration for wheel size/gearbox differences.
-static float pulsesPerMeterL = 1899.0f;
-static float pulsesPerMeterR = 1899.0f;
-// Legacy/summary value (used by existing plots/tools): average of L/R.
-static float pulsesPerMeter = 1899.0f;
+// `pulsesPerMeterL`, `pulsesPerMeterR`, and `pulsesPerMeter` were moved
+// to top-level globals so they are visible to helpers declared above.
 
 static bool encCalEditingLeft = true;
 
 static inline float clampPpm(float ppm) {
-  if (ppm < 1500.0f) ppm = 1500.0f;
+  // Hard floor prevents division-by-near-zero in speed calculations.
+  if (ppm < 100.0f) ppm = 100.0f;
   if (ppm > 4000.0f) ppm = 4000.0f;
   return ppm;
 }
@@ -3146,6 +3331,10 @@ static inline void syncPulsesPerMeterDerived() {
 static bool settings_dirty = false;
 static unsigned long settings_dirty_ms = 0;
 #define SETTINGS_AUTOSAVE_IDLE_MS 1000
+
+// Step size sequence for encoder tuning (shared by ENC CAL)
+static const float tunePpmSteps[] = {0.1f, 0.5f, 1.0f, 5.0f, 10.0f, 50.0f};
+static int tunePpmStepIndex = 0; // index into tunePpmSteps
 
 static void loadPersistedSettings() {
   if (!prefs_ok) return;
@@ -3242,6 +3431,9 @@ static void loadPersistedSettings() {
   if (grid_course.gate_count > 0) {
     prefs.getBytes("gc_gd", grid_course.gates, grid_course.gate_count * sizeof(GridGate));
   }
+  // Last gate index (-1 = auto, 0+ = force last)
+  grid_course.last_gate_idx = (int8_t)prefs.getChar("gc_lgi", -1);
+  if (grid_course.last_gate_idx >= grid_course.gate_count) grid_course.last_gate_idx = -1;
   // BFS start/goal determined at graph build time (virtual nodes)
   bfs_start_node = 0;
   bfs_goal_node = 0;
@@ -3306,6 +3498,8 @@ static void savePersistedSettings() {
   if (grid_course.gate_count > 0) {
     prefs.putBytes("gc_gd", grid_course.gates, grid_course.gate_count * sizeof(GridGate));
   }
+  // Save last gate index
+  prefs.putChar("gc_lgi", grid_course.last_gate_idx);
 }
 
 static bool runActive = false;
@@ -3335,7 +3529,7 @@ static float runDebug_turnRemainingDeg = NAN;
 
 // Stall avoidance during RUN: if we are commanding motion, keep PWM above this.
 // Tune based on testing.
-#define RUN_MIN_PWM 90.0f
+#define RUN_MIN_PWM 95.0f
 
 // Test mode: lock RUN PWM (bypasses speed PI). Useful for heading tuning and diagnosing power/brownout.
 // NOTE: v73 phased navigation uses a distance-based S-curve profile instead.
@@ -3487,18 +3681,17 @@ static float runDebug_turnRemainingDeg = NAN;
 // Distance-stop braking pulse: briefly command reverse to reduce coast distance.
 // This is only applied when we stop due to reaching the target distance ("DIST").
 #define DIST_STOP_BRAKE_ENABLE 1
-#define DIST_STOP_BRAKE_MS 180
-#define DIST_STOP_BRAKE_PWM 120
+#define DIST_STOP_BRAKE_MS 300
+#define DIST_STOP_BRAKE_PWM 145
 
 // Braking / approach tuning near the stop distance.
 // As we get within BRAKE_ZONE_M of the target distance, reduce the target speed
 // and cap PWM, but still enforce a minimum PWM so we don't stall.
-#define BRAKE_ZONE_M 0.25f
-#define BRAKE_MIN_SPEED_FACTOR 0.70f
-// For time-optimized runs (e.g. 10m/10s), capping PWM here can prevent hitting the time.
-// Leave uncapped by default; distance stop handles the final cutoff.
-#define BRAKE_MAX_PWM 255.0f
-#define BRAKE_MIN_PWM 105.0f
+#define BRAKE_ZONE_M 0.60f
+#define BRAKE_MIN_SPEED_FACTOR 0.30f
+// Cap PWM in the brake zone to prevent coasting past the target.
+#define BRAKE_MAX_PWM 155.0f
+#define BRAKE_MIN_PWM 90.0f
 
 // PID steering trim: keeps left/right pulse rates equal to avoid veering.
 // Error is (leftRate - rightRate) in pulses/sec.
@@ -3695,6 +3888,9 @@ static inline void setMotorsReversePwm(uint8_t leftPwm, uint8_t rightPwm) {
   motor_r_speed = rightPwm;
 }
 
+// Timestamp of last pivot command (ms)
+static unsigned long lastPivotCmdMs = 0;
+
 // sign>0 = turn left, sign<0 = turn right (in vehicle frame).
 static inline void setMotorsPivotPwm(int sign, uint8_t pwm) {
   if (sign >= 0) {
@@ -3706,6 +3902,9 @@ static inline void setMotorsPivotPwm(int sign, uint8_t pwm) {
   }
   motor_l_speed = pwm;
   motor_r_speed = pwm;
+  // Record last pivot command time so callers can apply post-pivot settle/ramp
+  // without requiring synchronous delays here.
+  lastPivotCmdMs = millis();
 }
 
 // HBridge diagnostics (fixed addresses 0x20/0x21 as you configured)
@@ -3719,6 +3918,7 @@ static uint8_t motorL_err_dir = 0xFF;
 static uint8_t motorL_err_pwm = 0xFF;
 static uint8_t motorR_err_dir = 0xFF;
 static uint8_t motorR_err_pwm = 0xFF;
+
 
 // Last values written to the HBridge registers (post inversion + min PWM clamp)
 static uint8_t motorL_last_reg_dir = 0xFF;
@@ -3750,7 +3950,7 @@ static void enterScreen(ScreenState next) {
     if (imu_present && imu_control_enabled) {
       // Give the car a moment to settle (users often enter RUN while still handling it).
       delay(500);
-      calibrateImuGyroBias();
+      calibrateImuGyroBias(); // Declaration is in Robot.cpp
       showImuReadyScreen(imu_gz_bias_dps);
       delay(250);
     }
@@ -3760,7 +3960,7 @@ static void enterScreen(ScreenState next) {
   if (next == SCREEN_IMU_CAL) {
     if (imu_present) {
       delay(500);
-      calibrateImuGyroBias();
+      calibrateImuGyroBias(); // Declaration is in Robot.cpp
     }
   }
 
@@ -3775,6 +3975,29 @@ static void enterScreen(ScreenState next) {
     extern void sqTestResetExtern();
     sqTestResetExtern();
   }
+
+  // Reset straight test to idle on entry
+  if (next == SCREEN_STRAIGHT_TEST) {
+    // strTestReset() defined later; use a forward-declared wrapper
+    extern void strTestResetExtern();
+    strTestResetExtern();
+  }
+
+  // Reset turn test to idle on entry
+  if (next == SCREEN_TURN_TEST) {
+    extern void trnTestResetExtern();
+    trnTestResetExtern();
+  }
+
+  // When entering encoder-calibration screen, capture encoder baselines
+  if (next == SCREEN_SET_ENC_CAL) {
+    // Force a fresh read so displayed distances start from zero
+    readWheelEncodersForce();
+    encCal_start_L = encoderL_count;
+    encCal_start_R = encoderR_count;
+  }
+
+  // NOTE: AUTO ENC feature removed — tuning handled in ENC CAL screen.
 
   currentScreen = next;
 }
@@ -3829,6 +4052,9 @@ static void startRun() {
   runActive = true;
   runStartMs = millis();
   runStartEpoch = time(nullptr);
+
+  // Ensure we use the latest persisted encoder calibration if available.
+  if (prefs_ok) loadPersistedSettings();
 
   // Ensure the control loop fully re-initializes for this run even if quick-cal blocks.
   runControlResetRequest = true;
@@ -3947,11 +4173,9 @@ static void stopRun() {
     return;
   }
 
-  // Optional: active braking to reduce coast distance when we stopped due to reaching the target distance.
+  // Closed-loop braking: stops each wheel when its encoder reaches zero velocity.
   if (DIST_STOP_BRAKE_ENABLE && lastRunStopReason && strcmp(lastRunStopReason, "DIST") == 0) {
-    setMotorsReversePwm((uint8_t)DIST_STOP_BRAKE_PWM, (uint8_t)DIST_STOP_BRAKE_PWM);
-    applyMotorOutputs();
-    delay((unsigned long)DIST_STOP_BRAKE_MS);
+    brakeToStop((uint8_t)DIST_STOP_BRAKE_PWM, (unsigned long)DIST_STOP_BRAKE_MS + 200);
   }
 
   if (runStartMs != 0) {
@@ -4030,22 +4254,6 @@ static void stopRun() {
              (unsigned long)runMetaLastSavedLastBytes);
     startDebugLogLine(line);
   }
-
-#if RUN_CLOUD_UPLOAD_ENABLE
-  // Upload the saved CSV to a webhook for plotting.
-  // Do this deferred by default so stopRun() stays responsive.
-#if RUN_CLOUD_UPLOAD_ON_STOP
-#if RUN_CLOUD_UPLOAD_DEFERRED
-  cloudUploadPending = true;
-  cloudUploadAttempts = 0;
-  cloudUploadNextAttemptMs = millis();
-  cloudUploadLastOk = false;
-  Serial.println("CloudUpload: queued");
-#else
-  cloudUploadLastOk = cloudUploadLastRunCsv();
-#endif
-#endif
-#endif
 
 #if RUNLOG_PRINT_TO_SERIAL_ON_STOP
   runLogPrintCsvToSerial();
@@ -4341,10 +4549,112 @@ static void hbridgeWriteDirectionSpeed8(uint8_t motor_addr, uint8_t direction, u
 }
 
 void stopAllMotors() {
+  motor_l_direction = 0;
+  motor_r_direction = 0;
   motor_l_speed = 0;
   motor_r_speed = 0;
-  applyMotorOutputs();
+  // Write direction=STOP to both motors back-to-back (minimise gap)
+  // before writing speed=0, so neither motor runs at full PWM while
+  // the other is already stopped.
+  Wire.beginTransmission(MOTOR_L_ADDR);
+  Wire.write(0x00);
+  Wire.write((uint8_t)0);  // dir=STOP
+  Wire.endTransmission(true);
+  Wire.beginTransmission(MOTOR_R_ADDR);
+  Wire.write(0x00);
+  Wire.write((uint8_t)0);  // dir=STOP
+  Wire.endTransmission(true);
+  i2cGuard();
+  // Now zero the speed registers
+  Wire.beginTransmission(MOTOR_L_ADDR);
+  Wire.write(0x01);
+  Wire.write((uint8_t)0);
+  Wire.endTransmission(true);
+  Wire.beginTransmission(MOTOR_R_ADDR);
+  Wire.write(0x01);
+  Wire.write((uint8_t)0);
+  Wire.endTransmission(true);
+  i2cGuard();
+  // Update cached state so applyMotorOutputs will see no change
+  motorL_last_reg_dir = 0;
+  motorL_last_reg_pwm = 0;
+  motorR_last_reg_dir = 0;
+  motorR_last_reg_pwm = 0;
+  // Invalidate applyMotorOutputs() cache so the next call always writes
+  extern volatile bool motorCacheDirty;
+  motorCacheDirty = true;
 }
+
+// Read IMU once and integrate gyro-Z into imu_yaw.
+// Call this during blocking waits so yaw tracking stays current.
+static void imuIntegrateOnce() {
+  if (!imu_present) return;
+  float ax, ay, az, gx, gy, gz, tmp;
+  if (!imu6886Read(&ax, &ay, &az, &gx, &gy, &gz, &tmp)) return;
+  float gz_corr = gz - imu_gz_bias_dps;
+  uint32_t nowUs = (uint32_t)micros();
+  if (lastYawUs != 0) {
+    float dt_s = (float)(nowUs - lastYawUs) * 1e-6f;
+    if (dt_s > 0.0f && dt_s < 0.5f) {
+      imu_yaw += gz_corr * dt_s;
+      while (imu_yaw > 180.0f) imu_yaw -= 360.0f;
+      while (imu_yaw < -180.0f) imu_yaw += 360.0f;
+    }
+  }
+  lastYawUs = nowUs;
+  imu_gz_dps = gz_corr;
+  imu_gz_raw_dps = gz;
+}
+
+// Closed-loop braking: apply reverse brake equally to both motors, then stop
+// each motor individually once its encoder shows zero velocity.  This ensures
+// both wheels stop at the same time regardless of motor asymmetry.
+static void brakeToStop(uint8_t brakePwm, unsigned long maxBrakeMs) {
+  setMotorsReversePwm(brakePwm, brakePwm);
+  applyMotorOutputs();
+
+  // If encoders unavailable, fall back to fixed-delay brake
+  readWheelEncodersForce();
+  if (!encoderL_found && !encoderR_found) {
+    delay(maxBrakeMs / 2);
+    stopAllMotors();
+    return;
+  }
+
+  int32_t prevL = encoderL_count;
+  int32_t prevR = encoderR_count;
+  bool stoppedL = false, stoppedR = false;
+  unsigned long t0 = millis();
+
+  while ((millis() - t0) < maxBrakeMs) {
+    delay(25);
+    imuIntegrateOnce();
+    readWheelEncodersForce();
+
+    int32_t deltaL = abs(encoderL_count - prevL);
+    int32_t deltaR = abs(encoderR_count - prevR);
+
+    // Wheel is stopped when encoder barely changed in 25ms
+    if (!stoppedL && deltaL < 3) {
+      hbridgeWriteDirectionSpeed8(MOTOR_L_ADDR, 0, 0, nullptr, nullptr);
+      stoppedL = true;
+    }
+    if (!stoppedR && deltaR < 3) {
+      hbridgeWriteDirectionSpeed8(MOTOR_R_ADDR, 0, 0, nullptr, nullptr);
+      stoppedR = true;
+    }
+
+    if (stoppedL && stoppedR) break;
+
+    prevL = encoderL_count;
+    prevR = encoderR_count;
+  }
+
+  stopAllMotors();
+}
+
+// Flag set by stopAllMotors() to force applyMotorOutputs() to resend on next call
+volatile bool motorCacheDirty = false;
 
 void applyMotorOutputs() {
   // Avoid spamming I2C; only send when values change or at a low refresh rate.
@@ -4358,7 +4668,11 @@ void applyMotorOutputs() {
   static uint8_t last_r = 255;
 
   const unsigned long now = millis();
-  const bool values_changed = (motor_l_direction != last_ldir) || (motor_r_direction != last_rdir) || (motor_l_speed != last_l) || (motor_r_speed != last_r);
+  bool values_changed = (motor_l_direction != last_ldir) || (motor_r_direction != last_rdir) || (motor_l_speed != last_l) || (motor_r_speed != last_r);
+  if (motorCacheDirty) {
+    values_changed = true;
+    motorCacheDirty = false;
+  }
   if (!values_changed && (now - last_send_ms) < keepalive_ms) {
     return;
   }
@@ -4436,6 +4750,11 @@ static const uint8_t HW_FIND_START_PWM = 50;  // start ramp from here
 static const unsigned long HW_FIND_STEP_DURATION_MS = 300; // time at each PWM level
 static const int32_t HW_FIND_PULSE_THRESHOLD = 5; // pulses needed to count as "moving"
 
+// HW test motion tracking for no-motion auto-boost
+static unsigned long lastMotionMs_hw = 0;
+static int32_t lastMotionEncL_hw = 0;
+static int32_t lastMotionEncR_hw = 0;
+
 static void applyHardwareTestDialSteps(int detentSteps) {
   if (detentSteps == 0) return;
   if (selected_motor == 2) return;  // ignore dial in FIND MIN mode
@@ -4490,17 +4809,20 @@ static void applyCanDistanceDialSteps(int detentSteps) {
 
 static void applyEncoderCalDialSteps(int detentSteps) {
   if (detentSteps == 0) return;
-  const float step = 5.0f;  // pulses per detent
-  float* target = encCalEditingLeft ? &pulsesPerMeterL : &pulsesPerMeterR;
+  const int stepCount = (int)(sizeof(tunePpmSteps) / sizeof(tunePpmSteps[0]));
+  const float step = tunePpmSteps[tunePpmStepIndex % stepCount];
+  volatile float* target = encCalEditingLeft ? &pulsesPerMeterL : &pulsesPerMeterR;
   float next = *target + (float)detentSteps * step;
   next = clampPpm(next);
-  if (fabsf(*target - next) > 0.001f) {
+  if (fabsf(*target - next) > 0.0001f) {
     *target = next;
     syncPulsesPerMeterDerived();
     settings_dirty = true;
     settings_dirty_ms = millis();
   }
 }
+
+/* TUNE PPM removed: functionality merged into ENC CAL (SCREEN_SET_ENC_CAL). */
 
 static void applyControlModeDialSteps(int detentSteps) {
   if (detentSteps == 0) return;
@@ -4602,7 +4924,7 @@ static void drawMainMenu() {
   // If the critical devices aren't present, do not start the run (safer than open-loop).
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(FW_VERSION, 120, 2);
+  ui.drawString(FW_VERSION, 2, 2);
 
   ui.setTextColor(TFT_CYAN);
   ui.setTextSize(1);
@@ -4810,20 +5132,211 @@ static void drawSetEncoderCal() {
 
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(1);
-  ui.drawString("Dial: adjust selected", 120, 55);
-  ui.drawString("Click: toggle L/R", 120, 70);
-  ui.drawString("Hold: save + exit", 120, 85);
+  ui.drawString("Dial: adjust selected", 120, 45);
+  ui.drawString("Turn: adjust value", 120, 58);
+  ui.drawString("Click: cycle step  Hold1s: toggle L/R", 120, 71);
+  ui.drawString("Hold2s: save + exit", 120, 84);
 
   ui.setTextSize(2);
   ui.setTextColor(encCalEditingLeft ? TFT_GREEN : TFT_DARKGREY);
-  ui.drawString(String("L ") + String(pulsesPerMeterL, 1), 120, 125);
+  ui.drawString(String("L ") + String(pulsesPerMeterL, 2), 120, 125);
   ui.setTextColor(encCalEditingLeft ? TFT_DARKGREY : TFT_GREEN);
-  ui.drawString(String("R ") + String(pulsesPerMeterR, 1), 120, 155);
+  ui.drawString(String("R ") + String(pulsesPerMeterR, 2), 120, 155);
 
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
-  ui.drawString(String("avg ") + String(pulsesPerMeter, 1), 120, 185);
+  char stepBuf[16];
+  snprintf(stepBuf, sizeof(stepBuf), "%.2g", (double)tunePpmSteps[tunePpmStepIndex % (int)(sizeof(tunePpmSteps)/sizeof(tunePpmSteps[0]))]);
+  ui.drawString(String("Step: ") + String(stepBuf) + "  avg " + String(pulsesPerMeter, 2), 120, 185);
   ui.setTextSize(1);
+  // Live distance since entering this screen (shows per-wheel encoder distance)
+  readWheelEncoders();
+  const int32_t dL = encoderL_count - encCal_start_L;
+  const int32_t dR = encoderR_count - encCal_start_R;
+  const float dLcorr = INVERT_LEFT_ENCODER_COUNT ? -(float)dL : (float)dL;
+  const float dRcorr = INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR;
+  const float distL_m = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
+  const float distR_m = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
+  ui.setTextColor(TFT_YELLOW);
+  ui.setTextSize(1);
+  ui.drawString(String("L dist: ") + String(distL_m, 3) + " m", 120, 205);
+  ui.drawString(String("R dist: ") + String(distR_m, 3) + " m", 120, 220);
+}
+
+// Automated encoder calibration using IMU-based distance estimation.
+// Runs motors forward at `pwm` for `duration_s` seconds, integrates IMU
+// horizontal acceleration to estimate distance, then computes pulses/m.
+static void autoCalibrateEncodersUsingImu(float duration_s, uint8_t pwm) {
+  if (!imu_present) {
+    Serial.println("AutoCal: IMU not present");
+    return;
+  }
+
+  // Ensure fresh sensor reads
+  readWheelEncodersInternal(true);
+  int32_t startL = encoderL_count;
+  int32_t startR = encoderR_count;
+
+  // Drive forward
+  setMotorsForwardPwm(pwm, pwm);
+  applyMotorOutputs();
+
+  float vel = 0.0f;
+  float dist = 0.0f;
+  unsigned long t0 = millis();
+  unsigned long last = t0;
+  const unsigned long durMs = (unsigned long)(duration_s * 1000.0f);
+
+  while ((unsigned long)(millis() - t0) < durMs) {
+    unsigned long now = millis();
+    float dt = (now - last) / 1000.0f;
+    if (dt <= 0.0f) dt = 0.001f;
+    last = now;
+
+    // Update sensors
+    readWheelEncodersForce();
+
+    // Horizontal-plane accel magnitude (g)
+    const float horiz_g = sqrtf(imu_ax_g * imu_ax_g + imu_ay_g * imu_ay_g);
+    // Ignore tiny readings as noise
+    const float accel_g = (horiz_g > 0.02f) ? horiz_g : 0.0f;
+    const float accel_ms2 = accel_g * 9.80665f;
+
+    // Simple integration (very approximate — use short durations)
+    vel += accel_ms2 * dt;
+    dist += vel * dt;
+
+    // Small sleep to yield; sensor updates driven elsewhere but keep loop responsive
+    delay(10);
+  }
+
+  // Stop motors
+  setMotorsStop();
+  applyMotorOutputs();
+
+  // Read final encoder counts
+  readWheelEncodersForce();
+  int32_t endL = encoderL_count;
+  int32_t endR = encoderR_count;
+  const int32_t dL = INVERT_LEFT_ENCODER_COUNT ? -(endL - startL) : (endL - startL);
+  const int32_t dR = INVERT_RIGHT_ENCODER_COUNT ? -(endR - startR) : (endR - startR);
+
+  if (dist > 0.05f) {
+    pulsesPerMeterL = (float)dL / dist;
+    pulsesPerMeterR = (float)dR / dist;
+    syncPulsesPerMeterDerived();
+    Serial.printf("AutoCal: dist=%.3fm dL=%ld dR=%ld ppmL=%.1f ppmR=%.1f\n",
+                  (double)dist, (long)dL, (long)dR,
+                  (double)pulsesPerMeterL, (double)pulsesPerMeterR);
+  } else {
+    Serial.println("AutoCal: insufficient estimated distance (IMU); try longer run or verify IMU");
+  }
+}
+
+// Run one trial and return computed ppmL/ppmR via references; returns true if successful
+static bool autoCalibrateEncodersTrial(float duration_s, uint8_t pwm, float &out_ppmL, float &out_ppmR, float &out_dist) {
+  if (!imu_present) return false;
+  readWheelEncodersInternal(true);
+  int32_t startL = encoderL_count;
+  int32_t startR = encoderR_count;
+  setMotorsForwardPwm(pwm, pwm);
+  applyMotorOutputs();
+
+  float vel = 0.0f;
+  float dist = 0.0f;
+  unsigned long t0 = millis();
+  unsigned long last = t0;
+  const unsigned long durMs = (unsigned long)(duration_s * 1000.0f);
+  while ((unsigned long)(millis() - t0) < durMs) {
+    unsigned long now = millis();
+    float dt = (now - last) / 1000.0f;
+    if (dt <= 0.0f) dt = 0.001f;
+    last = now;
+    readWheelEncodersForce();
+    const float horiz_g = sqrtf(imu_ax_g * imu_ax_g + imu_ay_g * imu_ay_g);
+    const float accel_g = (horiz_g > 0.02f) ? horiz_g : 0.0f;
+    const float accel_ms2 = accel_g * 9.80665f;
+    vel += accel_ms2 * dt;
+    dist += vel * dt;
+    delay(10);
+  }
+  setMotorsStop();
+  applyMotorOutputs();
+  readWheelEncodersForce();
+  int32_t endL = encoderL_count;
+  int32_t endR = encoderR_count;
+  const int32_t dL = INVERT_LEFT_ENCODER_COUNT ? -(endL - startL) : (endL - startL);
+  const int32_t dR = INVERT_RIGHT_ENCODER_COUNT ? -(endR - startR) : (endR - startR);
+  out_dist = dist;
+  if (dist > 0.05f) {
+    out_ppmL = (float)dL / dist;
+    out_ppmR = (float)dR / dist;
+    return true;
+  }
+  return false;
+}
+
+// Interactive multi-trial auto-calibration: shows progress on-screen, averages valid trials, optionally saves
+static void autoCalibrateEncodersInteractive(int trials, float duration_s, uint8_t pwm, bool saveResults) {
+  if (!imu_present || trials <= 0) return;
+
+  float sumL = 0.0f, sumR = 0.0f;
+  int valid = 0;
+
+  for (int t = 0; t < trials; t++) {
+    // Update UI
+    ui.fillScreen(TFT_BLACK);
+    ui.setTextColor(TFT_CYAN);
+    ui.setTextSize(2);
+    ui.drawString("Auto ENC CAL", 120, 20);
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_WHITE);
+    ui.drawString(String("Trial ") + String(t+1) + "/" + String(trials), 120, 60);
+    ui.drawString(String("Duration: ") + String(duration_s,1) + "s PWM:" + String((int)pwm), 120, 80);
+    ui.pushSprite(0,0);
+
+    float ppmL=0, ppmR=0, dist=0;
+    const bool ok = autoCalibrateEncodersTrial(duration_s, pwm, ppmL, ppmR, dist);
+
+    // Show result for this trial
+    ui.setTextColor(ok ? TFT_GREEN : TFT_RED);
+    ui.setTextSize(2);
+    if (ok) {
+      ui.drawString(String("dist:") + String(dist,3) + "m", 120, 120);
+      ui.drawString(String("L:") + String(ppmL,1), 120, 150);
+      ui.drawString(String("R:") + String(ppmR,1), 120, 180);
+      sumL += ppmL; sumR += ppmR; valid++;
+    } else {
+      ui.drawString("Insufficient IMU data", 120, 120);
+    }
+    ui.pushSprite(0,0);
+    delay(800);
+  }
+
+  if (valid > 0) {
+    pulsesPerMeterL = sumL / (float)valid;
+    pulsesPerMeterR = sumR / (float)valid;
+    syncPulsesPerMeterDerived();
+    if (saveResults && prefs_ok) savePersistedSettings();
+
+    ui.fillScreen(TFT_BLACK);
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(2);
+    ui.drawString("AutoCal COMPLETE", 120, 40);
+    ui.setTextSize(1);
+    ui.drawString(String("ppmL: ") + String(pulsesPerMeterL,1), 120, 90);
+    ui.drawString(String("ppmR: ") + String(pulsesPerMeterR,1), 120, 110);
+    ui.drawString(String("avg ppm: ") + String(pulsesPerMeter,1), 120, 130);
+    ui.pushSprite(0,0);
+  } else {
+    ui.fillScreen(TFT_BLACK);
+    ui.setTextColor(TFT_RED);
+    ui.setTextSize(2);
+    ui.drawString("AutoCal FAILED", 120, 80);
+    ui.pushSprite(0,0);
+  }
+
+  delay(1000);
 }
 
 static void drawRunScreen() {
@@ -4899,6 +5412,20 @@ static void drawRunScreen() {
 
   // Keep the elapsed timer visible for recording results.
   ui.setTextSize(2);
+
+  // Progress bar: visual indicator of distance toward the target `runDistanceM`.
+  if (runDistanceM > 0.01f) {
+    const int barW = 200;
+    const int barH = 10;
+    const int barX = 20;
+    const int barY = 200;
+    float frac = runDistanceM > 0.0f ? (shownM / runDistanceM) : 0.0f;
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    ui.fillRect(barX, barY, barW, barH, TFT_DARKGREY);
+    ui.fillRect(barX, barY, (int)(barW * frac), barH, runActive ? TFT_GREEN : TFT_YELLOW);
+    ui.drawRect(barX, barY, barW, barH, TFT_WHITE);
+  }
   ui.drawString(String(elapsed, 1) + " s", 120, 170);
 
   // Show active setpoints so it's clear what the run will use.
@@ -4936,7 +5463,7 @@ static void drawRunScreen() {
 
 // Draw a mini grid visualization on the display
 static void drawGridMinimap(int16_t ox, int16_t oy, int16_t w, int16_t h,
-                            int highlightStep = -1) {
+                            int highlightStep = -1, bool showPath = false) {
   const uint8_t rows = grid_course.rows;
   const uint8_t cols = grid_course.cols;
   if (rows < 2 || cols < 2) return;
@@ -4979,16 +5506,17 @@ static void drawGridMinimap(int16_t ox, int16_t oy, int16_t w, int16_t h,
     }
   }
 
-  // Draw gates as green filled squares
+  // Draw gates as green filled squares (last gate in magenta)
   for (uint8_t i = 0; i < grid_course.gate_count; i++) {
     const GridGate& gt = grid_course.gates[i];
     int16_t x1, y1, x2, y2;
     g2s(gt.row, gt.col, x1, y1);
     g2s(gt.row + 1, gt.col + 1, x2, y2);
-    // Semi-transparent green square
+    bool isLast = ((int8_t)i == grid_course.last_gate_idx);
+    // Semi-transparent fill
     for (int16_t yy = y1 + 1; yy < y2; yy++)
-      ui.drawLine(x1 + 1, yy, x2 - 1, yy, 0x03E0); // dark green fill
-    ui.drawRect(x1, y1, x2 - x1, y2 - y1, TFT_GREEN);
+      ui.drawLine(x1 + 1, yy, x2 - 1, yy, isLast ? 0x780F : 0x03E0); // magenta-ish or dark green
+    ui.drawRect(x1, y1, x2 - x1, y2 - y1, isLast ? TFT_MAGENTA : TFT_GREEN);
   }
 
   // Draw water bottles as blue dots at edge midpoints
@@ -5025,6 +5553,45 @@ static void drawGridMinimap(int16_t ox, int16_t oy, int16_t w, int16_t h,
     ui.fillCircle(ex, ey, 4, TFT_ORANGE);
     ui.drawLine(ex - 3, ey - 3, ex + 3, ey + 3, TFT_ORANGE);
     ui.drawLine(ex - 3, ey + 3, ex + 3, ey - 3, TFT_ORANGE);
+  }
+
+  // Optionally draw the planned path (if computed)
+  if (showPath && bfs_state.path_valid && bfs_state.path_length > 0) {
+    const float spacing_m = (float)grid_course.spacing_cm / 100.0f;
+    int prev_x = 0, prev_y = 0;
+    bool havePrev = false;
+    for (uint16_t pi = 0; pi < bfs_state.path_length; pi++) {
+      const uint8_t nid = bfs_state.path[pi];
+      // Convert node coordinates (x_m = col*spacing, y_m = row*spacing)
+      float node_r = bfs_state.nodes[nid].y_m / spacing_m;
+      float node_c = bfs_state.nodes[nid].x_m / spacing_m;
+      int16_t nx, ny;
+      g2s(node_r, node_c, nx, ny);
+      // Draw waypoint marker
+      ui.fillCircle(nx, ny, 3, TFT_CYAN);
+      if (havePrev) {
+        ui.drawLine(prev_x, prev_y, nx, ny, TFT_CYAN);
+        // Draw direction arrow at midpoint of segment
+        float mx = (prev_x + nx) * 0.5f, my = (prev_y + ny) * 0.5f;
+        float dx = (float)(nx - prev_x), dy = (float)(ny - prev_y);
+        float len = sqrtf(dx * dx + dy * dy);
+        if (len > 6.0f) {
+          float ux = dx / len, uy = dy / len; // unit vector along segment
+          float sz = 4.0f; // arrowhead size
+          // Arrowhead tip at midpoint + half-size forward
+          float tipx = mx + ux * sz * 0.5f, tipy = my + uy * sz * 0.5f;
+          // Two base points perpendicular to direction
+          float bx1 = mx - ux * sz * 0.5f + uy * sz * 0.4f;
+          float by1 = my - uy * sz * 0.5f - ux * sz * 0.4f;
+          float bx2 = mx - ux * sz * 0.5f - uy * sz * 0.4f;
+          float by2 = my - uy * sz * 0.5f + ux * sz * 0.4f;
+          ui.fillTriangle((int16_t)tipx, (int16_t)tipy,
+                          (int16_t)bx1, (int16_t)by1,
+                          (int16_t)bx2, (int16_t)by2, TFT_CYAN);
+        }
+      }
+      prev_x = nx; prev_y = ny; havePrev = true;
+    }
   }
 
   // Highlight current cursor in editor modes
@@ -5119,9 +5686,168 @@ static void drawImuCalScreen() {
     ui.drawString(String(imu_gz_raw_dps, 2), 120, 198);
   }
 
-  ui.setTextColor(TFT_GREEN);
+  // If a calibration routine is running, show smooth animated progress bar + duck.
+  if (imu_calibrating) {
+    // Stage label
+    ui.setTextSize(1);
+    if (imu_cal_progress < 15) {
+      ui.setTextColor(TFT_YELLOW);
+      ui.drawString("Hold still...", 120, 192);
+    } else if (imu_cal_progress < 100) {
+      ui.setTextColor(TFT_GREEN);
+      ui.drawString("Sampling gyro", 120, 192);
+    } else {
+      ui.setTextColor(TFT_GREEN);
+      ui.drawString("Done!", 120, 192);
+    }
+
+    // Smooth animated progress bar
+    static float imucal_displayed_pct = 0.0f;
+    float target_pct = (float)imu_cal_progress;
+    if (imu_cal_progress == 0) imucal_displayed_pct = 0.0f;
+    float diff = target_pct - imucal_displayed_pct;
+    if (diff > 0.5f) {
+      imucal_displayed_pct += diff * 0.15f;
+      if (imucal_displayed_pct > target_pct) imucal_displayed_pct = target_pct;
+    } else {
+      imucal_displayed_pct = target_pct;
+    }
+
+    const int bx = 20, by = 208, bw = 200, bh = 20, radius = 6;
+    int filled = (int)((bw * imucal_displayed_pct) / 100.0f);
+    if (filled < 0) filled = 0;
+    if (filled > bw) filled = bw;
+
+    // Background (rounded)
+    ui.fillRoundRect(bx, by, bw, bh, radius, TFT_DARKGREY);
+    // Filled portion (rounded, clipped)
+    if (filled > 2 * radius) {
+      ui.fillRoundRect(bx, by, filled, bh, radius, TFT_CYAN);
+    } else if (filled > 0) {
+      ui.fillRect(bx, by, filled, bh, TFT_CYAN);
+    }
+    // Border (rounded)
+    ui.drawRoundRect(bx, by, bw, bh, radius, TFT_WHITE);
+
+    // Percentage text centered on bar
+    char pctBuf[8];
+    snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)imucal_displayed_pct);
+    ui.setTextColor(TFT_BLACK);
+    ui.setTextSize(1);
+    ui.drawString(pctBuf, bx + bw / 2, by + bh / 2);
+
+    // Duck rides the progress bar
+    {
+      const int duckX = bx + filled - 6;
+      const int duckY = by - 22;
+      ui.fillEllipse(duckX, duckY + 10, 10, 7, TFT_YELLOW);
+      ui.fillCircle(duckX + 9, duckY + 2, 6, TFT_YELLOW);
+      ui.fillCircle(duckX + 11, duckY, 1, TFT_BLACK);
+      ui.fillTriangle(duckX + 15, duckY + 2,
+                      duckX + 15, duckY + 5,
+                      duckX + 20, duckY + 3, TFT_ORANGE);
+      ui.fillEllipse(duckX - 2, duckY + 10, 5, 4, 0xFD60);
+      ui.drawLine(duckX - 4, duckY + 17, duckX - 7, duckY + 20, TFT_ORANGE);
+      ui.drawLine(duckX + 2, duckY + 17, duckX - 1, duckY + 20, TFT_ORANGE);
+    }
+  }
+
+  if (!imu_calibrating) {
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(1);
+    ui.drawString("Click:recal  Hold:menu", 120, 225);
+  }
+}
+
+// Calibration status screen for SCREEN_CALIBRATE with smooth progress bar.
+static void drawCalibrateScreen() {
+  ui.fillScreen(TFT_BLACK);
+
+  ui.setTextColor(TFT_CYAN);
+  ui.setTextSize(2);
+  ui.drawString("CALIBRATING", 120, 25);
+
+  // Stage label
   ui.setTextSize(1);
-  ui.drawString("Click:recal  Hold:menu", 120, 225);
+  if (imuCal_stage <= 1) {
+    ui.setTextColor(TFT_YELLOW);
+    ui.drawString("Hold still...", 120, 55);
+  } else if (imuCal_stage == 2) {
+    ui.setTextColor(TFT_GREEN);
+    ui.drawString("Sampling gyro", 120, 55);
+  } else {
+    ui.setTextColor(TFT_GREEN);
+    ui.drawString("Done!", 120, 55);
+  }
+
+  // --- Smooth animated progress bar ---
+  // Smoothly interpolate displayed progress towards actual progress
+  static float displayed_pct = 0.0f;
+  float target_pct = (float)imu_cal_progress;
+  // Reset on new calibration start
+  if (imu_cal_progress == 0 && !imu_calibrating) displayed_pct = 0.0f;
+  // Ease toward target (fast catch-up, smooth motion)
+  float diff = target_pct - displayed_pct;
+  if (diff > 0.5f) {
+    displayed_pct += diff * 0.15f; // smooth ease
+    if (displayed_pct > target_pct) displayed_pct = target_pct;
+  } else {
+    displayed_pct = target_pct;
+  }
+
+  const int bx = 20, by = 85, bw = 200, bh = 20, radius = 6;
+  int filled = (int)((bw * displayed_pct) / 100.0f);
+  if (filled < 0) filled = 0;
+  if (filled > bw) filled = bw;
+
+  // Background (rounded)
+  ui.fillRoundRect(bx, by, bw, bh, radius, TFT_DARKGREY);
+  // Filled portion (rounded, clipped)
+  if (filled > 2 * radius) {
+    ui.fillRoundRect(bx, by, filled, bh, radius, TFT_CYAN);
+  } else if (filled > 0) {
+    ui.fillRect(bx, by, filled, bh, TFT_CYAN);
+  }
+  // Border (rounded)
+  ui.drawRoundRect(bx, by, bw, bh, radius, TFT_WHITE);
+
+  // Percentage text centered on bar
+  char pctBuf[8];
+  snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)displayed_pct);
+  ui.setTextColor(TFT_BLACK);
+  ui.setTextSize(1);
+  ui.drawString(pctBuf, bx + bw / 2, by + bh / 2);
+
+  // Gyro bias result (shows live during cal, final when done)
+  ui.setTextColor(TFT_DARKGREY);
+  ui.setTextSize(1);
+  ui.drawString("Gyro Z bias (dps)", 120, 125);
+  ui.setTextColor(TFT_GREEN);
+  ui.setTextSize(2);
+  ui.drawString(String(imu_gz_bias_dps, 3), 120, 145);
+
+  // --- Duck ---
+  // The duck rides the progress bar, sliding right as calibration progresses
+  {
+    const int duckX = bx + filled - 6;  // duck sits at the leading edge of the bar
+    const int duckY = by - 22;          // duck stands on top of the bar
+
+    // Body (yellow ellipse)
+    ui.fillEllipse(duckX, duckY + 10, 10, 7, TFT_YELLOW);
+    // Head (smaller circle)
+    ui.fillCircle(duckX + 9, duckY + 2, 6, TFT_YELLOW);
+    // Eye
+    ui.fillCircle(duckX + 11, duckY, 1, TFT_BLACK);
+    // Beak (orange triangle)
+    ui.fillTriangle(duckX + 15, duckY + 2,
+                    duckX + 15, duckY + 5,
+                    duckX + 20, duckY + 3, TFT_ORANGE);
+    // Wing (darker arc on body)
+    ui.fillEllipse(duckX - 2, duckY + 10, 5, 4, 0xFD60); // dark yellow
+    // Feet (two small orange lines under body)
+    ui.drawLine(duckX - 4, duckY + 17, duckX - 7, duckY + 20, TFT_ORANGE);
+    ui.drawLine(duckX + 2, duckY + 17, duckX - 1, duckY + 20, TFT_ORANGE);
+  }
 }
 
 static void drawBfsNavScreen(int bfs_setup_step) {
@@ -5268,7 +5994,7 @@ static void drawBfsNavScreen(int bfs_setup_step) {
       break;
     }
 
-    case 6: { // Gates editor (squares)
+    case 6: { // Gates editor (squares) — 3-state: none → gate → last gate → remove
       ui.setTextColor(TFT_GREEN);
       ui.setTextSize(2);
       snprintf(buf, sizeof(buf), "GATES (%d)", grid_course.gate_count);
@@ -5277,18 +6003,37 @@ static void drawBfsNavScreen(int bfs_setup_step) {
       uint8_t row, col;
       gridSquarePosition(grid_gate_cursor, row, col);
       bool hasGate = gridHasGate(row, col);
+      // Check if this gate is the designated last gate
+      bool isLast = false;
+      if (hasGate && grid_course.last_gate_idx >= 0 && grid_course.last_gate_idx < grid_course.gate_count) {
+        const GridGate& lg = grid_course.gates[grid_course.last_gate_idx];
+        isLast = (lg.row == row && lg.col == col);
+      }
 
-      ui.setTextColor(hasGate ? TFT_GREEN : TFT_WHITE);
+      ui.setTextColor(isLast ? TFT_MAGENTA : (hasGate ? TFT_GREEN : TFT_WHITE));
       ui.setTextSize(1);
-      snprintf(buf, sizeof(buf), "Sq(%d,%d) %s", row, col,
-               hasGate ? "[GATE]" : "[none]");
+      if (isLast) {
+        snprintf(buf, sizeof(buf), "Sq(%d,%d) [LAST]", row, col);
+      } else {
+        snprintf(buf, sizeof(buf), "Sq(%d,%d) %s", row, col,
+                 hasGate ? "[GATE]" : "[none]");
+      }
       ui.drawString(buf, 120, 55);
 
-      drawGridMinimap(70, 70, 100, 125, 6);
+      // Show last gate info
+      if (grid_course.last_gate_idx >= 0 && grid_course.last_gate_idx < grid_course.gate_count) {
+        const GridGate& lg = grid_course.gates[grid_course.last_gate_idx];
+        ui.setTextColor(TFT_MAGENTA);
+        ui.setTextSize(1);
+        snprintf(buf, sizeof(buf), "Last: Sq(%d,%d)", lg.row, lg.col);
+        ui.drawString(buf, 120, 70);
+      }
+
+      drawGridMinimap(70, 80, 100, 115, 6);
 
       ui.setTextColor(TFT_GREEN);
       ui.setTextSize(1);
-      ui.drawString("Dial:move Click:toggle", 120, 200);
+      ui.drawString("Click: +gate/last/remove", 120, 200);
       ui.drawString("Hold:next  2s:menu", 120, 215);
       break;
     }
@@ -5312,7 +6057,7 @@ static void drawBfsNavScreen(int bfs_setup_step) {
                grid_course.gate_count);
       ui.drawString(buf, 120, 85);
 
-      drawGridMinimap(70, 100, 100, 100);
+      drawGridMinimap(70, 100, 100, 100, -1, true);
 
       ui.setTextColor(TFT_GREEN);
       ui.setTextSize(1);
@@ -5349,6 +6094,8 @@ static void drawBfsRunScreen() {
   switch (bfs_run_phase) {
     case BFS_PHASE_TURN:    phaseStr = "TURNING";  phaseColor = TFT_ORANGE;  break;
     case BFS_PHASE_DRIVE:   phaseStr = "DRIVING";  phaseColor = TFT_GREEN;   break;
+    case BFS_PHASE_BRAKE:   phaseStr = "BRAKE";    phaseColor = TFT_RED;     break;
+    case BFS_PHASE_SETTLE:  phaseStr = "SETTLE";   phaseColor = TFT_BLUE;    break;
     case BFS_PHASE_ARRIVED: phaseStr = "ARRIVED";  phaseColor = TFT_YELLOW;  break;
     case BFS_PHASE_DONE:    phaseStr = "DONE!";    phaseColor = TFT_MAGENTA; break;
     default: break;
@@ -5801,6 +6548,53 @@ static void drawSelfTestScreen() {
 }
 
 // ========================================================================
+// Lightweight log helpers for test modes (square / straight / turn)
+// that don't use startRun() / stopRun().
+// ========================================================================
+static void testLogInit(const char* testName, float distM) {
+  runMeta.id = runMetaNextId++;
+  if (prefs_ok) prefs.putULong("run_id_next", runMetaNextId);
+  runMeta.runDistanceM = distM;
+  runMeta.pulsesPerMeter = pulsesPerMeter;
+  runMeta.pulsesPerMeterL = pulsesPerMeterL;
+  runMeta.pulsesPerMeterR = pulsesPerMeterR;
+  runMeta.motor_bias_pwm = motor_bias_pwm;
+  runMeta.i2c_clock_hz = i2c_clock_hz;
+  runMeta.imu_present = imu_present ? 1 : 0;
+  runMeta.imu_ok_at_start = imu_ok ? 1 : 0;
+  runLogReset();
+  runLogCount = 0;
+  runLogOverflow = false;
+  Serial.printf("TestLog: init id=%lu test=%s\n", (unsigned long)runMeta.id, testName);
+}
+
+static void testLogAppendSample(unsigned long t_ms, float meters, float yaw, float targetYaw,
+                                float yawErr, float gz, float lateralM, float remainingM,
+                                float basePwm, float steerCorr, uint8_t lPwm, uint8_t rPwm,
+                                float distL, float distR, float steerI = 0.0f) {
+  if (!runLog || runLogCapacity == 0) return;
+  RunLogSample s;
+  memset(&s, 0, sizeof(s));
+  s.t_ms = (uint32_t)t_ms;
+  s.meters = meters;
+  s.forwardM = meters;
+  s.yawRelDeg = yaw;
+  s.targetYawDeg = targetYaw;
+  s.yawErrDeg = yawErr;
+  s.gz_dps = gz;
+  s.lateralM = lateralM;
+  s.remainingM = remainingM;
+  s.basePWM = basePwm;
+  s.corrOut = steerCorr;
+  s.lPwm = lPwm;
+  s.rPwm = rPwm;
+  s.distL = distL;
+  s.distR = distR;
+  s.steerIntegral = steerI;
+  runLogAppend(s);
+}
+
+// ========================================================================
 // Square Drive Test
 // Drives a 50cm square (4 sides, 4 right turns) and measures drift.
 // Reports: per-side distance error, heading error, and final position
@@ -5823,6 +6617,9 @@ struct SqTestResult {
   float yaw_drift_deg;      // final yaw vs expected (should be ≈ start)
   float enc_dist_L_m;       // total left encoder distance
   float enc_dist_R_m;       // total right encoder distance
+  float position_err_m;     // dead-reckoned distance from start (XY)
+  float pos_x_m;            // dead-reckoned X offset from start
+  float pos_y_m;            // dead-reckoned Y offset from start
   unsigned long elapsed_ms; // total test time
 };
 
@@ -5839,6 +6636,17 @@ static int32_t sq_enc_total_start_R = 0;
 static float sq_driven_m = 0.0f;             // distance driven in current side
 static unsigned long sq_start_ms = 0;
 static unsigned long sq_drive_start_ms = 0;  // for timed fallback
+static float sq_imu_vel = 0.0f;
+static float sq_imu_dist = 0.0f;
+static unsigned long sq_imu_last_ms = 0;
+// Square-test motion tracking for no-motion auto-boost
+static unsigned long lastMotionMs_sq = 0;
+static int32_t lastMotionEncL_sq = 0;
+static int32_t lastMotionEncR_sq = 0;
+static float lastDrivenM_sq = 0.0f;
+// Dead-reckoning position tracking (X=forward at start, Y=left)
+static float sq_pos_x = 0.0f;
+static float sq_pos_y = 0.0f;
 
 static void sqTestReset() {
   sq_phase = SQ_IDLE;
@@ -5848,12 +6656,26 @@ static void sqTestReset() {
 // Extern wrapper for enterScreen() which is defined before sqTestReset()
 void sqTestResetExtern() { sqTestReset(); }
 
+// Steering PID state for square test
+static float sq_steerI = 0.0f;
+static float sq_prev_yaw_err = 0.0f;
+static unsigned long sq_pid_last_ms = 0;
+static float sq_dFilt = 0.0f;  // low-pass filtered derivative
+// Turn settle state (matches turn test logic)
+static unsigned long sq_first_in_tol_ms = 0;
+static unsigned long sq_turn_start_ms = 0;
+
 static void sqTestStart() {
   memset(&sq_result, 0, sizeof(sq_result));
   sq_side = 0;
   sq_phase = SQ_CALIBRATING;
   sq_start_ms = millis();
   stopAllMotors();
+  testLogInit("SQUARE", sq_side_len_m * 4.0f);
+  sq_steerI = 0.0f;
+  sq_prev_yaw_err = 0.0f;
+  sq_pid_last_ms = 0;
+  sq_dFilt = 0.0f;
   Serial.printf("=== SQUARE TEST START  side=%.2fm ===\n", (double)sq_side_len_m);
 }
 
@@ -5865,19 +6687,37 @@ static float sqComputeDriven() {
   const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
   const float sL = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
   const float sR = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
+  const float aL = fabsf(sL);
+  const float aR = fabsf(sR);
   switch (enc_mode) {
-    case ENC_MODE_BOTH:       return fabsf(0.5f * (sL + sR));
-    case ENC_MODE_LEFT_ONLY:  return fabsf(sL);
-    case ENC_MODE_RIGHT_ONLY: return fabsf(sR);
-    case ENC_MODE_TIMED: {
-      float elapsed_s = (millis() - sq_drive_start_ms) / 1000.0f;
-      return elapsed_s * ENC_TIMED_SPEED_MPS;
-    }
+    case ENC_MODE_BOTH:
+      if (encoderL_found || encoderR_found) {
+        float lhs = encoderL_found ? aL : 0.0f;
+        float rhs = encoderR_found ? aR : 0.0f;
+        float denom = (encoderL_found && encoderR_found) ? 2.0f : 1.0f;
+        return fabsf((lhs + rhs) / denom);
+      }
+      // Neither encoder found — prefer IMU over timed
+      if (imu_present) return sq_imu_dist;
+      break;  // fall through to TIMED
+    case ENC_MODE_LEFT_ONLY:
+      if (encoderL_found) return aL;
+      if (imu_present) return sq_imu_dist;
+      break;
+    case ENC_MODE_RIGHT_ONLY:
+      if (encoderR_found) return aR;
+      if (imu_present) return sq_imu_dist;
+      break;
+    default:
+      break;
   }
-  return 0.0f;
+  // Timed fallback if no encoder or IMU available
+  float elapsed_s = (millis() - sq_drive_start_ms) / 1000.0f;
+  return elapsed_s * ENC_TIMED_SPEED_MPS;
 }
 
 // Called from loop() each tick. Returns true while test is running.
+static unsigned long sq_lastLogMs = 0;
 static bool sqTestTick() {
   const unsigned long now = millis();
 
@@ -5887,13 +6727,12 @@ static bool sqTestTick() {
       return false;
 
     case SQ_CALIBRATING: {
-      // Brief IMU calibration
+      // Brief IMU calibration (already includes 1.5s hands-off settle internally)
       if (imu_present) {
-        delay(300);
         calibrateImuGyroBias();
         imu_yaw = 0.0f;
       }
-      readWheelEncodersInternal(true);
+      readWheelEncodersForce();
       sq_start_yaw = imu_yaw;
       sq_target_yaw = sq_start_yaw;  // first side: drive straight ahead
       sq_enc_total_start_L = encoderL_count;
@@ -5902,51 +6741,120 @@ static bool sqTestTick() {
       sq_enc_start_R = encoderR_count;
       sq_driven_m = 0.0f;
       sq_drive_start_ms = now;
+      // reset IMU integration state for distance fallback
+      sq_imu_vel = 0.0f;
+      sq_imu_dist = 0.0f;
+      sq_imu_last_ms = now;
       sq_phase = SQ_DRIVE;  // start driving first side (no turn needed)
+      // Initialize square-test motion trackers
+      lastMotionEncL_sq = encoderL_count;
+      lastMotionEncR_sq = encoderR_count;
+      lastMotionMs_sq = now;
+      lastDrivenM_sq = 0.0f;
+      // Reset dead-reckoning position
+      sq_pos_x = 0.0f;
+      sq_pos_y = 0.0f;
       Serial.printf("SQ: calibrated yaw=%.1f, starting side 0\n", (double)sq_start_yaw);
       break;
     }
 
     case SQ_TURN: {
-      // Pivot to face the next side (90° right turn each time)
+      // Pivot to face the next side — matches turn test logic
       float yaw_err = sq_target_yaw - imu_yaw;
       while (yaw_err > 180.0f) yaw_err -= 360.0f;
       while (yaw_err < -180.0f) yaw_err += 360.0f;
 
-      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
-        // Turn complete — start driving
+      const float SQ_TURN_TOLERANCE = 2.0f;       // degrees (matches turn test)
+      const unsigned long SQ_TURN_SETTLE_MS = 300; // must hold in tolerance this long
+
+      if (fabsf(yaw_err) < SQ_TURN_TOLERANCE) {
+        if (sq_first_in_tol_ms == 0) sq_first_in_tol_ms = now;
+        if ((now - sq_first_in_tol_ms) >= SQ_TURN_SETTLE_MS) {
+          // Turn settled — IMU-aware pause (keeps imu_yaw fresh)
+          stopAllMotors();
+          { unsigned long t0s = millis();
+            while ((millis() - t0s) < 150) { imuIntegrateOnce(); delay(5); } }
+          readWheelEncodersForce();
+          sq_enc_start_L = encoderL_count;
+          sq_enc_start_R = encoderR_count;
+          sq_driven_m = 0.0f;
+          sq_drive_start_ms = millis();
+          // reset IMU integration state for distance fallback
+          sq_imu_vel = 0.0f;
+          sq_imu_dist = 0.0f;
+          sq_imu_last_ms = millis();
+          sq_phase = SQ_DRIVE;
+          // Initialize motion trackers for this drive segment
+          lastMotionEncL_sq = encoderL_count;
+          lastMotionEncR_sq = encoderR_count;
+          lastMotionMs_sq = now;
+          Serial.printf("SQ: turn done yaw=%.1f target=%.1f, driving side %d\n",
+                  (double)imu_yaw, (double)sq_target_yaw, sq_side);
+          break;
+        }
+        // In tolerance but still settling — stop motors and wait
         stopAllMotors();
-        delay(100);
-        readWheelEncodersInternal(true);
+      } else {
+        // Left tolerance — reset settle timer
+        sq_first_in_tol_ms = 0;
+
+        // Pivot with proportional speed
+        int sign = (yaw_err > 0.0f) ? 1 : -1;
+        float pwmScale = fabsf(yaw_err) / 45.0f;
+        if (pwmScale > 1.0f) pwmScale = 1.0f;
+        if (pwmScale < 0.35f) pwmScale = 0.35f;
+        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
+        if (turnPwm < 115) turnPwm = 115;
+        setMotorsPivotPwm(sign, turnPwm);
+        applyMotorOutputs();
+      }
+
+      // Timeout safety
+      if ((now - sq_turn_start_ms) > 5000) {
+        stopAllMotors();
+        { unsigned long t0s = millis();
+          while ((millis() - t0s) < 150) { imuIntegrateOnce(); delay(5); } }
+        readWheelEncodersForce();
         sq_enc_start_L = encoderL_count;
         sq_enc_start_R = encoderR_count;
         sq_driven_m = 0.0f;
         sq_drive_start_ms = millis();
+        sq_imu_vel = 0.0f;
+        sq_imu_dist = 0.0f;
+        sq_imu_last_ms = millis();
         sq_phase = SQ_DRIVE;
-        Serial.printf("SQ: turn done yaw=%.1f target=%.1f, driving side %d\n",
-                      (double)imu_yaw, (double)sq_target_yaw, sq_side);
-      } else {
-        // Pivot
-        int sign = (yaw_err > 0.0f) ? 1 : -1;
-        float pwmScale = fabsf(yaw_err) / 45.0f;
-        if (pwmScale > 1.0f) pwmScale = 1.0f;
-        if (pwmScale < 0.4f) pwmScale = 0.4f;
-        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
-        if (turnPwm < 110) turnPwm = 110;
-        setMotorsPivotPwm(sign, turnPwm);
-        applyMotorOutputs();
+        lastMotionEncL_sq = encoderL_count;
+        lastMotionEncR_sq = encoderR_count;
+        lastMotionMs_sq = now;
+        Serial.printf("SQ: turn TIMEOUT yaw=%.1f target=%.1f, forcing drive side %d\n",
+                (double)imu_yaw, (double)sq_target_yaw, sq_side);
       }
       break;
     }
 
     case SQ_DRIVE: {
-      readWheelEncodersInternal(true);
+      // Update IMU-based distance integration (failsafe)
+      if (imu_present) {
+        const unsigned long nowMs = millis();
+        float dt = (nowMs - sq_imu_last_ms) / 1000.0f;
+        if (dt > 0.0f && dt < 0.5f) {
+          const float horiz_g = sqrtf(imu_ax_g * imu_ax_g + imu_ay_g * imu_ay_g);
+          const float accel_g = (horiz_g > 0.02f) ? horiz_g : 0.0f;
+          const float accel_ms2 = accel_g * 9.80665f;
+          sq_imu_vel += accel_ms2 * dt;
+          sq_imu_dist += sq_imu_vel * dt;
+        }
+        sq_imu_last_ms = nowMs;
+      }
+      readWheelEncodersForce();
       sq_driven_m = sqComputeDriven();
 
-      if (sq_driven_m >= sq_side_len_m - BFS_ARRIVE_TOLERANCE_M) {
-        // Side complete
-        stopAllMotors();
-        delay(150);
+      if (sq_driven_m >= sq_side_len_m - 0.08f) {
+        // Side complete — closed-loop reverse brake stops each wheel when its encoder reaches zero
+        brakeToStop(140, 400);
+        // IMU-aware settle wait — keeps imu_yaw fresh during pause
+        { unsigned long t0settle = millis();
+          while ((millis() - t0settle) < 300) { imuIntegrateOnce(); delay(5); } }
 
         sq_result.side_dist_m[sq_side] = sq_driven_m;
         sq_result.side_dist_err_m[sq_side] = sq_driven_m - sq_side_len_m;
@@ -5963,57 +6871,114 @@ static bool sqTestTick() {
                       sq_side, (double)sq_driven_m, (double)sq_result.side_dist_err_m[sq_side],
                       (double)imu_yaw, (double)sq_result.heading_err[sq_side]);
 
+        // Update dead-reckoned position: heading during this side is the target yaw
+        {
+          float headingRad = sq_target_yaw * (M_PI / 180.0f);
+          sq_pos_x += sq_driven_m * cosf(headingRad);
+          sq_pos_y += sq_driven_m * sinf(headingRad);
+          Serial.printf("SQ: DR pos (%.3f, %.3f)m after side %d\n",
+                        (double)sq_pos_x, (double)sq_pos_y, sq_side);
+        }
+
         sq_side++;
         if (sq_side >= 4) {
-          // Square complete!
+          // All 4 sides complete — compute results directly (no final turn)
+          stopAllMotors();
           sq_result.elapsed_ms = now - sq_start_ms;
           sq_result.total_dist_m = 0;
           for (int i = 0; i < 4; i++) sq_result.total_dist_m += sq_result.side_dist_m[i];
-          // Final yaw drift (should be back near start_yaw after 4×90° = 360°)
           sq_result.yaw_drift_deg = imu_yaw - sq_start_yaw;
           while (sq_result.yaw_drift_deg > 180.0f) sq_result.yaw_drift_deg -= 360.0f;
           while (sq_result.yaw_drift_deg < -180.0f) sq_result.yaw_drift_deg += 360.0f;
-          // Encoder totals
-          readWheelEncodersInternal(true);
+          readWheelEncodersForce();
           int32_t totDL = encoderL_count - sq_enc_total_start_L;
           int32_t totDR = encoderR_count - sq_enc_total_start_R;
           float totDLcorr = (INVERT_LEFT_ENCODER_COUNT ? -(float)totDL : (float)totDL);
           float totDRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)totDR : (float)totDR);
           sq_result.enc_dist_L_m = (pulsesPerMeterL > 1.0f) ? (totDLcorr / pulsesPerMeterL) : 0.0f;
           sq_result.enc_dist_R_m = (pulsesPerMeterR > 1.0f) ? (totDRcorr / pulsesPerMeterR) : 0.0f;
-
+          sq_result.pos_x_m = sq_pos_x;
+          sq_result.pos_y_m = sq_pos_y;
+          sq_result.position_err_m = sqrtf(sq_pos_x * sq_pos_x + sq_pos_y * sq_pos_y);
           sq_phase = SQ_DONE;
-          Serial.printf("SQ: DONE total=%.2fm yawDrift=%.1f encL=%.2f encR=%.2f time=%lums\n",
+          runLogSaveToSpiffs();
+          Serial.printf("SQ: DONE total=%.2fm yawDrift=%.1f posErr=%.3fm (%.3f,%.3f) encL=%.2f encR=%.2f time=%lums\n",
                         (double)sq_result.total_dist_m, (double)sq_result.yaw_drift_deg,
+                        (double)sq_result.position_err_m, (double)sq_result.pos_x_m, (double)sq_result.pos_y_m,
                         (double)sq_result.enc_dist_L_m, (double)sq_result.enc_dist_R_m,
                         sq_result.elapsed_ms);
         } else {
-          // Turn 90° right for next side
-          // IMU yaw increases CCW, so turning right = decrease yaw
-          sq_target_yaw -= 90.0f;
+          // Turn 90° right relative to fresh imu_yaw (kept current by
+          // imuIntegrateOnce() during brakeToStop + settle wait above).
+          sq_target_yaw = imu_yaw - 90.0f;
+          sq_steerI = 0.0f;
+          sq_prev_yaw_err = 0.0f;
+          sq_pid_last_ms = 0;
+          sq_dFilt = 0.0f;
+          sq_first_in_tol_ms = 0;
+          sq_turn_start_ms = millis();
           sq_phase = SQ_TURN;
           Serial.printf("SQ: turning to %.1f for side %d\n", (double)sq_target_yaw, sq_side);
         }
       } else {
-        // Drive with yaw correction (same logic as BFS DRIVE)
+        // Drive with yaw PID correction (P + I + D)
         float yaw_err = sq_target_yaw - imu_yaw;
         while (yaw_err > 180.0f) yaw_err -= 360.0f;
         while (yaw_err < -180.0f) yaw_err += 360.0f;
 
-        float steerCorr = BFS_DRIVE_STEER_KP * yaw_err;
+        // Leaky integral for steady-state bias correction
+        const float sq_steerKi = 4.0f;
+        const float sq_steerKd = 0.20f;
+        const float sq_iLeakTau = 1.0f;
+        // Measure real dt; clamp to [1ms, 50ms] to prevent spikes after stalls
+        float dt;
+        if (sq_pid_last_ms == 0) {
+          dt = 0.010f;
+        } else {
+          unsigned long dtMs = now - sq_pid_last_ms;
+          if (dtMs < 1) dtMs = 1;
+          if (dtMs > 50) dtMs = 50;
+          dt = dtMs / 1000.0f;
+        }
+        sq_pid_last_ms = now;
+        sq_steerI -= sq_steerI * (dt / sq_iLeakTau);
+        if (fabsf(yaw_err) > 0.1f) {
+          sq_steerI += yaw_err * dt;
+        }
+        const float sq_iMaxCorr = 25.0f;
+        const float sqILim = sq_iMaxCorr / sq_steerKi;
+        if (sq_steerI > sqILim) sq_steerI = sqILim;
+        if (sq_steerI < -sqILim) sq_steerI = -sqILim;
+
+        // Low-pass filtered derivative (alpha ~0.3 at 10ms, adapts with real dt)
+        float rawDeriv = (yaw_err - sq_prev_yaw_err) / dt;
+        sq_prev_yaw_err = yaw_err;
+        const float dFilterTau = 0.030f; // 30ms time constant
+        float dAlpha = dt / (dFilterTau + dt);
+        sq_dFilt += dAlpha * (rawDeriv - sq_dFilt);
+
+        // Boost P gain during deceleration
+        float remaining = sq_side_len_m - sq_driven_m;
+        float effectiveKp = BFS_DRIVE_STEER_KP;
+        if (remaining < 0.30f) {
+          effectiveKp = BFS_DRIVE_STEER_KP * 1.5f;
+        }
+
+        float steerCorr = effectiveKp * yaw_err
+                        + sq_steerKi * sq_steerI
+                        + sq_steerKd * sq_dFilt;
         if (steerCorr > 60.0f) steerCorr = 60.0f;
         if (steerCorr < -60.0f) steerCorr = -60.0f;
 
-        // Brake zone near end of side
-        float remaining = sq_side_len_m - sq_driven_m;
+        // Decel near end — short zone + high floor to maintain steering authority
         float speedFactor = 1.0f;
-        if (remaining < 0.3f) {
-          speedFactor = remaining / 0.3f;
-          if (speedFactor < 0.25f) speedFactor = 0.25f;
+        if (remaining < 0.20f) {
+          speedFactor = remaining / 0.20f;
+          if (speedFactor < 0.30f) speedFactor = 0.30f;
         }
 
         float basePwm = BFS_DRIVE_PWM * speedFactor;
-        if (basePwm < 110.0f) basePwm = 110.0f;
+        if (basePwm < 105.0f) basePwm = 105.0f;
 
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
         float rightPwm = basePwm + steerCorr - (float)motor_bias_pwm;
@@ -6021,9 +6986,78 @@ static bool sqTestTick() {
         if (rightPwm < 0.0f) rightPwm = 0.0f;
         if (leftPwm > 255.0f) leftPwm = 255.0f;
         if (rightPwm > 255.0f) rightPwm = 255.0f;
+        // Prevent one-wheel stall: clamp above hardware minimum
+        if (leftPwm > 0.0f && leftPwm < 100.0f) leftPwm = 100.0f;
+        if (rightPwm > 0.0f && rightPwm < 110.0f) rightPwm = 110.0f;
+
+        // Motion detection + adaptive auto-boost for Square Test
+        {
+          // Prefer distance-based detection (handles low-pulse movement); fallback to encoder-pulse check
+          const float MIN_DRIVEN_MOTION_M = 0.005f; // 5 mm
+          float drivenDelta = sq_driven_m - lastDrivenM_sq;
+          if (drivenDelta >= MIN_DRIVEN_MOTION_M) {
+            lastDrivenM_sq = sq_driven_m;
+            lastMotionEncL_sq = encoderL_count;
+            lastMotionEncR_sq = encoderR_count;
+            lastMotionMs_sq = now;
+          } else {
+            const int32_t dML = encoderL_count - lastMotionEncL_sq;
+            const int32_t dMR = encoderR_count - lastMotionEncR_sq;
+            const float motionAbs = (fabsf((float)dML) + fabsf((float)dMR)) * 0.5f;
+            if (motionAbs >= (float)RUN_NO_MOTION_MIN_PULSES) {
+              lastMotionEncL_sq = encoderL_count;
+              lastMotionEncR_sq = encoderR_count;
+              lastMotionMs_sq = now;
+              lastDrivenM_sq = sq_driven_m;
+            }
+          }
+
+          const uint32_t sinceEncMoveMs_sq = (lastMotionMs_sq != 0) ? ((uint32_t)now - (uint32_t)lastMotionMs_sq) : 0u;
+          const uint32_t NO_MOTION_BOOST_AFTER_MS = 300u;
+          const uint32_t NO_MOTION_BOOST_RAMP_MS = 1200u; // time to reach max boost
+          const float NO_MOTION_BOOST_PWM_START = 20.0f;
+          const float NO_MOTION_BOOST_PWM_MAX = 80.0f; // gentle max boost to overcome stiction
+          const float MAX_SQ_SAFE_PWM = 160.0f; // cap to keep speeds moderate and limit drift
+          if (sinceEncMoveMs_sq >= NO_MOTION_BOOST_AFTER_MS && sinceEncMoveMs_sq < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+            float frac;
+            if (sinceEncMoveMs_sq >= NO_MOTION_BOOST_RAMP_MS) frac = 1.0f;
+            else frac = (float)(sinceEncMoveMs_sq - NO_MOTION_BOOST_AFTER_MS) / (float)(NO_MOTION_BOOST_RAMP_MS - NO_MOTION_BOOST_AFTER_MS);
+            if (frac < 0.0f) frac = 0.0f;
+            if (frac > 1.0f) frac = 1.0f;
+            float boost = NO_MOTION_BOOST_PWM_START + frac * (NO_MOTION_BOOST_PWM_MAX - NO_MOTION_BOOST_PWM_START);
+            if (leftPwm > 0.0f) {
+              leftPwm += boost;
+              if (leftPwm > MAX_SQ_SAFE_PWM) leftPwm = MAX_SQ_SAFE_PWM;
+            }
+            if (rightPwm > 0.0f) {
+              rightPwm += boost;
+              if (rightPwm > MAX_SQ_SAFE_PWM) rightPwm = MAX_SQ_SAFE_PWM;
+            }
+          }
+        }
 
         setMotorsForwardPwm((uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f));
         applyMotorOutputs();
+
+        // Log sample every ~100ms
+        if ((now - sq_lastLogMs) >= 100u) {
+          sq_lastLogMs = now;
+          float totDriven = 0;
+          for (int i2 = 0; i2 < sq_side; i2++) totDriven += sq_result.side_dist_m[i2];
+          totDriven += sq_driven_m;
+          float rem = sq_side_len_m - sq_driven_m;
+          const int32_t dL3 = encoderL_count - sq_enc_total_start_L;
+          const int32_t dR3 = encoderR_count - sq_enc_total_start_R;
+          float dLm3 = (INVERT_LEFT_ENCODER_COUNT ? -(float)dL3 : (float)dL3);
+          float dRm3 = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR3 : (float)dR3);
+          if (pulsesPerMeterL > 1.0f) dLm3 /= pulsesPerMeterL;
+          if (pulsesPerMeterR > 1.0f) dRm3 /= pulsesPerMeterR;
+          testLogAppendSample(now - sq_start_ms, totDriven, imu_yaw, sq_target_yaw,
+                              yaw_err, imu_gz_dps, 0, rem,
+                              basePwm, steerCorr,
+                              (uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f),
+                              dLm3, dRm3, sq_steerI);
+        }
       }
       break;
     }
@@ -6160,6 +7194,17 @@ static void drawSquareTestScreen() {
   ui.drawString(yawBuf, 120, y);
   y += 14;
 
+  // Position error (dead-reckoned return-to-start distance)
+  char posBuf[48];
+  snprintf(posBuf, sizeof(posBuf), "Pos err: %.0fmm (%.0f,%.0f)",
+           (double)(sq_result.position_err_m * 1000.0f),
+           (double)(sq_result.pos_x_m * 1000.0f),
+           (double)(sq_result.pos_y_m * 1000.0f));
+  ui.setTextColor(sq_result.position_err_m < 0.05f ? TFT_GREEN :
+                  sq_result.position_err_m < 0.10f ? TFT_YELLOW : TFT_RED);
+  ui.drawString(posBuf, 120, y);
+  y += 14;
+
   // Encoder L/R totals
   char encBuf[48];
   snprintf(encBuf, sizeof(encBuf), "EncL: %.2fm  EncR: %.2fm",
@@ -6189,6 +7234,647 @@ static void drawSquareTestScreen() {
   ui.drawString("Click: retest  Hold: back", 120, 228);
 }
 
+// ========================================================================
+// STRAIGHT-LINE TEST
+// Drives forward a configurable distance to verify straightness.
+// Reports yaw drift, L/R encoder mismatch, and IMU-derived lateral drift.
+// ========================================================================
+enum StraightTestPhase {
+  STR_IDLE,
+  STR_CALIBRATING,
+  STR_DRIVING,
+  STR_DONE,
+};
+
+struct StraightTestResult {
+  float target_m;
+  float driven_m;
+  float dist_err_m;
+  float yaw_drift_deg;
+  float enc_L_m;
+  float enc_R_m;
+  float enc_diff_mm;     // |L - R| in mm
+  float lateral_drift_m; // estimated sideways drift from IMU
+  unsigned long elapsed_ms;
+};
+
+static StraightTestPhase str_phase = STR_IDLE;
+static StraightTestResult str_result;
+static float str_target_m = 1.00f;
+static float str_start_yaw = 0.0f;
+static int32_t str_enc_start_L = 0;
+static int32_t str_enc_start_R = 0;
+static unsigned long str_start_ms = 0;
+static float str_driven_m = 0.0f;
+static float str_lateral_m = 0.0f;
+// Motion tracking for auto-boost
+static unsigned long str_lastMotionMs = 0;
+static int32_t str_lastMotionEncL = 0;
+static int32_t str_lastMotionEncR = 0;
+static float str_lastDrivenM = 0.0f;
+static float str_lateral_prev_driven = 0.0f;
+static unsigned long str_lastLogMs = 0;
+// Steering PID state for straight test
+static float str_steerI = 0.0f;
+static float str_prev_yaw_err = 0.0f;
+static unsigned long str_pid_last_ms = 0;
+static float str_dFilt = 0.0f;  // low-pass filtered derivative
+
+static void strTestReset() {
+  str_phase = STR_IDLE;
+  stopAllMotors();
+}
+void strTestResetExtern() { strTestReset(); }
+
+static void strTestStart() {
+  memset(&str_result, 0, sizeof(str_result));
+  str_result.target_m = str_target_m;
+  str_phase = STR_CALIBRATING;
+  str_start_ms = millis();
+  stopAllMotors();
+  testLogInit("STRAIGHT", str_target_m);
+  str_lastLogMs = 0;
+  str_steerI = 0.0f;
+  str_prev_yaw_err = 0.0f;
+  str_pid_last_ms = 0;
+  str_dFilt = 0.0f;
+  Serial.printf("=== STRAIGHT TEST START  target=%.2fm ===\n", (double)str_target_m);
+}
+
+static float strComputeDriven() {
+  const int32_t dL = encoderL_count - str_enc_start_L;
+  const int32_t dR = encoderR_count - str_enc_start_R;
+  const float dLcorr = (INVERT_LEFT_ENCODER_COUNT  ? -(float)dL : (float)dL);
+  const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
+  const float sL = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
+  const float sR = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
+  if (encoderL_found && encoderR_found) return (fabsf(sL) + fabsf(sR)) * 0.5f;
+  if (encoderL_found) return fabsf(sL);
+  if (encoderR_found) return fabsf(sR);
+  return 0.0f;
+}
+
+static bool strTestTick() {
+  const unsigned long now = millis();
+  switch (str_phase) {
+    case STR_IDLE:
+    case STR_DONE:
+      return false;
+
+    case STR_CALIBRATING: {
+      if (imu_present) {
+        calibrateImuGyroBias();
+        imu_yaw = 0.0f;
+      }
+      readWheelEncodersForce();
+      str_start_yaw = imu_yaw;
+      str_enc_start_L = encoderL_count;
+      str_enc_start_R = encoderR_count;
+      str_driven_m = 0.0f;
+      str_lateral_m = 0.0f;
+      str_lastMotionEncL = encoderL_count;
+      str_lastMotionEncR = encoderR_count;
+      str_lastMotionMs = now;
+      str_lastDrivenM = 0.0f;
+      str_lateral_prev_driven = 0.0f;
+      str_phase = STR_DRIVING;
+      Serial.printf("STR: calibrated yaw=%.1f, driving %.2fm\n", (double)str_start_yaw, (double)str_target_m);
+      break;
+    }
+
+    case STR_DRIVING: {
+      readWheelEncodersForce();
+      str_driven_m = strComputeDriven();
+
+      // Accumulate lateral drift from IMU heading
+      if (imu_present) {
+        float headingRad = imu_yaw * (M_PI / 180.0f);
+        float dd = str_driven_m - str_lateral_prev_driven;
+        if (dd > 0.0f) {
+          str_lateral_m += dd * sinf(headingRad);
+        }
+        str_lateral_prev_driven = str_driven_m;
+      }
+
+      if (str_driven_m >= str_target_m - 0.08f) {
+        // Done — closed-loop reverse brake stops each wheel when its encoder reaches zero
+        brakeToStop(140, 400);
+        // IMU-aware settle wait
+        { unsigned long t0settle = millis();
+          while ((millis() - t0settle) < 300) { imuIntegrateOnce(); delay(5); } }
+
+        const int32_t totDL = encoderL_count - str_enc_start_L;
+        const int32_t totDR = encoderR_count - str_enc_start_R;
+        float dLcorr = (INVERT_LEFT_ENCODER_COUNT ? -(float)totDL : (float)totDL);
+        float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)totDR : (float)totDR);
+        str_result.enc_L_m = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
+        str_result.enc_R_m = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
+        str_result.enc_diff_mm = fabsf(str_result.enc_L_m - str_result.enc_R_m) * 1000.0f;
+        str_result.driven_m = str_driven_m;
+        str_result.dist_err_m = str_driven_m - str_target_m;
+        str_result.yaw_drift_deg = imu_yaw - str_start_yaw;
+        str_result.lateral_drift_m = str_lateral_m;
+        str_result.elapsed_ms = now - str_start_ms;
+
+        str_phase = STR_DONE;
+        runLogSaveToSpiffs();
+        Serial.printf("STR: DONE dist=%.3f err=%.3f yaw=%.1f latDrift=%.3f encDiff=%.1fmm time=%lums\n",
+                      (double)str_result.driven_m, (double)str_result.dist_err_m,
+                      (double)str_result.yaw_drift_deg, (double)str_result.lateral_drift_m,
+                      (double)str_result.enc_diff_mm, str_result.elapsed_ms);
+      } else {
+        // Drive with yaw PID correction (P + I + D)
+        float yaw_err = str_start_yaw - imu_yaw;
+        while (yaw_err > 180.0f) yaw_err -= 360.0f;
+        while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+        // Leaky integral to fight steady-state drift from motor/encoder asymmetry
+        const float str_steerKi = 4.0f;
+        const float str_steerKd = 0.20f;
+        const float str_iLeakTau = 1.0f;
+        // Measure real dt; clamp to [1ms, 50ms] to prevent spikes after stalls
+        float dt;
+        if (str_pid_last_ms == 0) {
+          dt = 0.010f;
+        } else {
+          unsigned long dtMs = now - str_pid_last_ms;
+          if (dtMs < 1) dtMs = 1;
+          if (dtMs > 50) dtMs = 50;
+          dt = dtMs / 1000.0f;
+        }
+        str_pid_last_ms = now;
+        str_steerI -= str_steerI * (dt / str_iLeakTau);
+        if (fabsf(yaw_err) > 0.1f) {
+          str_steerI += yaw_err * dt;
+        }
+        // Anti-windup: cap I contribution
+        const float str_iMaxCorr = 25.0f;
+        const float iLim = str_iMaxCorr / str_steerKi;
+        if (str_steerI > iLim) str_steerI = iLim;
+        if (str_steerI < -iLim) str_steerI = -iLim;
+
+        // Low-pass filtered derivative (alpha ~0.3 at 10ms, adapts with real dt)
+        float rawDeriv = (yaw_err - str_prev_yaw_err) / dt;
+        str_prev_yaw_err = yaw_err;
+        const float dFilterTau = 0.030f; // 30ms time constant
+        float dAlpha = dt / (dFilterTau + dt);
+        str_dFilt += dAlpha * (rawDeriv - str_dFilt);
+
+        // Boost P gain during deceleration to maintain steering authority at low PWM
+        float remaining = str_target_m - str_driven_m;
+        float effectiveKp = BFS_DRIVE_STEER_KP;
+        if (remaining < 0.30f) {
+          effectiveKp = BFS_DRIVE_STEER_KP * 1.5f;
+        }
+
+        float steerCorr = effectiveKp * yaw_err
+                        + str_steerKi * str_steerI
+                        + str_steerKd * str_dFilt;
+        if (steerCorr > 60.0f) steerCorr = 60.0f;
+        if (steerCorr < -60.0f) steerCorr = -60.0f;
+
+        // Decel near end — short zone + high floor to maintain steering authority
+        float speedFactor = 1.0f;
+        if (remaining < 0.20f) {
+          speedFactor = remaining / 0.20f;
+          if (speedFactor < 0.30f) speedFactor = 0.30f;
+        }
+
+        float basePwm = BFS_DRIVE_PWM * speedFactor;
+        if (basePwm < 105.0f) basePwm = 105.0f;
+
+        float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
+        float rightPwm = basePwm + steerCorr - (float)motor_bias_pwm;
+        if (leftPwm < 0.0f) leftPwm = 0.0f;
+        if (rightPwm < 0.0f) rightPwm = 0.0f;
+        if (leftPwm > 255.0f) leftPwm = 255.0f;
+        if (rightPwm > 255.0f) rightPwm = 255.0f;
+        // Prevent one-wheel stall: if either motor is commanded above zero
+        // but below the hardware minimum, clamp it up so it actually spins
+        if (leftPwm > 0.0f && leftPwm < 100.0f) leftPwm = 100.0f;
+        if (rightPwm > 0.0f && rightPwm < 110.0f) rightPwm = 110.0f;
+
+        // Auto-boost if not moving
+        {
+          const float MIN_DRIVEN_MOTION_M = 0.005f;
+          float drivenDelta = str_driven_m - str_lastDrivenM;
+          if (drivenDelta >= MIN_DRIVEN_MOTION_M) {
+            str_lastDrivenM = str_driven_m;
+            str_lastMotionEncL = encoderL_count;
+            str_lastMotionEncR = encoderR_count;
+            str_lastMotionMs = now;
+          }
+          const uint32_t sinceMotionMs = (str_lastMotionMs != 0) ? ((uint32_t)now - (uint32_t)str_lastMotionMs) : 0u;
+          if (sinceMotionMs >= 300u && sinceMotionMs < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+            float frac = (float)(sinceMotionMs - 300u) / 900.0f;
+            if (frac > 1.0f) frac = 1.0f;
+            float boost = 20.0f + frac * 60.0f;
+            leftPwm += boost;
+            rightPwm += boost;
+            if (leftPwm > 160.0f) leftPwm = 160.0f;
+            if (rightPwm > 160.0f) rightPwm = 160.0f;
+          }
+        }
+
+        setMotorsForwardPwm((uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f));
+        applyMotorOutputs();
+
+        // Log sample every ~100ms
+        if ((now - str_lastLogMs) >= 100u) {
+          str_lastLogMs = now;
+          float yawErr = str_start_yaw - imu_yaw;
+          float rem = str_target_m - str_driven_m;
+          const int32_t dL2 = encoderL_count - str_enc_start_L;
+          const int32_t dR2 = encoderR_count - str_enc_start_R;
+          float dLm = (INVERT_LEFT_ENCODER_COUNT ? -(float)dL2 : (float)dL2);
+          float dRm = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR2 : (float)dR2);
+          if (pulsesPerMeterL > 1.0f) dLm /= pulsesPerMeterL;
+          if (pulsesPerMeterR > 1.0f) dRm /= pulsesPerMeterR;
+          testLogAppendSample(now - str_start_ms, str_driven_m, imu_yaw, str_start_yaw,
+                              yawErr, imu_gz_dps, str_lateral_m, rem,
+                              basePwm, steerCorr,
+                              (uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f),
+                              dLm, dRm, str_steerI);
+        }
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+  return true;
+}
+
+static void drawStraightTestScreen() {
+  ui.fillScreen(TFT_BLACK);
+  ui.setTextDatum(middle_center);
+
+  ui.setTextColor(TFT_CYAN);
+  ui.setTextSize(2);
+  ui.drawString("STRAIGHT", 120, 18);
+
+  if (str_phase == STR_IDLE) {
+    ui.setTextColor(TFT_WHITE);
+    ui.setTextSize(1);
+    ui.drawString("Drive straight to test", 120, 50);
+    ui.drawString("heading hold accuracy", 120, 65);
+
+    ui.setTextColor(TFT_YELLOW);
+    ui.setTextSize(2);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.2fm", (double)str_target_m);
+    ui.drawString(buf, 120, 100);
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    ui.drawString("Dial: adjust distance", 120, 125);
+
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(2);
+    ui.drawString("Click: GO", 120, 170);
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    ui.drawString("Hold: back", 120, 210);
+    return;
+  }
+
+  if (str_phase == STR_CALIBRATING) {
+    ui.setTextColor(TFT_YELLOW);
+    ui.setTextSize(2);
+    ui.drawString("Calibrating...", 120, 120);
+    return;
+  }
+
+  if (str_phase == STR_DRIVING) {
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(1);
+    ui.drawString("DRIVING", 120, 45);
+
+    ui.setTextColor(TFT_WHITE);
+    ui.setTextSize(2);
+    char distBuf[16];
+    snprintf(distBuf, sizeof(distBuf), "%.3fm", (double)str_driven_m);
+    ui.drawString(distBuf, 120, 80);
+
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    char yawBuf[32];
+    snprintf(yawBuf, sizeof(yawBuf), "Yaw: %.1f deg", (double)imu_yaw);
+    ui.drawString(yawBuf, 120, 110);
+
+    float elapsed = (millis() - str_start_ms) / 1000.0f;
+    char timeBuf[16];
+    snprintf(timeBuf, sizeof(timeBuf), "%.1fs", (double)elapsed);
+    ui.drawString(timeBuf, 120, 180);
+
+    ui.setTextColor(TFT_RED);
+    ui.drawString("Click: ABORT", 120, 225);
+    return;
+  }
+
+  // STR_DONE — results
+  int y = 40;
+  ui.setTextSize(1);
+
+  char buf[48];
+  snprintf(buf, sizeof(buf), "Dist: %.3fm (tgt %.2f)", (double)str_result.driven_m, (double)str_result.target_m);
+  ui.setTextColor(fabsf(str_result.dist_err_m) < 0.05f ? TFT_GREEN : TFT_YELLOW);
+  ui.drawString(buf, 120, y); y += 16;
+
+  snprintf(buf, sizeof(buf), "Yaw drift: %.1f deg", (double)str_result.yaw_drift_deg);
+  ui.setTextColor(fabsf(str_result.yaw_drift_deg) < 5.0f ? TFT_GREEN : TFT_RED);
+  ui.drawString(buf, 120, y); y += 16;
+
+  snprintf(buf, sizeof(buf), "Lateral: %.0fmm", (double)(str_result.lateral_drift_m * 1000.0f));
+  ui.setTextColor(fabsf(str_result.lateral_drift_m) < 0.03f ? TFT_GREEN :
+                  fabsf(str_result.lateral_drift_m) < 0.06f ? TFT_YELLOW : TFT_RED);
+  ui.drawString(buf, 120, y); y += 16;
+
+  snprintf(buf, sizeof(buf), "EncL: %.3f  EncR: %.3f", (double)str_result.enc_L_m, (double)str_result.enc_R_m);
+  ui.setTextColor(TFT_BLUE);
+  ui.drawString(buf, 120, y); y += 16;
+
+  snprintf(buf, sizeof(buf), "L-R diff: %.1fmm", (double)str_result.enc_diff_mm);
+  ui.setTextColor(str_result.enc_diff_mm < 20.0f ? TFT_GREEN : TFT_RED);
+  ui.drawString(buf, 120, y); y += 16;
+
+  snprintf(buf, sizeof(buf), "Time: %.1fs", str_result.elapsed_ms / 1000.0f);
+  ui.setTextColor(TFT_DARKGREY);
+  ui.drawString(buf, 120, y); y += 20;
+
+  bool pass = fabsf(str_result.yaw_drift_deg) < 5.0f && str_result.enc_diff_mm < 20.0f;
+  ui.setTextColor(pass ? TFT_GREEN : TFT_RED);
+  ui.setTextSize(2);
+  ui.drawString(pass ? "STRAIGHT" : "VEERING", 120, y);
+
+  ui.setTextColor(TFT_DARKGREY);
+  ui.setTextSize(1);
+  ui.drawString("Click: retest  Hold: back", 120, 228);
+}
+
+// ========================================================================
+// 90-DEGREE TURN-IN-PLACE TEST
+// Performs an exact 90° right pivot and reports accuracy.
+// ========================================================================
+enum TurnTestPhase {
+  TRN_IDLE,
+  TRN_CALIBRATING,
+  TRN_TURNING,
+  TRN_DONE,
+};
+
+struct TurnTestResult {
+  float target_deg;
+  float actual_deg;
+  float error_deg;
+  float overshoot_deg;   // max overshoot past target
+  unsigned long elapsed_ms;
+  unsigned long settle_ms; // time from first entering tolerance to final stop
+};
+
+static TurnTestPhase trn_phase = TRN_IDLE;
+static TurnTestResult trn_result;
+static float trn_target_deg = 90.0f;  // adjustable: positive = right turn
+static float trn_start_yaw = 0.0f;
+static unsigned long trn_start_ms = 0;
+static float trn_max_overshoot = 0.0f;
+static unsigned long trn_first_in_tol_ms = 0;
+static int trn_direction = -1;  // -1 = right (yaw decreases), +1 = left
+
+static void trnTestReset() {
+  trn_phase = TRN_IDLE;
+  stopAllMotors();
+}
+void trnTestResetExtern() { trnTestReset(); }
+
+static void trnTestStart() {
+  memset(&trn_result, 0, sizeof(trn_result));
+  trn_result.target_deg = trn_target_deg;
+  trn_phase = TRN_CALIBRATING;
+  trn_start_ms = millis();
+  trn_max_overshoot = 0.0f;
+  trn_first_in_tol_ms = 0;
+  stopAllMotors();
+  testLogInit("TURN", trn_target_deg);
+  Serial.printf("=== TURN TEST START  target=%.1f deg dir=%s ===\n",
+                (double)trn_target_deg, trn_direction < 0 ? "RIGHT" : "LEFT");
+}
+
+static unsigned long trn_lastLogMs = 0;
+
+static bool trnTestTick() {
+  const unsigned long now = millis();
+  switch (trn_phase) {
+    case TRN_IDLE:
+    case TRN_DONE:
+      return false;
+
+    case TRN_CALIBRATING: {
+      if (imu_present) {
+        calibrateImuGyroBias();
+        imu_yaw = 0.0f;
+      }
+      trn_start_yaw = imu_yaw;
+      trn_max_overshoot = 0.0f;
+      trn_first_in_tol_ms = 0;
+      trn_start_ms = millis();  // reset AFTER calibration so timeout counts from actual turn start
+      trn_phase = TRN_TURNING;
+      Serial.printf("TRN: calibrated yaw=%.1f, turning %.1f deg %s\n",
+                    (double)trn_start_yaw, (double)trn_target_deg,
+                    trn_direction < 0 ? "RIGHT" : "LEFT");
+      break;
+    }
+
+    case TRN_TURNING: {
+      // Target yaw: start + direction * target_deg
+      // For right turn: yaw decreases (trn_direction = -1)
+      float target_yaw = trn_start_yaw + trn_direction * trn_target_deg;
+      float yaw_err = target_yaw - imu_yaw;
+      while (yaw_err > 180.0f) yaw_err -= 360.0f;
+      while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+      float turned_deg = fabsf(imu_yaw - trn_start_yaw);
+
+      // Track overshoot
+      float overshoot = turned_deg - trn_target_deg;
+      if (overshoot > trn_max_overshoot) trn_max_overshoot = overshoot;
+
+      const float TOLERANCE = 2.0f;  // degrees
+      const unsigned long SETTLE_HOLD_MS = 300;  // must hold in tolerance this long
+
+      if (fabsf(yaw_err) < TOLERANCE) {
+        if (trn_first_in_tol_ms == 0) trn_first_in_tol_ms = now;
+        if ((now - trn_first_in_tol_ms) >= SETTLE_HOLD_MS) {
+          // Done — settled in tolerance
+          stopAllMotors();
+          delay(100);
+          trn_result.actual_deg = fabsf(imu_yaw - trn_start_yaw);
+          trn_result.error_deg = trn_result.actual_deg - trn_target_deg;
+          trn_result.overshoot_deg = trn_max_overshoot > 0.0f ? trn_max_overshoot : 0.0f;
+          trn_result.elapsed_ms = now - trn_start_ms;
+          trn_result.settle_ms = (trn_first_in_tol_ms > trn_start_ms) ? (trn_first_in_tol_ms - trn_start_ms) : 0;
+          trn_phase = TRN_DONE;
+          runLogSaveToSpiffs();
+          Serial.printf("TRN: DONE actual=%.1f err=%.1f overshoot=%.1f settle=%lums time=%lums\n",
+                        (double)trn_result.actual_deg, (double)trn_result.error_deg,
+                        (double)trn_result.overshoot_deg, trn_result.settle_ms, trn_result.elapsed_ms);
+          break;
+        }
+        // In tolerance but still settling — stop motors and wait
+        stopAllMotors();
+      } else {
+        // Reset settle timer if we leave tolerance
+        trn_first_in_tol_ms = 0;
+
+        // Pivot with proportional speed
+        int sign = (yaw_err > 0.0f) ? 1 : -1;
+        float pwmScale = fabsf(yaw_err) / 45.0f;
+        if (pwmScale > 1.0f) pwmScale = 1.0f;
+        if (pwmScale < 0.35f) pwmScale = 0.35f;
+        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
+        if (turnPwm < 115) turnPwm = 115;
+        setMotorsPivotPwm(sign, turnPwm);
+        applyMotorOutputs();
+
+        // Log sample every ~100ms
+        if ((now - trn_lastLogMs) >= 100u) {
+          trn_lastLogMs = now;
+          testLogAppendSample(now - trn_start_ms, 0, imu_yaw, target_yaw,
+                              yaw_err, imu_gz_dps, 0, fabsf(yaw_err),
+                              (float)turnPwm, 0,
+                              motor_l_speed, motor_r_speed, 0, 0);
+        }
+      }
+
+      // Timeout safety
+      if ((now - trn_start_ms) > 5000) {
+        stopAllMotors();
+        trn_result.actual_deg = fabsf(imu_yaw - trn_start_yaw);
+        trn_result.error_deg = trn_result.actual_deg - trn_target_deg;
+        trn_result.overshoot_deg = trn_max_overshoot > 0.0f ? trn_max_overshoot : 0.0f;
+        trn_result.elapsed_ms = now - trn_start_ms;
+        trn_result.settle_ms = 0;
+        trn_phase = TRN_DONE;
+        runLogSaveToSpiffs();
+        Serial.printf("TRN: TIMEOUT actual=%.1f err=%.1f\n",
+                      (double)trn_result.actual_deg, (double)trn_result.error_deg);
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+  return true;
+}
+
+static void drawTurnTestScreen() {
+  ui.fillScreen(TFT_BLACK);
+  ui.setTextDatum(middle_center);
+
+  ui.setTextColor(TFT_CYAN);
+  ui.setTextSize(2);
+  ui.drawString("TURN 90", 120, 18);
+
+  if (trn_phase == TRN_IDLE) {
+    ui.setTextColor(TFT_WHITE);
+    ui.setTextSize(1);
+    ui.drawString("In-place pivot test", 120, 50);
+    ui.drawString("measures turn accuracy", 120, 65);
+
+    ui.setTextColor(TFT_YELLOW);
+    ui.setTextSize(2);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%.0f %s", (double)trn_target_deg,
+             trn_direction < 0 ? "RIGHT" : "LEFT");
+    ui.drawString(buf, 120, 100);
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    ui.drawString("Dial: adjust angle", 120, 125);
+    ui.drawString("Hold 1s: toggle L/R", 120, 140);
+
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(2);
+    ui.drawString("Click: GO", 120, 175);
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    ui.drawString("Hold 2s: back", 120, 210);
+    return;
+  }
+
+  if (trn_phase == TRN_CALIBRATING) {
+    ui.setTextColor(TFT_YELLOW);
+    ui.setTextSize(2);
+    ui.drawString("Calibrating...", 120, 120);
+    return;
+  }
+
+  if (trn_phase == TRN_TURNING) {
+    float turned = fabsf(imu_yaw - trn_start_yaw);
+    ui.setTextColor(TFT_GREEN);
+    ui.setTextSize(1);
+    ui.drawString(trn_direction < 0 ? "TURNING RIGHT" : "TURNING LEFT", 120, 45);
+
+    ui.setTextColor(TFT_WHITE);
+    ui.setTextSize(2);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%.1f / %.0f", (double)turned, (double)trn_target_deg);
+    ui.drawString(buf, 120, 80);
+
+    ui.setTextSize(1);
+    ui.setTextColor(TFT_DARKGREY);
+    char yawBuf[32];
+    snprintf(yawBuf, sizeof(yawBuf), "Yaw: %.1f deg", (double)imu_yaw);
+    ui.drawString(yawBuf, 120, 110);
+
+    float elapsed = (millis() - trn_start_ms) / 1000.0f;
+    char timeBuf[16];
+    snprintf(timeBuf, sizeof(timeBuf), "%.1fs", (double)elapsed);
+    ui.drawString(timeBuf, 120, 180);
+
+    ui.setTextColor(TFT_RED);
+    ui.drawString("Click: ABORT", 120, 225);
+    return;
+  }
+
+  // TRN_DONE — results
+  int y = 45;
+  ui.setTextSize(1);
+
+  char buf[48];
+  snprintf(buf, sizeof(buf), "Target: %.0f deg %s",
+           (double)trn_result.target_deg, trn_direction < 0 ? "RIGHT" : "LEFT");
+  ui.setTextColor(TFT_WHITE);
+  ui.drawString(buf, 120, y); y += 18;
+
+  snprintf(buf, sizeof(buf), "Actual: %.1f deg", (double)trn_result.actual_deg);
+  ui.setTextColor(fabsf(trn_result.error_deg) < 5.0f ? TFT_GREEN : TFT_YELLOW);
+  ui.drawString(buf, 120, y); y += 18;
+
+  snprintf(buf, sizeof(buf), "Error: %.1f deg", (double)trn_result.error_deg);
+  ui.setTextColor(fabsf(trn_result.error_deg) < 5.0f ? TFT_GREEN :
+                  fabsf(trn_result.error_deg) < 10.0f ? TFT_YELLOW : TFT_RED);
+  ui.drawString(buf, 120, y); y += 18;
+
+  snprintf(buf, sizeof(buf), "Overshoot: %.1f deg", (double)trn_result.overshoot_deg);
+  ui.setTextColor(trn_result.overshoot_deg < 5.0f ? TFT_GREEN : TFT_RED);
+  ui.drawString(buf, 120, y); y += 18;
+
+  snprintf(buf, sizeof(buf), "Settle: %lums  Total: %lums",
+           trn_result.settle_ms, trn_result.elapsed_ms);
+  ui.setTextColor(TFT_DARKGREY);
+  ui.drawString(buf, 120, y); y += 22;
+
+  bool pass = fabsf(trn_result.error_deg) < 5.0f && trn_result.overshoot_deg < 8.0f;
+  ui.setTextColor(pass ? TFT_GREEN : TFT_RED);
+  ui.setTextSize(2);
+  ui.drawString(pass ? "ACCURATE" : "IMPRECISE", 120, y);
+
+  ui.setTextColor(TFT_DARKGREY);
+  ui.setTextSize(1);
+  ui.drawString("Click: retest  Hold: back", 120, 228);
+}
+
 static void renderCurrentScreen() {
   switch (currentScreen) {
     case SCREEN_MAIN_MENU:
@@ -6212,6 +7898,7 @@ static void renderCurrentScreen() {
     case SCREEN_SET_ENC_CAL:
       drawSetEncoderCal();
       break;
+    /* SCREEN_TUNE_PPM removed */
     case SCREEN_SET_CTRL_MODE:
       drawSetControlMode();
       break;
@@ -6232,6 +7919,15 @@ static void renderCurrentScreen() {
       break;
     case SCREEN_SQUARE_TEST:
       drawSquareTestScreen();
+      break;
+    case SCREEN_STRAIGHT_TEST:
+      drawStraightTestScreen();
+      break;
+    case SCREEN_TURN_TEST:
+      drawTurnTestScreen();
+      break;
+    case SCREEN_CALIBRATE:
+      drawCalibrateScreen();
       break;
   }
 
@@ -6712,8 +8408,8 @@ void setup() {
   Serial.printf("FW: %s\n", FW_VERSION);
 
   // Filesystem for post-run logging
-  // Non-destructive mount: do NOT auto-format on failure (would erase logs).
-  spiffs_ok = SPIFFS.begin(false);
+  // Auto-format on first boot so FFat works out of the box.
+  spiffs_ok = SPIFFS.begin(true);
 #if !SERIAL_QUIET_MODE
   Serial.printf("SPIFFS: %s\n", spiffs_ok ? "OK" : "FAIL");
   printSpiffsUsageToSerial("SPIFFS");
@@ -6739,7 +8435,7 @@ void setup() {
   if (prefs_ok) {
     loadPersistedSettings();
 #if !SERIAL_QUIET_MODE
-    Serial.printf("Loaded settings: ppm=%.1f ppmL=%.1f ppmR=%.1f mtr_bias=%d\n",
+    Serial.printf("Loaded settings: ppm=%.2f ppmL=%.2f ppmR=%.2f mtr_bias=%d\n",
                   (double)pulsesPerMeter,
                   (double)pulsesPerMeterL,
                   (double)pulsesPerMeterR,
@@ -6760,23 +8456,7 @@ void setup() {
   showBVSplashScreen();
   delay(BOOT_SPLASH_MS);
 
-#if RUN_CLOUD_UPLOAD_ENABLE
-  // Best-effort time sync (fast timeout). If WiFi isn't configured/available,
-  // the RUN screen will show UTC as (unset) and logs will omit timestamps.
-  if (strlen(WIFI_SSID) > 0 && strlen(WIFI_PASSWORD) > 0) {
-    WiFi.mode(WIFI_STA);
-    if (WiFi.status() != WL_CONNECTED) {
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      const unsigned long t0 = millis();
-      while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 1500) {
-        delay(25);
-      }
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      trySyncTimeWithNtpQuick();
-    }
-  }
-#endif
+
  
 #if !SERIAL_QUIET_MODE
   Serial.println("TEST 2: M5.begin() done");
@@ -6901,29 +8581,6 @@ void loop() {
     lastScreen = currentScreen;
   }
 
-#if RUN_CLOUD_UPLOAD_ENABLE
-#if RUN_CLOUD_UPLOAD_ON_STOP
-#if RUN_CLOUD_UPLOAD_DEFERRED
-  // Deferred upload worker: retries a few times after a run ends.
-  if (!runActive && cloudUploadPending && (long)(now - cloudUploadNextAttemptMs) >= 0) {
-    cloudUploadAttempts++;
-    Serial.printf("CloudUpload: attempt %u/%u\n", (unsigned)cloudUploadAttempts, (unsigned)RUN_CLOUD_UPLOAD_MAX_RETRIES);
-    cloudUploadLastOk = cloudUploadLastRunCsv();
-    if (cloudUploadLastOk) {
-      cloudUploadPending = false;
-      Serial.println("CloudUpload: OK");
-    } else if (cloudUploadAttempts >= RUN_CLOUD_UPLOAD_MAX_RETRIES) {
-      cloudUploadPending = false;
-      Serial.println("CloudUpload: FAILED (giving up)");
-    } else {
-      cloudUploadNextAttemptMs = now + (unsigned long)RUN_CLOUD_UPLOAD_RETRY_MS;
-      Serial.printf("CloudUpload: retry in %u ms\n", (unsigned)RUN_CLOUD_UPLOAD_RETRY_MS);
-    }
-  }
-#endif
-#endif
-#endif
-
   // Auto-save calibration settings after the dial stops.
   if (settings_dirty && (now - settings_dirty_ms) >= (unsigned long)SETTINGS_AUTOSAVE_IDLE_MS) {
     if (currentScreen == SCREEN_SET_ENC_CAL || currentScreen == SCREEN_SET_CTRL_MODE
@@ -6980,20 +8637,58 @@ void loop() {
 
   // Read IMU attitude periodically (degrees)
   static unsigned long lastImuMs = 0;
-  static unsigned long lastYawMs = 0;
   if (now - lastImuMs >= (unsigned long)control_period_ms) {
     lastImuMs = now;
 
     float ax_g = 0.0f, ay_g = 0.0f, az_g = 0.0f;
     float gx_dps = 0.0f, gy_dps = 0.0f, gz_dps = 0.0f;
     float temp_c = 0.0f;
+    static uint8_t imu_consecutive_fails = 0;
     const uint32_t t0us = (uint32_t)micros();
     const bool ok = imu_present && imu6886Read(&ax_g, &ay_g, &az_g, &gx_dps, &gy_dps, &gz_dps, &temp_c);
     const uint32_t t1us = (uint32_t)micros();
     runDbg_lastImuReadUs = (t1us >= t0us) ? (t1us - t0us) : 0;
     imu_ok = ok;
+
+    if (!ok) {
+      imu_consecutive_fails++;
+      if (imu_consecutive_fails >= 5) {
+        Serial.println("IMU_I2C: consecutive fails — bus recovery!");
+        i2cBusRecovery();
+        imu_consecutive_fails = 0;
+      }
+    } else {
+      imu_consecutive_fails = 0;
+    }
+
+    imu_ax_g = ok ? ax_g : 0.0f;
+    imu_ay_g = ok ? ay_g : 0.0f;
+    imu_az_g = ok ? az_g : 0.0f;
     imu_gz_raw_dps = ok ? gz_dps : 0.0f;
     imu_gz_dps = ok ? (gz_dps - imu_gz_bias_dps) : 0.0f;
+
+    // Stall detection (relocated from gridHasWall): if commanded PWM high
+    // but horizontal acceleration is very low for >400ms, latch cutoff.
+    {
+      const int maxPwm = (abs(motor_l_speed) > abs(motor_r_speed)) ? abs(motor_l_speed) : abs(motor_r_speed);
+      const bool pwmHigh = (maxPwm > 100);
+      const float horiz_g = sqrtf(imu_ax_g * imu_ax_g + imu_ay_g * imu_ay_g);
+      const bool accelLow = fabsf(horiz_g) < 0.05f;  // ~0.05g threshold
+      static unsigned long stallStartMs = 0;
+
+      if (pwmHigh && accelLow && !stall_cutoff_latched) {
+        unsigned long nowSt = millis();
+        if (stallStartMs == 0) stallStartMs = nowSt;
+        if ((nowSt - stallStartMs) > 400u) {
+          Serial.println("STALL: High PWM with low acceleration — emergency cutoff");
+          stopAllMotors();
+          stall_cutoff_latched = true;
+        }
+      } else {
+        stallStartMs = 0;
+        if (!pwmHigh) stall_cutoff_latched = false;
+      }
+    }
 
     // While stopped (NOT during a run), refine gyro bias using a stability-gated window.
     // This is a "start line" improvement: you can sit staged for seconds/minutes and let
@@ -7079,11 +8774,14 @@ void loop() {
       imu_roll = roll_deg;
       imu_pitch = pitch_deg;
 
-      // Integrate gyro Z (deg/s) into a yaw-ish angle (will drift, but shows motion)
-      if (lastYawMs == 0) lastYawMs = now;
-      const float dt_s = (now - lastYawMs) / 1000.0f;
-      lastYawMs = now;
+      // Integrate gyro Z (deg/s) into a yaw-ish angle using bias-compensated rate.
+      const uint32_t nowUs = (uint32_t)micros();
+      if (lastYawUs == 0) lastYawUs = nowUs;
+      const uint32_t dtUs = nowUs - lastYawUs;
+      lastYawUs = nowUs;
+      const float dt_s = (float)dtUs * 1e-6f;
       if (dt_s > 0.0f && dt_s < 0.5f) {
+        // currentYaw += (rawGyroZ - gyroBiasZ) * deltaTime
         imu_yaw += imu_gz_dps * dt_s;
         // Wrap to [-180, 180]
         while (imu_yaw > 180.0f) imu_yaw -= 360.0f;
@@ -7128,6 +8826,12 @@ void loop() {
           break;
         case 7:
           enterScreen(SCREEN_SQUARE_TEST);
+          break;
+        case 8:
+          enterScreen(SCREEN_STRAIGHT_TEST);
+          break;
+        case 9:
+          enterScreen(SCREEN_TURN_TEST);
           break;
       }
     }
@@ -7175,12 +8879,43 @@ void loop() {
         gridVEdgeFromIndex(grid_vbottle_cursor, r1, c1, r2, c2);
         gridToggleBottle(r1, c1, r2, c2);
       } else if (bfs_setup_step == 6) {
-        // Gate editor: click toggles gate at cursor square
+        // Gate editor: 3-state toggle (none → gate → last gate → remove)
         uint8_t row, col;
         gridSquarePosition(grid_gate_cursor, row, col);
-        gridToggleGate(row, col);
+        bool hasGate = gridHasGate(row, col);
+        if (!hasGate) {
+          // No gate → place gate
+          if (grid_course.gate_count < MAX_GATES) {
+            grid_course.gates[grid_course.gate_count] = {row, col};
+            grid_course.gate_count++;
+          }
+        } else {
+          // Find this gate's index
+          int8_t gateIdx = -1;
+          for (uint8_t gi = 0; gi < grid_course.gate_count; gi++) {
+            if (grid_course.gates[gi].row == row && grid_course.gates[gi].col == col) {
+              gateIdx = (int8_t)gi;
+              break;
+            }
+          }
+          if (gateIdx >= 0 && grid_course.last_gate_idx != gateIdx) {
+            // Gate exists but not marked as last → mark as last
+            grid_course.last_gate_idx = gateIdx;
+          } else {
+            // Gate is already marked as last → remove gate
+            // Clear last_gate_idx if it was this gate
+            if (grid_course.last_gate_idx == gateIdx) grid_course.last_gate_idx = -1;
+            // Remove the gate
+            for (uint8_t j = (uint8_t)gateIdx; j < grid_course.gate_count - 1; j++)
+              grid_course.gates[j] = grid_course.gates[j + 1];
+            grid_course.gate_count--;
+            // Adjust last_gate_idx if it pointed after the removed gate
+            if (grid_course.last_gate_idx > gateIdx) grid_course.last_gate_idx--;
+            if (grid_course.last_gate_idx >= grid_course.gate_count) grid_course.last_gate_idx = -1;
+          }
+        }
       } else if (bfs_setup_step == 7) {
-        // Confirm screen: click starts BFS run
+        // Confirm screen: click starts BFS run via IMU calibration screen.
         bfsInitializeGraph();
         bfs_start_node = bfs_start_edge_node;
         bfs_goal_node = bfs_end_center_node;
@@ -7188,6 +8923,7 @@ void loop() {
                        bfsComputePathWithGates() :
                        bfsComputePath(bfs_start_node, bfs_goal_node);
         if (pathOk) {
+          bfsSimplifyPath();
           bfs_run_active = true;
           bfs_current_target = bfsGetNextTarget();
           savePersistedSettings();
@@ -7195,7 +8931,10 @@ void loop() {
           bfs_run_total_driven_m = 0.0f;
           bfs_run_start_ms = 0;
           bfs_run_cumulative_yaw_deg = 0.0f;
-          enterScreen(SCREEN_BFS_RUN);
+
+          // Two-stage IMU calibration before entering BFS_RUN.
+          imuCal_next_screen = SCREEN_BFS_RUN;
+          enterScreen(SCREEN_CALIBRATE);
         }
       }
       settings_dirty = true;
@@ -7208,6 +8947,20 @@ void loop() {
       if (bfs_setup_step >= 2 && bfs_setup_step <= 6) {
         // Editor steps: advance to next step
         bfs_setup_step++;
+        if (bfs_setup_step == 7) {
+          // Entering confirm screen — pre-compute path for preview display
+          bfsInitializeGraph();
+          bfs_start_node = bfs_start_edge_node;
+          bfs_goal_node = bfs_end_center_node;
+          bool previewOk = (grid_course.gate_count > 0) ?
+                            bfsComputePathWithGates() :
+                            bfsComputePath(bfs_start_node, bfs_goal_node);
+          if (previewOk) {
+            bfsSimplifyPath();
+          } else {
+            Serial.println("BFS: path preview failed (no valid path)");
+          }
+        }
       } else if (bfs_setup_step == 7) {
         // Confirm screen: hold goes back one step
         bfs_setup_step = 6;
@@ -7246,17 +8999,20 @@ void loop() {
 
       // Compute the grid-frame heading the robot faces at the start position.
       // The robot is placed at a border edge midpoint, facing INWARD.
-      {
-        uint8_t sr1 = grid_course.start_r1, sc1 = grid_course.start_c1;
+        {
+          uint8_t sr1 = grid_course.start_r1;
+          uint8_t sc1 = grid_course.start_c1;
         uint8_t sr2 = grid_course.start_r2, sc2 = grid_course.start_c2;
+        // Heading is computed in SCREEN frame (row→screenX, col→screenY)
+        // so the atan2 args are swapped vs raw grid (x=col, y=row).
         if (sr1 == sr2) {
-          // Horizontal border edge: top (row=0) faces +Y, bottom faces -Y
+          // Horizontal border edge: top (row=0) faces screen-right (+row), bottom faces screen-left
           float dr = (sr1 == 0) ? 1.0f : -1.0f;
-          bfs_run_initial_heading_deg = atan2f(dr, 0.0f) * (180.0f / (float)M_PI);
+          bfs_run_initial_heading_deg = atan2f(0.0f, dr) * (180.0f / (float)M_PI);
         } else {
-          // Vertical border edge: left (col=0) faces +X, right faces -X
+          // Vertical border edge: left (col=0) faces screen-down (+col), right faces screen-up
           float dc = (sc1 == 0) ? 1.0f : -1.0f;
-          bfs_run_initial_heading_deg = atan2f(0.0f, dc) * (180.0f / (float)M_PI);
+          bfs_run_initial_heading_deg = atan2f(dc, 0.0f) * (180.0f / (float)M_PI);
         }
       }
 
@@ -7274,6 +9030,11 @@ void loop() {
       bfs_run_active = false;
       stopAllMotors();
     }
+
+    // Settling statistics for BFS_PHASE_SETTLE (accelerometer variance)
+    static float bfs_settle_mean_g = 0.0f;
+    static float bfs_settle_m2_g = 0.0f;
+    static int   bfs_settle_n = 0;
 
     if (bfs_run_phase == BFS_PHASE_DONE) {
       stopAllMotors();
@@ -7296,13 +9057,25 @@ void loop() {
         float dy = bfs_state.nodes[nextNode].y_m - bfs_state.nodes[curNode].y_m;
         bfs_run_segment_dist_m = sqrtf(dx * dx + dy * dy);
 
-        // Target heading in grid frame (degrees, atan2 convention: Y-down → CW positive)
-        float target_heading_deg = atan2f(dy, dx) * (180.0f / (float)M_PI);
-        // Convert grid heading to IMU yaw:
-        // Grid uses Y-down so atan2 angles increase CW from above.
-        // IMU yaw increases CCW from above.  Negate the grid delta.
-        // At run start, IMU reads start_yaw when robot faces initial_heading_deg.
-        bfs_run_target_yaw_deg = bfs_run_start_yaw - (target_heading_deg - bfs_run_initial_heading_deg);
+        // Target heading in SCREEN frame (row→screenX, col→screenY):
+        // screen_dx ∝ dy (row change), screen_dy ∝ dx (col change)
+        float target_heading_deg = atan2f(dx, dy) * (180.0f / (float)M_PI);
+
+        // Compute the grid heading the robot CURRENTLY faces.
+        // At run start: IMU=start_yaw corresponded to grid heading=initial_heading_deg.
+        // Current grid heading = initial_heading + (start_yaw - current_imu_yaw)
+        // (IMU yaw decreases when turning CW in grid frame)
+        // Integrate IMU so imu_yaw is up-to-date before computing turn target.
+        imuIntegrateOnce();
+        float current_grid_heading = bfs_run_initial_heading_deg + (bfs_run_start_yaw - imu_yaw);
+        // The turn delta in grid frame is (target - current).
+        // Convert to IMU frame: IMU turns opposite to grid, so negate.
+        float turn_delta = target_heading_deg - current_grid_heading;
+        // Normalize
+        while (turn_delta > 180.0f) turn_delta -= 360.0f;
+        while (turn_delta < -180.0f) turn_delta += 360.0f;
+        // Apply relative to current fresh IMU yaw
+        bfs_run_target_yaw_deg = imu_yaw - turn_delta;
 
         // Reset segment encoder tracking
         bfs_run_enc_start_L = encoderL_count;
@@ -7310,6 +9083,8 @@ void loop() {
         bfs_run_driven_m = 0.0f;
 
         bfs_run_phase = BFS_PHASE_TURN;
+        bfs_turn_first_in_tol_ms = 0;  // reset settle timer for new turn
+        bfs_turn_start_ms = now;       // record when turn started
         Serial.printf("BFS_RUN: segment %s->%s dist=%.2f heading=%.1f target_yaw=%.1f\n",
                       bfs_state.nodes[curNode].name, bfs_state.nodes[nextNode].name,
                       (double)bfs_run_segment_dist_m, (double)(target_heading_deg),
@@ -7324,67 +9099,110 @@ void loop() {
       while (yaw_err < -180.0f) yaw_err += 360.0f;
 
       if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
-        // Close enough, start driving
+        // In tolerance — stop motors and hold for settle time (like turn test)
         stopAllMotors();
-        delay(100);  // Brief settle
-        readWheelEncodersInternal(true);  // Force fresh read after settle
+        if (bfs_turn_first_in_tol_ms == 0) bfs_turn_first_in_tol_ms = now;
+        if ((now - bfs_turn_first_in_tol_ms) >= BFS_TURN_SETTLE_MS) {
+          // Settled — enter BRAKE then SETTLE before driving
+          bfs_turn_first_in_tol_ms = 0;
+          bfs_run_brake_start_ms = now;
+          bfs_run_after_brake_phase = BFS_PHASE_SETTLE;
+          bfs_run_phase = BFS_PHASE_BRAKE;
+          Serial.printf("BFS_RUN: TURN done, entering BRAKE/SETTLE yaw=%.1f err=%.1f encL=%ld encR=%ld\n",
+                        (double)imu_yaw, (double)yaw_err,
+                        (long)encoderL_count, (long)encoderR_count);
+        }
+      } else {
+        // Out of tolerance — reset settle timer
+        bfs_turn_first_in_tol_ms = 0;
+
+        // Pivot: positive error = turn left (CCW), negative = turn right (CW)
+        int sign = (yaw_err > 0.0f) ? 1 : -1;
+
+        float pwmScale = fabsf(yaw_err) / 45.0f;
+        if (pwmScale > 1.0f) pwmScale = 1.0f;
+        if (pwmScale < 0.35f) pwmScale = 0.35f;
+        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
+        if (turnPwm < BFS_TURN_CRAWL_PWM) turnPwm = BFS_TURN_CRAWL_PWM;
+
+        setMotorsPivotPwm(sign, turnPwm);
+        applyMotorOutputs();
+      }
+
+      // Timeout safety: 5 seconds max
+      if (bfs_turn_start_ms > 0 && (now - bfs_turn_start_ms) > 5000) {
+        stopAllMotors();
+        bfs_turn_first_in_tol_ms = 0;
+        bfs_run_brake_start_ms = now;
+        bfs_run_after_brake_phase = BFS_PHASE_SETTLE;
+        bfs_run_phase = BFS_PHASE_BRAKE;
+        Serial.println("BFS_RUN: TURN timeout, forcing BRAKE/SETTLE");
+      }
+    }
+    else if (bfs_run_phase == BFS_PHASE_BRAKE) {
+      // Brief electronic brake with motors commanded to 0 PWM.
+      stopAllMotors();
+      if ((now - bfs_run_brake_start_ms) >= 150u) {
+        if (bfs_run_after_brake_phase == BFS_PHASE_SETTLE) {
+          bfs_run_settle_start_ms = now;
+          bfs_settle_mean_g = 0.0f;
+          bfs_settle_m2_g = 0.0f;
+          bfs_settle_n = 0;
+          bfs_run_phase = BFS_PHASE_SETTLE;
+        } else if (bfs_run_after_brake_phase == BFS_PHASE_ARRIVED) {
+          bfs_run_phase = BFS_PHASE_ARRIVED;
+        } else {
+          bfs_run_phase = BFS_PHASE_ARRIVED;
+        }
+        bfs_run_after_brake_phase = BFS_PHASE_IDLE;
+      }
+    }
+    else if (bfs_run_phase == BFS_PHASE_SETTLE) {
+      // Wait until accelerometer variance is near-zero before transitioning to DRIVE.
+      // Use horizontal-plane acceleration (ax, ay) as proxy for residual linear motion.
+      const float horiz_g = sqrtf(imu_ax_g * imu_ax_g + imu_ay_g * imu_ay_g);
+      bfs_settle_n += 1;
+      const float delta = horiz_g - bfs_settle_mean_g;
+      bfs_settle_mean_g += delta / (float)bfs_settle_n;
+      const float delta2 = horiz_g - bfs_settle_mean_g;
+      bfs_settle_m2_g += delta * delta2;
+
+      float var_g2 = 0.0f;
+      if (bfs_settle_n > 1) {
+        var_g2 = bfs_settle_m2_g / (float)(bfs_settle_n - 1);
+      }
+
+      const bool timeOk = (now - bfs_run_settle_start_ms) >= 80u;
+      const bool varSmall = var_g2 < (0.015f * 0.015f);
+
+      if (timeOk && varSmall) {
+        // Fresh encoder snapshot for the upcoming DRIVE
+        readWheelEncodersInternal(true);
         bfs_run_enc_start_L = encoderL_count;
         bfs_run_enc_start_R = encoderR_count;
         bfs_run_drive_start_ms = millis();  // for ENC_MODE_TIMED fallback
         bfs_run_phase = BFS_PHASE_DRIVE;
-        Serial.printf("BFS_RUN: TURN done, starting DRIVE yaw=%.1f err=%.1f encL=%ld encR=%ld\n",
-                      (double)imu_yaw, (double)yaw_err,
-                      (long)encoderL_count, (long)encoderR_count);
-      } else {
-        // Pivot: positive error = turn left (CCW), negative = turn right (CW)
-        int sign = (yaw_err > 0.0f) ? 1 : -1;
-        // Scale PWM by error magnitude for smoother approach
-        float pwmScale = fabsf(yaw_err) / 45.0f;
-        if (pwmScale > 1.0f) pwmScale = 1.0f;
-        if (pwmScale < 0.4f) pwmScale = 0.4f;
-        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
-        if (turnPwm < 110) turnPwm = 110;
-        setMotorsPivotPwm(sign, turnPwm);
-        applyMotorOutputs();
+        bfs_drive_pd_first = true;  // reset PD state for new segment
+        Serial.printf("BFS_RUN: SETTLE done, starting DRIVE encL=%ld encR=%ld var_g2=%.6f\n",
+                      (long)encoderL_count, (long)encoderR_count, (double)var_g2);
       }
     }
     else if (bfs_run_phase == BFS_PHASE_DRIVE) {
       // Force a fresh encoder read every iteration during DRIVE
       readWheelEncodersInternal(true);
 
-      // Compute distance driven using the best available source (set at boot)
-      const int32_t dL = encoderL_count - bfs_run_enc_start_L;
-      const int32_t dR = encoderR_count - bfs_run_enc_start_R;
-      const float dLcorr = (INVERT_LEFT_ENCODER_COUNT  ? -(float)dL : (float)dL);
-      const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
-      const float sL = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
-      const float sR = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
-
-      switch (enc_mode) {
-        case ENC_MODE_BOTH:
-          bfs_run_driven_m = fabsf(0.5f * (sL + sR));
-          break;
-        case ENC_MODE_LEFT_ONLY:
-          bfs_run_driven_m = fabsf(sL);
-          break;
-        case ENC_MODE_RIGHT_ONLY:
-          bfs_run_driven_m = fabsf(sR);
-          break;
-        case ENC_MODE_TIMED: {
-          // Dead-reckoning fallback: estimate distance from elapsed time
-          float elapsed_s = (millis() - bfs_run_drive_start_ms) / 1000.0f;
-          bfs_run_driven_m = elapsed_s * ENC_TIMED_SPEED_MPS;
-          break;
-        }
-      }
+      // Compute distance driven using unified encoder odometry helper
+      bfs_run_driven_m = getAverageDistanceMeters();
 
       if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
-        // Reached waypoint
-        stopAllMotors();
-        delay(150);  // Let robot physically stop before next segment
+        // Reached waypoint: closed-loop reverse brake (like straight test)
+        brakeToStop(140, 400);
+        // IMU-aware settle wait
+        { unsigned long t0settle = millis();
+          while ((millis() - t0settle) < 300) { imuIntegrateOnce(); delay(5); } }
         bfs_run_total_driven_m += bfs_run_driven_m;
         bfs_run_phase = BFS_PHASE_ARRIVED;
-        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f\n",
+        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (brakeToStop)\n",
                       (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
                       (double)bfs_run_total_driven_m);
       } else {
@@ -7393,21 +9211,49 @@ void loop() {
         while (yaw_err > 180.0f) yaw_err -= 360.0f;
         while (yaw_err < -180.0f) yaw_err += 360.0f;
 
-        float steerCorr = BFS_DRIVE_STEER_KP * yaw_err;
+        // PD steering: proportional + derivative on yaw error using micros()-based dt.
+        static float prevYawErrDeg = 0.0f;
+        static uint32_t prevYawErrUs = 0;
+        if (bfs_drive_pd_first) {
+          prevYawErrDeg = yaw_err;
+          prevYawErrUs = (uint32_t)micros();
+          bfs_drive_pd_first = false;
+        }
+        const uint32_t nowUs = (uint32_t)micros();
+        float dTerm = 0.0f;
+        if (prevYawErrUs != 0) {
+          const uint32_t dtUs = nowUs - prevYawErrUs;
+          if (dtUs > 0) {
+            const float dt_s = (float)dtUs * 1e-6f;
+            if (dt_s > 0.0f && dt_s < 0.5f) {
+              const float dErr = yaw_err - prevYawErrDeg;
+              dTerm = BFS_DRIVE_STEER_KD * (dErr / dt_s);
+            }
+          }
+        }
+        prevYawErrUs = nowUs;
+        prevYawErrDeg = yaw_err;
+
+        // Deceleration zone: boost KP in last 0.30m (like straight test)
+        float remaining = bfs_run_segment_dist_m - bfs_run_driven_m;
+        float effectiveKp = BFS_DRIVE_STEER_KP;
+        if (remaining < 0.30f) {
+          effectiveKp = BFS_DRIVE_STEER_KP * 1.5f;
+        }
+
+        float steerCorr = effectiveKp * yaw_err + dTerm;
         if (steerCorr > 60.0f) steerCorr = 60.0f;
         if (steerCorr < -60.0f) steerCorr = -60.0f;
 
-        // Brake zone near target — ramp down over last 0.5m
-        float remaining = bfs_run_segment_dist_m - bfs_run_driven_m;
+        // Deceleration zone: ramp down over last 0.20m (matching straight test)
         float speedFactor = 1.0f;
-        if (remaining < 0.5f) {
-          speedFactor = remaining / 0.5f;
-          if (speedFactor < 0.25f) speedFactor = 0.25f;
+        if (remaining < 0.20f) {
+          speedFactor = remaining / 0.20f;
+          if (speedFactor < 0.30f) speedFactor = 0.30f;
         }
 
         float basePwm = BFS_DRIVE_PWM * speedFactor;
-        // Ensure minimum PWM is high enough to actually move the robot on the ground
-        if (basePwm < 110.0f) basePwm = 110.0f;
+        if (basePwm < 105.0f) basePwm = 105.0f;
         // Positive yaw_err → need to turn LEFT (CCW, increase IMU yaw)
         // → slow left wheel, speed up right wheel
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
@@ -7417,6 +9263,9 @@ void loop() {
         if (rightPwm < 0.0f) rightPwm = 0.0f;
         if (leftPwm > 255.0f) leftPwm = 255.0f;
         if (rightPwm > 255.0f) rightPwm = 255.0f;
+        // Prevent one-wheel stall (matching straight test)
+        if (leftPwm > 0.0f && leftPwm < 100.0f) leftPwm = 100.0f;
+        if (rightPwm > 0.0f && rightPwm < 110.0f) rightPwm = 110.0f;
 
         setMotorsForwardPwm((uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f));
         applyMotorOutputs();
@@ -7517,19 +9366,34 @@ void loop() {
 
   else if (currentScreen == SCREEN_SET_ENC_CAL) {
     applyEncoderCalDialSteps(dialSteps);
+    // Single click cycles step size; hold 1s toggles L/R; hold 2s saves & exits
     if ((now - boot_ms) > 500 && M5.BtnA.wasClicked()) {
+      const int stepCount = (int)(sizeof(tunePpmSteps) / sizeof(tunePpmSteps[0]));
+      tunePpmStepIndex = (tunePpmStepIndex + 1) % stepCount;
+      settings_dirty = true;
+      settings_dirty_ms = millis();
+    }
+
+    static bool encCalHold1Handled = false;
+    static bool encCalHold2Handled = false;
+    if (!M5.BtnA.isPressed()) {
+      encCalHold1Handled = false;
+      encCalHold2Handled = false;
+    }
+    if (!encCalHold1Handled && M5.BtnA.pressedFor(1000)) {
+      encCalHold1Handled = true;
       encCalEditingLeft = !encCalEditingLeft;
     }
-    static bool encCalLongPressHandled = false;
-    if (!M5.BtnA.isPressed()) encCalLongPressHandled = false;
-    if (!encCalLongPressHandled && M5.BtnA.pressedFor(800)) {
-      encCalLongPressHandled = true;
+    if (!encCalHold2Handled && M5.BtnA.pressedFor(2000)) {
+      encCalHold2Handled = true;
       savePersistedSettings();
       settings_dirty = false;
       enterScreen(SCREEN_MAIN_MENU);
     }
     stopAllMotors();
   }
+
+  
 
   else if (currentScreen == SCREEN_SET_CTRL_MODE) {
     applyControlModeDialSteps(dialSteps);
@@ -7919,6 +9783,10 @@ void loop() {
               effectiveTargetForwardRate = effectiveTargetForwardRate * factor;
               minPwmForMotion = BRAKE_MIN_PWM;
             }
+            // Bleed the speed integral in the brake zone so the PI controller
+            // can actually reduce basePWM instead of coasting on stale history.
+            // Deeper into the zone → faster bleed (factor ranges 0.30..1.0).
+            speedIntegral *= (0.90f + 0.10f * factor);  // at edge: ×1.0, at end: ×0.93
           }
 
           // Start-slow softstart:
@@ -7953,10 +9821,38 @@ void loop() {
                                           : ((pulsesPerMeter > 1.0f) ? (pathRatePps / pulsesPerMeter) : 0.0f);
           const float actualForwardRate = actualPathRate * cosYaw;
 
+          // Fuse IMU-integrated forward velocity with encoder-derived rate for a more robust speed estimate.
+          // Static fusion state is reset via the run control reset above.
+          static float imu_vel_est = 0.0f;    // integrated IMU velocity (m/s)
+          static float imu_vel_lp = 0.0f;     // low-pass filtered IMU velocity
+          const float imu_fuse_alpha = 0.85f; // weight for encoder-derived velocity (0..1)
+
+          float fusedPathRate = actualPathRate;
+          float fusedForwardRate = actualForwardRate;
+          if (imu_present && imu_ok && dt > 0.0f && dt < 0.5f) {
+            // Use forward-axis accel (imu_ax_g) → m/s^2
+            float accel_ms2 = imu_ax_g * 9.80665f;
+            if (fabsf(accel_ms2) < 0.05f) accel_ms2 = 0.0f; // deadband
+            imu_vel_est += accel_ms2 * dt;
+            imu_vel_lp = 0.95f * imu_vel_lp + 0.05f * imu_vel_est;
+
+            // Fuse: prefer encoder estimate but back off to IMU when encoder quantization/noise present
+            fusedForwardRate = imu_fuse_alpha * actualForwardRate + (1.0f - imu_fuse_alpha) * imu_vel_lp;
+            // Derive path rate from fused forward by dividing by cosYaw when safe
+            if (fabsf(cosYaw) > 1e-3f) fusedPathRate = fusedForwardRate / cosYaw;
+            else fusedPathRate = actualPathRate;
+          } else {
+            // No IMU available/healthy: decay integrated state to avoid long drift
+            imu_vel_est *= 0.995f;
+            imu_vel_lp *= 0.995f;
+            fusedPathRate = actualPathRate;
+            fusedForwardRate = actualForwardRate;
+          }
+
           // Speed control
           // - Normal: PI in pulse-rate units
           // - Test: locked PWM to isolate heading control and reduce startup current surge
-          const float actualRateForControl_mps = (fabsf(cosYaw) >= SPEED_TURN_COS_THRESHOLD) ? actualForwardRate : actualPathRate;
+          const float actualRateForControl_mps = (fabsf(cosYaw) >= SPEED_TURN_COS_THRESHOLD) ? fusedForwardRate : fusedPathRate;
           float targetRatePpsForLog = 0.0f;
           float actualRatePpsForLog = 0.0f;
           float speedErrPps = 0.0f;
@@ -8061,6 +9957,28 @@ void loop() {
             if (basePWMf < RUN_START_ASSIST_PWM) basePWMf = RUN_START_ASSIST_PWM;
           }
 #endif
+
+          // Enforce a maximum safe forward speed by scaling back base PWM when
+          // the fused forward-rate estimate exceeds `MAX_ALLOWED_SPEED_MPS`.
+          // Uses a small hysteresis to avoid chatter.
+          {
+            const float MAX_ALLOWED_SPEED_MPS = 0.25f;
+            const float SPEED_HYST_MPS = 0.02f;
+            static unsigned long run_last_overspeed_ms = 0;
+            if (actualRateForControl_mps > (MAX_ALLOWED_SPEED_MPS + SPEED_HYST_MPS)) {
+              // Aggressive cut: scale down proportionally but allow cutting to 10% as safe floor
+              float scale = MAX_ALLOWED_SPEED_MPS / actualRateForControl_mps;
+              if (scale < 0.10f) scale = 0.10f; // allow aggressive reduction
+              basePWMf *= scale;
+              // Also reduce integrator to avoid immediate re-raise of basePWMf
+              speedIntegral *= 0.25f;
+              runWarnTooFast = true;
+              run_last_overspeed_ms = now;
+            } else if (actualRateForControl_mps < (MAX_ALLOWED_SPEED_MPS - SPEED_HYST_MPS)) {
+              // Clear warning and allow integrator to recover slowly
+              runWarnTooFast = false;
+            }
+          }
 
           // Phased CAN: kick at the beginning of each DRIVE segment to avoid post-turn stalling.
           // (This is independent of run-start assist, which only applies at the very beginning of the run.)
@@ -8591,11 +10509,11 @@ void loop() {
                 if (canPhase == CANP_DRIVE_STRAIGHT0) {
                   beginTurnPhase(CANP_TURN_TO_OFFSET, +thetaDeg);
                 } else if (canPhase == CANP_DRIVE_DIAG_OUT) {
-                  beginTurnPhase(CANP_TURN_TO_PARALLEL, -thetaDeg);
+                  beginTurnPhase(CANP_TURN_TO_PARALLEL, 0.0f);
                 } else if (canPhase == CANP_DRIVE_PARALLEL) {
                   beginTurnPhase(CANP_TURN_BACK_IN, -thetaDeg);
                 } else if (canPhase == CANP_DRIVE_DIAG_IN) {
-                  beginTurnPhase(CANP_TURN_TO_CENTER, +thetaDeg);
+                  beginTurnPhase(CANP_TURN_TO_CENTER, 0.0f);
                 } else {
                   // finished
                   lastRunStopReason = "DIST";
@@ -9133,7 +11051,67 @@ void loop() {
           if (!(canPhasedActive && (canPhase == CANP_TURN_TO_OFFSET || canPhase == CANP_TURN_TO_PARALLEL ||
                                     canPhase == CANP_TURN_BACK_IN || canPhase == CANP_TURN_TO_CENTER ||
                                     canPhase == CANP_TURN_SETTLE))) {
-            setMotorsForwardPwm((uint8_t)(leftPWMf + 0.5f), (uint8_t)(rightPWMf + 0.5f));
+            // Auto-boost: if we're commanding forward motion but encoders show no movement,
+            // gently increase PWM to try to overcome static friction. Conservative defaults
+            // are used to avoid unsafe commands. Boost only applies when target > 0.
+            const uint32_t sinceEncMoveMs = (lastMotionMs != 0) ? ((uint32_t)now - (uint32_t)lastMotionMs) : 0u;
+            const uint32_t NO_MOTION_BOOST_AFTER_MS = 300u; // wait this long before attempting boost
+            const float NO_MOTION_BOOST_PWM = 20.0f;       // additive PWM to try
+            if (effectiveTargetForwardRate > 0.0f && sinceEncMoveMs >= NO_MOTION_BOOST_AFTER_MS && sinceEncMoveMs < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+              if (leftPWMf > 0.0f) {
+                leftPWMf += NO_MOTION_BOOST_PWM;
+                if (leftPWMf > 255.0f) leftPWMf = 255.0f;
+              }
+              if (rightPWMf > 0.0f) {
+                rightPWMf += NO_MOTION_BOOST_PWM;
+                if (rightPWMf > 255.0f) rightPWMf = 255.0f;
+              }
+            }
+            // Prefer pivot-in-place whenever forward target is essentially zero.
+            // This issues opposing wheel commands (one forward, one reverse) so the robot
+            // turns without large lateral drift. Pivot PWM is clamped for safety.
+            const float PIVOT_MAX_PWM = 200.0f; // cap pivot PWM for safety
+            float finalLeftPwmF = leftPWMf;
+            float finalRightPwmF = rightPWMf;
+            bool usePivot = (effectiveTargetForwardRate <= 0.05f);
+            float pivotPwmF = 0.0f;
+            if (usePivot) {
+              int turnSign = (yawErrDegForLog >= 0.0f) ? 1 : -1;
+              pivotPwmF = basePWMf + fabsf(corr);
+              if (pivotPwmF < 110.0f) pivotPwmF = 110.0f;
+              if (pivotPwmF > PIVOT_MAX_PWM) pivotPwmF = PIVOT_MAX_PWM;
+              // Represent pivot as opposing wheel pwms for overspeed handling
+              finalLeftPwmF = pivotPwmF;
+              finalRightPwmF = pivotPwmF;
+            } else {
+              finalLeftPwmF = leftPWMf;
+              finalRightPwmF = rightPWMf;
+            }
+
+            // Apply aggressive overspeed throttling to the final PWM outputs every tick.
+            {
+              const float MAX_ALLOWED_SPEED_MPS = 0.25f;
+              const float SPEED_HYST_MPS = 0.02f;
+              if (actualRateForControl_mps > (MAX_ALLOWED_SPEED_MPS + SPEED_HYST_MPS)) {
+                float scale = MAX_ALLOWED_SPEED_MPS / actualRateForControl_mps;
+                if (scale < 0.10f) scale = 0.10f;
+                finalLeftPwmF *= scale;
+                finalRightPwmF *= scale;
+                speedIntegral *= 0.25f;
+                runWarnTooFast = true;
+              } else if (actualRateForControl_mps < (MAX_ALLOWED_SPEED_MPS - SPEED_HYST_MPS)) {
+                runWarnTooFast = false;
+              }
+            }
+
+            if (usePivot) {
+              int turnSign = (yawErrDegForLog >= 0.0f) ? 1 : -1;
+              // Use the pivotPwmF magnitude but scaled per overspeed above
+              uint8_t applyPwm = (uint8_t)(fminf(fmaxf((finalLeftPwmF + 0.5f), 0.0f), 255.0f));
+              setMotorsPivotPwm(turnSign, applyPwm);
+            } else {
+              setMotorsForwardPwm((uint8_t)(finalLeftPwmF + 0.5f), (uint8_t)(finalRightPwmF + 0.5f));
+            }
           }
 
           // Apply motor outputs now so command-path register fields match this tick's command.
@@ -9197,9 +11175,23 @@ void loop() {
           s.satShift = satShift;
           s.imuReadUs = (float)runDbg_lastImuReadUs;
           s.motorWriteUs = (float)runDbg_lastMotorWriteUs;
-          // Append (decimated) log sample
-          if (runLogEveryN <= 1 || ((runLogTick % runLogEveryN) == 0)) {
-            runLogAppend(s);
+          // Telemetry: left/right wheel distance (m) for CSV
+          {
+            const int32_t dL = encoderL_count - runStartEncL;
+            const int32_t dR = encoderR_count - runStartEncR;
+            const float dLcorr = INVERT_LEFT_ENCODER_COUNT ? -(float)dL : (float)dL;
+            const float dRcorr = INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR;
+            s.distL = (pulsesPerMeterL > 1.0f) ? (dLcorr / pulsesPerMeterL) : 0.0f;
+            s.distR = (pulsesPerMeterR > 1.0f) ? (dRcorr / pulsesPerMeterR) : 0.0f;
+          }
+          // Append at 10 Hz (every 100 ms) so CSV has currentYaw, targetYaw, distL, distR at 10 Hz
+          static unsigned long lastRunLogMs = 0;
+          if ((now - runStartMs) < 100u) lastRunLogMs = 0;
+          if ((now - lastRunLogMs) >= 100u) {
+            lastRunLogMs = now;
+            if (runLogEveryN <= 1 || ((runLogTick % runLogEveryN) == 0)) {
+              runLogAppend(s);
+            }
           }
           runLogTick++;
         }
@@ -9353,6 +11345,41 @@ void loop() {
         motor_r_speed = 0;
       }
 
+      // HW test: motion detection + conservative auto-boost for manual motor control
+      {
+        if (motor_enabled && lastMotionMs_hw == 0) {
+          // initialize trackers on first enable
+          readWheelEncodersInternal(true);
+          lastMotionEncL_hw = encoderL_count;
+          lastMotionEncR_hw = encoderR_count;
+          lastMotionMs_hw = now;
+        }
+        // check for encoder movement
+        const int32_t dML = encoderL_count - lastMotionEncL_hw;
+        const int32_t dMR = encoderR_count - lastMotionEncR_hw;
+        const float motionAbs = (fabsf((float)dML) + fabsf((float)dMR)) * 0.5f;
+        if (motionAbs >= (float)RUN_NO_MOTION_MIN_PULSES) {
+          lastMotionEncL_hw = encoderL_count;
+          lastMotionEncR_hw = encoderR_count;
+          lastMotionMs_hw = now;
+        }
+        const uint32_t sinceEncMoveMs_hw = (lastMotionMs_hw != 0) ? ((uint32_t)now - (uint32_t)lastMotionMs_hw) : 0u;
+        const uint32_t NO_MOTION_BOOST_AFTER_MS = 300u;
+        const float NO_MOTION_BOOST_PWM = 20.0f;
+        if (motor_enabled && sinceEncMoveMs_hw >= NO_MOTION_BOOST_AFTER_MS && sinceEncMoveMs_hw < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+          if (motor_l_speed > 0) {
+            int v = (int)motor_l_speed + (int)NO_MOTION_BOOST_PWM;
+            if (v > 255) v = 255;
+            motor_l_speed = (uint8_t)v;
+          }
+          if (motor_r_speed > 0) {
+            int v = (int)motor_r_speed + (int)NO_MOTION_BOOST_PWM;
+            if (v > 255) v = 255;
+            motor_r_speed = (uint8_t)v;
+          }
+        }
+      }
+
       applyMotorOutputs();
     }
   }
@@ -9362,7 +11389,7 @@ void loop() {
     if ((now - boot_ms) > 500 && M5.BtnA.wasClicked()) {
       if (imu_present) {
         delay(500);
-        calibrateImuGyroBias();
+        calibrateImuGyroBias(); // Declaration is in Robot.cpp
         imu_yaw = 0.0f;  // Reset yaw after recalibration
       }
     }
@@ -9374,6 +11401,20 @@ void loop() {
       suppressNextClick = true;
       enterScreen(SCREEN_MAIN_MENU);
     }
+    stopAllMotors();
+  }
+
+  else if (currentScreen == SCREEN_CALIBRATE) {
+    // Run the non-blocking two-stage IMU calibration.
+    runImuCalibration();
+
+    // When calibration completes, automatically transition to the next screen
+    // (typically SCREEN_BFS_RUN) as configured by the caller.
+    if (!imuCal_running && imuCal_done) {
+      imuCal_done = false;
+      enterScreen(imuCal_next_screen);
+    }
+
     stopAllMotors();
   }
 
@@ -9440,6 +11481,83 @@ void loop() {
     }
   }
 
+  // ---- STRAIGHT TEST input ----
+  else if (currentScreen == SCREEN_STRAIGHT_TEST) {
+    if (str_phase != STR_IDLE && str_phase != STR_DONE) {
+      strTestTick();
+    }
+
+    static bool strLongPressHandled = false;
+    if (!M5.BtnA.isPressed()) strLongPressHandled = false;
+    if (!strLongPressHandled && M5.BtnA.pressedFor(800)) {
+      strLongPressHandled = true;
+      suppressNextClick = true;
+      stopAllMotors();
+      str_phase = STR_IDLE;
+      enterScreen(SCREEN_MAIN_MENU);
+    }
+
+    if ((now - boot_ms) > 500 && M5.BtnA.wasClicked() && (now - last_button_ms) > 250) {
+      last_button_ms = now;
+      if (str_phase == STR_IDLE || str_phase == STR_DONE) {
+        strTestStart();
+      } else {
+        stopAllMotors();
+        str_phase = STR_IDLE;
+      }
+    }
+
+    if (str_phase == STR_IDLE && dialSteps != 0) {
+      str_target_m += dialSteps * 0.10f;
+      if (str_target_m < 0.20f) str_target_m = 0.20f;
+      if (str_target_m > 5.00f) str_target_m = 5.00f;
+    }
+  }
+
+  // ---- TURN TEST input ----
+  else if (currentScreen == SCREEN_TURN_TEST) {
+    if (trn_phase != TRN_IDLE && trn_phase != TRN_DONE) {
+      trnTestTick();
+    }
+
+    // 2s hold: back to menu
+    static bool trnExitHandled = false;
+    if (!M5.BtnA.isPressed()) trnExitHandled = false;
+    if (!trnExitHandled && M5.BtnA.pressedFor(2000)) {
+      trnExitHandled = true;
+      suppressNextClick = true;
+      stopAllMotors();
+      trn_phase = TRN_IDLE;
+      enterScreen(SCREEN_MAIN_MENU);
+    }
+
+    // 1s hold: toggle direction (only when idle)
+    static bool trnDirHandled = false;
+    if (!M5.BtnA.isPressed()) trnDirHandled = false;
+    if (!trnDirHandled && M5.BtnA.pressedFor(1000) && (trn_phase == TRN_IDLE || trn_phase == TRN_DONE)) {
+      trnDirHandled = true;
+      suppressNextClick = true;
+      trn_direction = -trn_direction;  // toggle LEFT/RIGHT
+      Serial.printf("TRN: direction toggled to %s\n", trn_direction < 0 ? "RIGHT" : "LEFT");
+    }
+
+    if ((now - boot_ms) > 500 && M5.BtnA.wasClicked() && (now - last_button_ms) > 250) {
+      last_button_ms = now;
+      if (trn_phase == TRN_IDLE || trn_phase == TRN_DONE) {
+        trnTestStart();
+      } else {
+        stopAllMotors();
+        trn_phase = TRN_IDLE;
+      }
+    }
+
+    if (trn_phase == TRN_IDLE && dialSteps != 0) {
+      trn_target_deg += dialSteps * 5.0f;
+      if (trn_target_deg < 5.0f) trn_target_deg = 5.0f;
+      if (trn_target_deg > 360.0f) trn_target_deg = 360.0f;
+    }
+  }
+
   // Render the active screen
   static unsigned long lastDisplay = 0;
   if (now - lastDisplay > DISPLAY_REFRESH_MS) {
@@ -9478,4 +11596,64 @@ void loop() {
                   encoderR_count);
   }
 #endif
+}
+
+// Blocking calibration implementation that updates the IMU CAL screen live.
+static void calibrateImuGyroBias() {
+  if (!imu_present) return;
+
+  imu_calibrating = true;
+  imu_cal_progress = 0;
+
+  const unsigned long t0 = millis();
+  // 1.5s hands-off wait
+  while ((millis() - t0) < 1500u) {
+    float ax, ay, az, gx, gy, gz, tmp;
+    (void)imu6886Read(&ax, &ay, &az, &gx, &gy, &gz, &tmp);
+    imu_cal_progress = (int)(((millis() - t0) * 15u) / 1500u);
+    if (imu_cal_progress < 0) imu_cal_progress = 0;
+    if (imu_cal_progress > 15) imu_cal_progress = 15;
+    drawImuCalScreen();
+    ui.pushSprite(0, 0);
+    yield();
+  }
+
+  double sumGz = 0.0;
+  int samples = 0;
+  int attempts = 0;
+  const int MAX_ATTEMPTS = 3000;  // bail if IMU fails repeatedly
+  while (samples < 1000 && attempts < MAX_ATTEMPTS) {
+    float ax, ay, az, gx, gy, gz, tmp;
+    const bool ok = imu6886Read(&ax, &ay, &az, &gx, &gy, &gz, &tmp);
+    attempts++;
+    if (ok) {
+      sumGz += (double)gz;
+      samples += 1;
+      imu_cal_progress = 15 + (samples * 85) / 1000;
+      if (imu_cal_progress > 100) imu_cal_progress = 100;
+    }
+    if ((attempts & 0xF) == 0) {
+      // update display every 16 attempts for smooth progress bar animation
+      drawImuCalScreen();
+      ui.pushSprite(0, 0);
+    }
+    yield();
+  }
+  if (samples < 1000) {
+    Serial.printf("IMU CAL: only got %d/1000 samples in %d attempts — sensor may be disconnected\n", samples, attempts);
+  }
+
+  const double avg = (samples > 0) ? (sumGz / (double)samples) : 0.0;
+  imu_gz_bias_dps = (float)avg;
+  if (fabsf(imu_gz_bias_dps) > 20.0f) imu_gz_bias_dps = 0.0f;
+  if (imu_gz_bias_dps > IMU_GZ_BIAS_CLAMP_DPS) imu_gz_bias_dps = IMU_GZ_BIAS_CLAMP_DPS;
+  if (imu_gz_bias_dps < -IMU_GZ_BIAS_CLAMP_DPS) imu_gz_bias_dps = -IMU_GZ_BIAS_CLAMP_DPS;
+
+  imu_gz_dps = imu_gz_raw_dps - imu_gz_bias_dps;
+  persistImuGyroBiasIfNeeded();
+
+  imu_cal_progress = 100;
+  drawImuCalScreen();
+  ui.pushSprite(0, 0);
+  imu_calibrating = false;
 }
