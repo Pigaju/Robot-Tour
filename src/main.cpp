@@ -40,11 +40,11 @@ static M5Canvas ui(&M5.Display);
 // I2C speed: higher can reduce loop blocking/phase lag, but only if your wiring/devices are stable.
 // We default to 100kHz because 400kHz can cause intermittent I2C failures on some setups (long wires/noisy power),
 // which is much worse (no encoder updates => no stop, no steering).
-#define I2C_CLOCK_HZ 50000
+#define I2C_CLOCK_HZ 100000
 
 // I2C bus guard delay (µs) between back-to-back transactions.
 // Prevents bus contention when 5 devices share the bus (2 motors, 2 encoders, IMU).
-#define I2C_GUARD_US 300
+#define I2C_GUARD_US 150
 static inline void i2cGuard() { delayMicroseconds(I2C_GUARD_US); }
 
 // I2C consecutive error tracking for automatic bus recovery
@@ -216,6 +216,27 @@ struct GridCourse {
 static GridCourse grid_course;
 static uint8_t bfs_gate_nodes[MAX_GATES]; // Virtual nodes at gate square centers
 static uint8_t bfs_sq_center[GRID_MAX_DIM][GRID_MAX_DIM]; // Center sub-node ID for each square (row,col)
+
+// ========================================================================
+// MANUAL WAYPOINT SYSTEM (replaces BFS pathfinding for 2026 rule compliance)
+// ========================================================================
+// The 2026 rules (8.i.v) prohibit algorithms that find the optimal route.
+// Instead, competitors manually determine the route and enter waypoints.
+// Waypoints are placed on a 25cm sub-grid (11 cols x 9 rows) covering
+// the 250cm x 200cm track, allowing diagonal and fractional-square moves.
+#define MANUAL_WP_MAX 32
+#define MANUAL_GRID_COLS 11   // 0-10 at 25cm = 250cm
+#define MANUAL_GRID_ROWS 9    // 0-8 at 25cm = 200cm
+#define MANUAL_GRID_SPACING_CM 25
+
+static uint8_t manual_wp_count = 0;
+static uint8_t manual_wp_col[MANUAL_WP_MAX]; // col index on 25cm grid (0-10)
+static uint8_t manual_wp_row[MANUAL_WP_MAX]; // row index on 25cm grid (0-8)
+// Cursor position for waypoint editor
+static uint8_t manual_wp_cursor_col = 0;
+static uint8_t manual_wp_cursor_row = 0;
+// Flat index for dial scrolling: cursor_idx = row * MANUAL_GRID_COLS + col
+static int manual_wp_cursor_idx = 0;
 
 // Initialize grid_course with sensible defaults
 // Fixed grid: 6 columns x 5 rows of intersections = 5x4 squares = 250x200cm at 50cm spacing
@@ -845,8 +866,8 @@ static bool bfsComputePathWithGates() {
   if (ng > 6) ng = 6;  // Cap at 6! = 720 permutations
 
   // If a last gate is pinned, separate it out; only permute the rest
-  int8_t pinned_last = grid_course.last_gate_idx;
-  if (pinned_last >= ng) pinned_last = -1; // invalid → auto
+  // (2026 rules: gate order is not enforced, so always optimize freely)
+  int8_t pinned_last = -1;
 
   // Build indices to permute (excluding pinned gate if any)
   uint8_t perm[MAX_GATES];
@@ -1050,8 +1071,14 @@ static void bfsSimplifyPath() {
     if (fabsf(cross) > 0.001f) {
       // Not collinear — keep this waypoint (direction change needed)
       simplified[slen++] = cur;
+    } else {
+      // Collinear — only skip if the direct prev→next line is clear of walls
+      if (!bfsEdgeClearOfWalls(bfs_state.nodes[prev].x_m, bfs_state.nodes[prev].y_m,
+                               bfs_state.nodes[next].x_m, bfs_state.nodes[next].y_m, 0.0f)) {
+        simplified[slen++] = cur;  // wall in the way, keep waypoint
+      }
+      // else: clear path, skip this intermediate node
     }
-    // else: collinear — skip this intermediate node
   }
 
   simplified[slen++] = bfs_state.path[bfs_state.path_length - 1];  // always keep goal
@@ -1078,6 +1105,61 @@ static void bfsAdvancePath() {
     bfs_state.path_index++;
     bfs_state.current_node = bfs_state.path[bfs_state.path_index];
   }
+}
+
+// ========================================================================
+// Convert manual waypoints into bfs_state path format for the runner.
+// This populates bfs_state.nodes[] and path[] so the existing BFS_PHASE_*
+// run execution code works unchanged, WITHOUT any route-solving algorithm.
+// ========================================================================
+static bool manualWaypointsToPath() {
+  if (manual_wp_count == 0) return false;
+
+  memset(&bfs_state, 0, sizeof(bfs_state));
+
+  // Node 0: start position (border edge midpoint, matches current grid)
+  float spacing_m = (float)grid_course.spacing_cm * 0.01f;
+  float sx = 0.5f * ((float)grid_course.start_c1 + (float)grid_course.start_c2) * spacing_m;
+  float sy = 0.5f * ((float)grid_course.start_r1 + (float)grid_course.start_r2) * spacing_m;
+  bfs_state.nodes[0].id = 0;
+  snprintf(bfs_state.nodes[0].name, sizeof(bfs_state.nodes[0].name), "S");
+  bfs_state.nodes[0].x_m = sx;
+  bfs_state.nodes[0].y_m = sy;
+
+  // Nodes 1..N: manual waypoints on 25cm grid
+  for (uint8_t i = 0; i < manual_wp_count; i++) {
+    uint8_t nid = i + 1;
+    bfs_state.nodes[nid].id = nid;
+    snprintf(bfs_state.nodes[nid].name, sizeof(bfs_state.nodes[nid].name), "W%d", (int)i);
+    bfs_state.nodes[nid].x_m = (float)manual_wp_col[i] * ((float)MANUAL_GRID_SPACING_CM * 0.01f);
+    bfs_state.nodes[nid].y_m = (float)manual_wp_row[i] * ((float)MANUAL_GRID_SPACING_CM * 0.01f);
+  }
+
+  bfs_state.node_count = manual_wp_count + 1;
+
+  // Build path: start → wp0 → wp1 → ... → wpN-1
+  bfs_state.path[0] = 0; // start node
+  for (uint8_t i = 0; i < manual_wp_count; i++) {
+    bfs_state.path[i + 1] = i + 1;
+  }
+  bfs_state.path_length = manual_wp_count + 1;
+  bfs_state.path_index = 0;
+  bfs_state.current_node = 0;
+  bfs_state.path_valid = true;
+
+  // Compute total path distance
+  bfs_state.path_dist_m = 0.0f;
+  for (uint16_t si = 0; si + 1 < bfs_state.path_length; si++) {
+    uint8_t a = bfs_state.path[si], b = bfs_state.path[si + 1];
+    float dx = bfs_state.nodes[b].x_m - bfs_state.nodes[a].x_m;
+    float dy = bfs_state.nodes[b].y_m - bfs_state.nodes[a].y_m;
+    bfs_state.path_dist_m += sqrtf(dx * dx + dy * dy);
+  }
+
+  Serial.printf("MANUAL: %d waypoints, path_len=%d, total_dist=%.2fm\n",
+                (int)manual_wp_count, (int)bfs_state.path_length,
+                (double)bfs_state.path_dist_m);
+  return true;
 }
 
 // Competition limits (update these when rules are confirmed)
@@ -2894,26 +2976,28 @@ void runImuCalibration() {
   }
 
   if (imuCal_stage == 1) {
-    // Stage 1: hands-off wait (STAY STILL) using millis().
+    // Stage 1: hands-off wait (STAY STILL) — 0.5s is enough with I2C at 100kHz.
     unsigned long elapsed = now - imuCal_stage_start_ms;
-    imu_cal_progress = (int)((elapsed * 15u) / 1500u); // 0-15% during stage 1
+    imu_cal_progress = (int)((elapsed * 15u) / 500u); // 0-15% during stage 1
     if (imu_cal_progress > 15) imu_cal_progress = 15;
-    if ((now - imuCal_stage_start_ms) >= 1500u) {
+    if ((now - imuCal_stage_start_ms) >= 500u) {
       imuCal_stage = 2;
       imuCal_stage_start_ms = now;
     }
   } else if (imuCal_stage == 2) {
-    // Stage 2: accumulate 1000 gyro Z samples.
-    if (imuCal_samples < 1000) {
-      float ax_g = 0.0f, ay_g = 0.0f, az_g = 0.0f;
-      float gx_dps = 0.0f, gy_dps = 0.0f, gz_dps_local = 0.0f;
-      float temp_c = 0.0f;
-      const bool ok = imu6886Read(&ax_g, &ay_g, &az_g, &gx_dps, &gy_dps, &gz_dps_local, &temp_c);
-      if (ok) {
-        imuCal_sumGz += (double)gz_dps_local;
-        imuCal_samples += 1;
-        imu_cal_progress = 15 + (imuCal_samples * 85) / 1000; // 15-100%
-        if (imu_cal_progress > 100) imu_cal_progress = 100;
+    // Stage 2: accumulate 500 gyro Z samples (batch 8 per loop call for speed).
+    if (imuCal_samples < 500) {
+      for (int batch = 0; batch < 8 && imuCal_samples < 500; batch++) {
+        float ax_g = 0.0f, ay_g = 0.0f, az_g = 0.0f;
+        float gx_dps = 0.0f, gy_dps = 0.0f, gz_dps_local = 0.0f;
+        float temp_c = 0.0f;
+        const bool ok = imu6886Read(&ax_g, &ay_g, &az_g, &gx_dps, &gy_dps, &gz_dps_local, &temp_c);
+        if (ok) {
+          imuCal_sumGz += (double)gz_dps_local;
+          imuCal_samples += 1;
+          imu_cal_progress = 15 + (imuCal_samples * 85) / 500; // 15-100%
+          if (imu_cal_progress > 100) imu_cal_progress = 100;
+        }
       }
     } else {
       // Finalize bias.
@@ -3182,9 +3266,9 @@ enum ScreenState {
 static ScreenState currentScreen = SCREEN_MAIN_MENU;
 static ScreenState imuCal_next_screen = SCREEN_MAIN_MENU;
 
-static const int NUM_MENU_ITEMS = 10;
+static const int NUM_MENU_ITEMS = 11;
 static const char* menuNames[NUM_MENU_ITEMS] = {
-  "BFS NAV",
+  "NAV",
   "TIME",
   "BIAS TEST",
   "ENC CAL",
@@ -3194,6 +3278,7 @@ static const char* menuNames[NUM_MENU_ITEMS] = {
   "SQ TEST",
   "STRAIGHT",
   "TURN 90",
+  "CLR LOGS",
 };
 
 static int selectedMenuItem = 0;
@@ -3213,7 +3298,7 @@ static float bfs_target_angle = 0.0f;
 //  3 = Bottles editor  (dial scrolls nodes, click toggles bottle)
 //  4 = Gates editor    (dial scrolls edges, click toggles gate)
 //  5 = Confirm / GO    (long-press to start run)
-#define BFS_SETUP_STEP_COUNT 8
+#define BFS_SETUP_STEP_COUNT 9
 static int bfs_setup_step = 0;
 
 // BFS Run state machine
@@ -3236,7 +3321,10 @@ static float bfs_run_driven_m = 0.0f;        // Distance driven in current segme
 static int32_t bfs_run_enc_start_L = 0;
 static int32_t bfs_run_enc_start_R = 0;
 static float bfs_run_total_driven_m = 0.0f;
+static float bfs_run_total_path_dist_m = 0.0f;  // Sum of all segment distances for time scaling
+static float bfs_run_effective_drive_time_s = 0.0f; // runTimeS minus estimated non-driving overhead
 static unsigned long bfs_run_start_ms = 0;
+static bool bfs_run_initialized = false;  // reset when starting new run, set on first BFS_RUN entry
 static unsigned long bfs_run_drive_start_ms = 0;  // for ENC_MODE_TIMED fallback
 static unsigned long bfs_run_brake_start_ms = 0;
 static unsigned long bfs_run_settle_start_ms = 0;
@@ -3245,15 +3333,30 @@ static bool bfs_drive_pd_first = true;            // Reset PD state on first DRI
 static unsigned long bfs_turn_first_in_tol_ms = 0; // For turn settle hold (like turn test)
 static unsigned long bfs_turn_start_ms = 0;         // When current TURN phase started
 
+// BFS turn PID state (reset between segments)
+static float bfs_turn_integral = 0.0f;
+static float bfs_turn_prev_err = 0.0f;
+static float bfs_turn_dFilt = 0.0f;
+static uint32_t bfs_turn_pid_last_us = 0;
+
+// BFS drive PID state (reset between segments)
+static float bfs_drive_integral = 0.0f;
+static float bfs_drive_prev_err = 0.0f;
+static float bfs_drive_dFilt = 0.0f;
+static uint32_t bfs_drive_pid_last_us = 0;
+static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering ramp
+#define BFS_DRIVE_STEER_RAMP_MS 150  // suppress steering for this long after turn→drive
+
 // BFS run tuning
 #define BFS_TURN_PWM 130
-#define BFS_TURN_TOLERANCE_DEG 2.0f
+#define BFS_TURN_TOLERANCE_DEG 5.0f
 #define BFS_TURN_SETTLE_MS 300
 #define BFS_TURN_CRAWL_DEG 15.0f
 #define BFS_TURN_CRAWL_PWM 115
-#define BFS_DRIVE_PWM 120
-#define BFS_DRIVE_STEER_KP 3.0f
-#define BFS_DRIVE_STEER_KD 0.8f
+#define BFS_DRIVE_PWM 130
+#define BFS_DRIVE_STEER_KP 2.0f
+#define BFS_DRIVE_STEER_KI 1.0f
+#define BFS_DRIVE_STEER_KD 0.06f
 #define BFS_ARRIVE_TOLERANCE_M 0.08f
 
 // Unified encoder odometry helper for BFS navigation.
@@ -3438,6 +3541,14 @@ static void loadPersistedSettings() {
   bfs_start_node = 0;
   bfs_goal_node = 0;
 
+  // Load manual waypoints
+  manual_wp_count = (uint8_t)prefs.getUChar("mw_n", 0);
+  if (manual_wp_count > MANUAL_WP_MAX) manual_wp_count = 0;
+  if (manual_wp_count > 0) {
+    prefs.getBytes("mw_c", manual_wp_col, manual_wp_count);
+    prefs.getBytes("mw_r", manual_wp_row, manual_wp_count);
+  }
+
   // Enforce competition ranges
   if (runDistanceM < RUN_DISTANCE_MIN_M) runDistanceM = RUN_DISTANCE_MIN_M;
   if (runDistanceM > RUN_DISTANCE_MAX_M) runDistanceM = RUN_DISTANCE_MAX_M;
@@ -3500,6 +3611,13 @@ static void savePersistedSettings() {
   }
   // Save last gate index
   prefs.putChar("gc_lgi", grid_course.last_gate_idx);
+
+  // Save manual waypoints
+  prefs.putUChar("mw_n", manual_wp_count);
+  if (manual_wp_count > 0) {
+    prefs.putBytes("mw_c", manual_wp_col, manual_wp_count);
+    prefs.putBytes("mw_r", manual_wp_row, manual_wp_count);
+  }
 }
 
 static bool runActive = false;
@@ -3843,9 +3961,8 @@ static float runDebug_turnRemainingDeg = NAN;
 #define SPEED_TURN_COS_THRESHOLD 0.70f
 
 static inline float wrapDeg(float deg) {
-  while (deg > 180.0f) deg -= 360.0f;
-  while (deg < -180.0f) deg += 360.0f;
-  return deg;
+  float r = fmodf(deg + 180.0f, 360.0f);
+  return (r < 0.0f) ? r + 180.0f : r - 180.0f;
 }
 
 static inline float clamp01(float x) {
@@ -4597,8 +4714,7 @@ static void imuIntegrateOnce() {
     float dt_s = (float)(nowUs - lastYawUs) * 1e-6f;
     if (dt_s > 0.0f && dt_s < 0.5f) {
       imu_yaw += gz_corr * dt_s;
-      while (imu_yaw > 180.0f) imu_yaw -= 360.0f;
-      while (imu_yaw < -180.0f) imu_yaw += 360.0f;
+      imu_yaw = wrapDeg(imu_yaw);
     }
   }
   lastYawUs = nowUs;
@@ -4610,13 +4726,21 @@ static void imuIntegrateOnce() {
 // each motor individually once its encoder shows zero velocity.  This ensures
 // both wheels stop at the same time regardless of motor asymmetry.
 static void brakeToStop(uint8_t brakePwm, unsigned long maxBrakeMs) {
-  setMotorsReversePwm(brakePwm, brakePwm);
+  // Progressive braking: start at lower PWM, ramp up only if still moving.
+  // Prevents wheel lock/skid on smooth surfaces (hardwood).
+  const uint8_t startPwm = (brakePwm > 80) ? (brakePwm / 2) : brakePwm;
+  uint8_t currentPwm = startPwm;
+  setMotorsReversePwm(currentPwm, currentPwm);
   applyMotorOutputs();
 
   // If encoders unavailable, fall back to fixed-delay brake
   readWheelEncodersForce();
   if (!encoderL_found && !encoderR_found) {
-    delay(maxBrakeMs / 2);
+    // Non-blocking fallback: poll IMU while waiting
+    uint32_t fallbackEndUs = (uint32_t)micros() + (maxBrakeMs / 2) * 1000u;
+    while ((int32_t)(fallbackEndUs - (uint32_t)micros()) > 0) {
+      imuIntegrateOnce();
+    }
     stopAllMotors();
     return;
   }
@@ -4625,14 +4749,34 @@ static void brakeToStop(uint8_t brakePwm, unsigned long maxBrakeMs) {
   int32_t prevR = encoderR_count;
   bool stoppedL = false, stoppedR = false;
   unsigned long t0 = millis();
+  uint32_t lastImuUs = (uint32_t)micros();
+  unsigned long lastEncCheckMs = t0;
 
   while ((millis() - t0) < maxBrakeMs) {
-    delay(25);
-    imuIntegrateOnce();
+    // Non-blocking IMU polling: read IMU as fast as I2C allows (~1-2ms)
+    uint32_t nowUs = (uint32_t)micros();
+    if ((nowUs - lastImuUs) >= 1000u) {  // ~1ms minimum between reads
+      imuIntegrateOnce();
+      lastImuUs = nowUs;
+    }
+
+    // Check encoders every 25ms
+    if ((millis() - lastEncCheckMs) < 25) continue;
+    lastEncCheckMs = millis();
     readWheelEncodersForce();
 
     int32_t deltaL = abs(encoderL_count - prevL);
     int32_t deltaR = abs(encoderR_count - prevR);
+
+    // Ramp up brake force if wheels are still moving fast
+    if (!stoppedL && !stoppedR && (deltaL > 8 || deltaR > 8)) {
+      if (currentPwm < brakePwm) {
+        currentPwm += 10;
+        if (currentPwm > brakePwm) currentPwm = brakePwm;
+        setMotorsReversePwm(currentPwm, currentPwm);
+        applyMotorOutputs();
+      }
+    }
 
     // Wheel is stopped when encoder barely changed in 25ms
     if (!stoppedL && deltaL < 3) {
@@ -4857,6 +5001,7 @@ static void applyBfsDialSteps(int detentSteps, int bfs_step) {
         gridBorderEdgeFromIndex(grid_start_cursor,
           grid_course.start_r1, grid_course.start_c1,
           grid_course.start_r2, grid_course.start_c2);
+        manual_wp_count = 0; // layout changed, reset waypoints
       }
       break;
     }
@@ -4867,6 +5012,7 @@ static void applyBfsDialSteps(int detentSteps, int bfs_step) {
         while (v < 0) v += sc;
         grid_end_cursor = (uint16_t)(v % sc);
         gridSquarePosition(grid_end_cursor, grid_course.end_row, grid_course.end_col);
+        manual_wp_count = 0; // layout changed, reset waypoints
       }
       break;
     }
@@ -4910,6 +5056,16 @@ static void applyBfsDialSteps(int detentSteps, int bfs_step) {
       }
       break;
     }
+    case 7: { // Waypoint editor cursor (25cm grid, row-major order)
+      int total = MANUAL_GRID_COLS * MANUAL_GRID_ROWS;
+      int v = manual_wp_cursor_idx + detentSteps;
+      while (v < 0) v += total;
+      v = v % total;
+      manual_wp_cursor_idx = v;
+      manual_wp_cursor_col = (uint8_t)(v % MANUAL_GRID_COLS);
+      manual_wp_cursor_row = (uint8_t)(v / MANUAL_GRID_COLS);
+      break;
+    }
     default:
       break;
   }
@@ -4920,54 +5076,59 @@ static void applyBfsDialSteps(int detentSteps, int bfs_step) {
 static void drawMainMenu() {
   ui.fillScreen(TFT_BLACK);
 
-  // Force a fresh I2C snapshot so the user can trust the RUN screen diagnostics.
-  // If the critical devices aren't present, do not start the run (safer than open-loop).
+  // Version top-left
   ui.setTextColor(TFT_DARKGREY);
   ui.setTextSize(1);
   ui.drawString(FW_VERSION, 2, 2);
 
+  // Title
   ui.setTextColor(TFT_CYAN);
-  ui.setTextSize(1);
-  ui.drawString("MENU", 120, 15);
+  ui.setTextSize(2);
+  ui.drawString("MENU", 120, 14);
 
-  float radius = 70.0f;
-  float centerX = 120.0f;
-  float centerY = 120.0f;
+  // Scrolling list — show up to 7 items centered on selected
+  const int VISIBLE = 7;
+  const int itemH = 24;
+  const int listTop = 34;
+  int startIdx = selectedMenuItem - VISIBLE / 2;
+  if (startIdx < 0) startIdx = 0;
+  if (startIdx + VISIBLE > NUM_MENU_ITEMS) startIdx = NUM_MENU_ITEMS - VISIBLE;
+  if (startIdx < 0) startIdx = 0;
 
-  for (int i = 0; i < NUM_MENU_ITEMS; i++) {
-    float angle = (i * (360.0f / NUM_MENU_ITEMS) - 90.0f) * (float)M_PI / 180.0f;
-    float itemX = centerX + radius * cosf(angle);
-    float itemY = centerY + radius * sinf(angle);
-
-    if (i == selectedMenuItem) {
-      ui.fillCircle(itemX, itemY, 30, TFT_DARKGREEN);
-      ui.drawCircle(itemX, itemY, 30, TFT_GREEN);
+  for (int v = 0; v < VISIBLE && (startIdx + v) < NUM_MENU_ITEMS; v++) {
+    int idx = startIdx + v;
+    int y = listTop + v * itemH;
+    if (idx == selectedMenuItem) {
+      ui.fillRoundRect(10, y - 2, 220, itemH - 2, 4, TFT_DARKGREEN);
+      ui.drawRoundRect(10, y - 2, 220, itemH - 2, 4, TFT_GREEN);
       ui.setTextColor(TFT_WHITE);
       ui.setTextSize(2);
     } else {
-      ui.drawCircle(itemX, itemY, 25, TFT_DARKGREY);
       ui.setTextColor(TFT_DARKGREY);
       ui.setTextSize(1);
     }
-
-    ui.drawString(String(i + 1), itemX, itemY);
+    // Number + name
+    char label[24];
+    snprintf(label, sizeof(label), "%d %s", idx + 1, menuNames[idx]);
+    ui.drawString(label, 120, y + itemH / 2 - 2);
   }
 
-  ui.setTextColor(TFT_GREEN);
-  ui.setTextSize(2);
-  ui.drawString(menuNames[selectedMenuItem], centerX, centerY);
+  // Scroll indicators
+  ui.setTextColor(TFT_DARKGREY);
+  ui.setTextSize(1);
+  if (startIdx > 0) ui.drawString("^", 235, listTop);
+  if (startIdx + VISIBLE < NUM_MENU_ITEMS) ui.drawString("v", 235, listTop + VISIBLE * itemH - 10);
 
-  // Status lines (keep readable; don't cram everything onto one line)
+  // Status at bottom
   ui.setTextColor(TFT_WHITE);
   ui.setTextSize(2);
   const String line1 = String(runDistanceM, 2) + "m / " + String(runTimeS, 1) + "s";
-  ui.drawString(line1, 120, 195);
-
-  ui.setTextColor(TFT_WHITE);
-  const String line2 = (canDistanceM >= CAN_ENABLE_MIN_M) ? (String("CAN DIST: ") + String(canDistanceM, 2) + "m") : String("CAN DIST: OFF");
-  ui.drawString(line2, 120, 220);
+  ui.drawString(line1, 120, 210);
 
   ui.setTextSize(1);
+  ui.setTextColor(TFT_DARKGREY);
+  const String line2 = (canDistanceM >= CAN_ENABLE_MIN_M) ? (String("CAN ") + String(canDistanceM, 2) + "m") : String("CAN OFF");
+  ui.drawString(line2, 120, 232);
 }
 
 static void drawSetDistance() {
@@ -5202,7 +5363,10 @@ static void autoCalibrateEncodersUsingImu(float duration_s, uint8_t pwm) {
     const float accel_g = (horiz_g > 0.02f) ? horiz_g : 0.0f;
     const float accel_ms2 = accel_g * 9.80665f;
 
-    // Simple integration (very approximate — use short durations)
+    // Leaky integration: decay velocity to prevent unbounded drift from
+    // accelerometer bias.  Tau of 0.5s means ~86% of DC bias is removed.
+    const float velLeakTau = 0.5f;
+    vel *= (1.0f - dt / velLeakTau);
     vel += accel_ms2 * dt;
     dist += vel * dt;
 
@@ -5256,6 +5420,8 @@ static bool autoCalibrateEncodersTrial(float duration_s, uint8_t pwm, float &out
     const float horiz_g = sqrtf(imu_ax_g * imu_ax_g + imu_ay_g * imu_ay_g);
     const float accel_g = (horiz_g > 0.02f) ? horiz_g : 0.0f;
     const float accel_ms2 = accel_g * 9.80665f;
+    const float velLeakTau = 0.5f;
+    vel *= (1.0f - dt / velLeakTau);
     vel += accel_ms2 * dt;
     dist += vel * dt;
     delay(10);
@@ -5506,17 +5672,15 @@ static void drawGridMinimap(int16_t ox, int16_t oy, int16_t w, int16_t h,
     }
   }
 
-  // Draw gates as green filled squares (last gate in magenta)
+  // Draw gates as green filled squares
   for (uint8_t i = 0; i < grid_course.gate_count; i++) {
     const GridGate& gt = grid_course.gates[i];
     int16_t x1, y1, x2, y2;
     g2s(gt.row, gt.col, x1, y1);
     g2s(gt.row + 1, gt.col + 1, x2, y2);
-    bool isLast = ((int8_t)i == grid_course.last_gate_idx);
-    // Semi-transparent fill
     for (int16_t yy = y1 + 1; yy < y2; yy++)
-      ui.drawLine(x1 + 1, yy, x2 - 1, yy, isLast ? 0x780F : 0x03E0); // magenta-ish or dark green
-    ui.drawRect(x1, y1, x2 - x1, y2 - y1, isLast ? TFT_MAGENTA : TFT_GREEN);
+      ui.drawLine(x1 + 1, yy, x2 - 1, yy, 0x03E0);
+    ui.drawRect(x1, y1, x2 - x1, y2 - y1, TFT_GREEN);
   }
 
   // Draw water bottles as blue dots at edge midpoints
@@ -6003,42 +6167,146 @@ static void drawBfsNavScreen(int bfs_setup_step) {
       uint8_t row, col;
       gridSquarePosition(grid_gate_cursor, row, col);
       bool hasGate = gridHasGate(row, col);
-      // Check if this gate is the designated last gate
-      bool isLast = false;
-      if (hasGate && grid_course.last_gate_idx >= 0 && grid_course.last_gate_idx < grid_course.gate_count) {
-        const GridGate& lg = grid_course.gates[grid_course.last_gate_idx];
-        isLast = (lg.row == row && lg.col == col);
-      }
-
-      ui.setTextColor(isLast ? TFT_MAGENTA : (hasGate ? TFT_GREEN : TFT_WHITE));
+      ui.setTextColor(hasGate ? TFT_GREEN : TFT_WHITE);
       ui.setTextSize(1);
-      if (isLast) {
-        snprintf(buf, sizeof(buf), "Sq(%d,%d) [LAST]", row, col);
-      } else {
-        snprintf(buf, sizeof(buf), "Sq(%d,%d) %s", row, col,
-                 hasGate ? "[GATE]" : "[none]");
-      }
+      snprintf(buf, sizeof(buf), "Sq(%d,%d) %s", row, col,
+               hasGate ? "[GATE]" : "[none]");
       ui.drawString(buf, 120, 55);
-
-      // Show last gate info
-      if (grid_course.last_gate_idx >= 0 && grid_course.last_gate_idx < grid_course.gate_count) {
-        const GridGate& lg = grid_course.gates[grid_course.last_gate_idx];
-        ui.setTextColor(TFT_MAGENTA);
-        ui.setTextSize(1);
-        snprintf(buf, sizeof(buf), "Last: Sq(%d,%d)", lg.row, lg.col);
-        ui.drawString(buf, 120, 70);
-      }
 
       drawGridMinimap(70, 80, 100, 115, 6);
 
       ui.setTextColor(TFT_GREEN);
       ui.setTextSize(1);
-      ui.drawString("Click: +gate/last/remove", 120, 200);
+      ui.drawString("Click: +gate/remove", 120, 200);
       ui.drawString("Hold:next  2s:menu", 120, 215);
       break;
     }
 
-    case 7: { // Confirm / GO
+    case 7: { // Waypoint editor (manual waypoint plotting on 25cm sub-grid)
+      ui.setTextColor(TFT_YELLOW);
+      ui.setTextSize(2);
+      snprintf(buf, sizeof(buf), "WAYPTS (%d)", manual_wp_count);
+      ui.drawString(buf, 120, 30);
+
+      // Draw minimap with 25cm waypoint overlay
+      // Map dimensions: fit 250x200cm into display area
+      const int mapX = 20, mapY = 50, mapW = 200, mapH = 160;
+      const float scaleX = (float)mapW / 2.50f; // pixels per meter
+      const float scaleY = (float)mapH / 2.00f;
+
+      // Draw 50cm grid lines (light grey)
+      for (int c = 0; c <= 5; c++) {
+        int px = mapX + (int)(c * 0.50f * scaleX);
+        ui.drawLine(px, mapY, px, mapY + mapH, TFT_DARKGREY);
+      }
+      for (int r = 0; r <= 4; r++) {
+        int py = mapY + mapH - (int)(r * 0.50f * scaleY);
+        ui.drawLine(mapX, py, mapX + mapW, py, TFT_DARKGREY);
+      }
+
+      // Draw 2x4 obstacles (red) if any walls
+      for (uint8_t wi = 0; wi < grid_course.wall_count; wi++) {
+        const GridWall &w = grid_course.walls[wi];
+        float spacing_m = (float)grid_course.spacing_cm * 0.01f;
+        int wx1 = mapX + (int)(w.c1 * spacing_m * scaleX);
+        int wy1 = mapY + mapH - (int)(w.r1 * spacing_m * scaleY);
+        int wx2 = mapX + (int)(w.c2 * spacing_m * scaleX);
+        int wy2 = mapY + mapH - (int)(w.r2 * spacing_m * scaleY);
+        ui.drawLine(wx1, wy1, wx2, wy2, TFT_RED);
+        // Draw thick
+        ui.drawLine(wx1-1, wy1, wx2-1, wy2, TFT_RED);
+        ui.drawLine(wx1+1, wy1, wx2+1, wy2, TFT_RED);
+      }
+
+      // Draw gate zones (green rectangles)
+      for (uint8_t gi = 0; gi < grid_course.gate_count; gi++) {
+        float spacing_m = (float)grid_course.spacing_cm * 0.01f;
+        int gx = mapX + (int)(grid_course.gates[gi].col * spacing_m * scaleX);
+        int gy = mapY + mapH - (int)((grid_course.gates[gi].row + 1) * spacing_m * scaleY);
+        int gw = (int)(spacing_m * scaleX);
+        int gh = (int)(spacing_m * scaleY);
+        ui.drawRect(gx, gy, gw, gh, TFT_GREEN);
+        // Gate label
+        char gl[4];
+        snprintf(gl, sizeof(gl), "%c", 'A' + gi);
+        ui.setTextColor(TFT_GREEN);
+        ui.setTextSize(1);
+        ui.drawString(gl, gx + gw/2, gy + gh/2);
+      }
+
+      // Draw start position (cyan dot)
+      {
+        float spacing_m = (float)grid_course.spacing_cm * 0.01f;
+        float sx = 0.5f * ((float)grid_course.start_c1 + (float)grid_course.start_c2) * spacing_m;
+        float sy = 0.5f * ((float)grid_course.start_r1 + (float)grid_course.start_r2) * spacing_m;
+        int spx = mapX + (int)(sx * scaleX);
+        int spy = mapY + mapH - (int)(sy * scaleY);
+        ui.fillCircle(spx, spy, 3, TFT_CYAN);
+      }
+
+      // Draw existing waypoints and path lines
+      float prevX_m = 0.5f * ((float)grid_course.start_c1 + (float)grid_course.start_c2) * ((float)grid_course.spacing_cm * 0.01f);
+      float prevY_m = 0.5f * ((float)grid_course.start_r1 + (float)grid_course.start_r2) * ((float)grid_course.spacing_cm * 0.01f);
+      for (uint8_t wi = 0; wi < manual_wp_count; wi++) {
+        float wx = (float)manual_wp_col[wi] * 0.25f;
+        float wy = (float)manual_wp_row[wi] * 0.25f;
+        int px1 = mapX + (int)(prevX_m * scaleX);
+        int py1 = mapY + mapH - (int)(prevY_m * scaleY);
+        int px2 = mapX + (int)(wx * scaleX);
+        int py2 = mapY + mapH - (int)(wy * scaleY);
+        ui.drawLine(px1, py1, px2, py2, TFT_YELLOW);
+        ui.fillCircle(px2, py2, 2, TFT_WHITE);
+        // Waypoint number label
+        char wl[4];
+        snprintf(wl, sizeof(wl), "%d", (int)(wi + 1));
+        ui.setTextColor(TFT_YELLOW);
+        ui.setTextSize(1);
+        ui.drawString(wl, px2 + 4, py2 - 5);
+        prevX_m = wx;
+        prevY_m = wy;
+      }
+
+      // Draw cursor (blinking magenta dot) with preview line from last point
+      {
+        float cx = (float)manual_wp_cursor_col * 0.25f;
+        float cy = (float)manual_wp_cursor_row * 0.25f;
+        int cpx = mapX + (int)(cx * scaleX);
+        int cpy = mapY + mapH - (int)(cy * scaleY);
+        // Preview line: dashed from last waypoint (or start) to cursor
+        int ppx = mapX + (int)(prevX_m * scaleX);
+        int ppy = mapY + mapH - (int)(prevY_m * scaleY);
+        // Draw dashed preview line (alternating pixels)
+        {
+          float dx = (float)(cpx - ppx), dy = (float)(cpy - ppy);
+          float len = sqrtf(dx * dx + dy * dy);
+          if (len > 2.0f) {
+            float ux = dx / len, uy = dy / len;
+            for (float t = 0; t < len; t += 4.0f) {
+              int x1 = ppx + (int)(ux * t);
+              int y1 = ppy + (int)(uy * t);
+              int x2 = ppx + (int)(ux * (t + 2.0f));
+              int y2 = ppy + (int)(uy * (t + 2.0f));
+              ui.drawLine(x1, y1, x2, y2, TFT_DARKGREY);
+            }
+          }
+        }
+        uint16_t curColor = ((millis() / 300) % 2 == 0) ? TFT_MAGENTA : TFT_WHITE;
+        ui.fillCircle(cpx, cpy, 4, curColor);
+        // Show cursor position and segment distance
+        float segDist = sqrtf((cx - prevX_m) * (cx - prevX_m) + (cy - prevY_m) * (cy - prevY_m));
+        snprintf(buf, sizeof(buf), "(%.2f,%.2f)m d=%.2f", (double)cx, (double)cy, (double)segDist);
+        ui.setTextColor(TFT_WHITE);
+        ui.setTextSize(1);
+        ui.drawString(buf, 120, 218);
+      }
+
+      ui.setTextColor(TFT_GREEN);
+      ui.setTextSize(1);
+      ui.drawString("Clk:add Hold:GO 2s:undo", 120, 230);
+      break;
+    }
+
+    case 8: { // Confirm / GO
       ui.setTextColor(TFT_CYAN);
       ui.setTextSize(2);
       ui.drawString("CONFIRM", 120, 30);
@@ -6052,12 +6320,27 @@ static void drawBfsNavScreen(int bfs_setup_step) {
                grid_course.start_r2, grid_course.start_c2,
                grid_course.end_row, grid_course.end_col);
       ui.drawString(buf, 120, 70);
-      snprintf(buf, sizeof(buf), "Walls:%d Bottles:%d Gates:%d",
-               grid_course.wall_count, grid_course.bottle_count,
-               grid_course.gate_count);
+      snprintf(buf, sizeof(buf), "WPs:%d Gates:%d Time:%.0fs",
+               manual_wp_count, grid_course.gate_count, (double)runTimeS);
       ui.drawString(buf, 120, 85);
 
-      drawGridMinimap(70, 100, 100, 100, -1, true);
+      // Compute and show total path distance
+      {
+        float totalDist = 0.0f;
+        float spacing_m = (float)grid_course.spacing_cm * 0.01f;
+        float px = 0.5f * ((float)grid_course.start_c1 + (float)grid_course.start_c2) * spacing_m;
+        float py = 0.5f * ((float)grid_course.start_r1 + (float)grid_course.start_r2) * spacing_m;
+        for (uint8_t i = 0; i < manual_wp_count; i++) {
+          float wx = (float)manual_wp_col[i] * 0.25f;
+          float wy = (float)manual_wp_row[i] * 0.25f;
+          totalDist += sqrtf((wx - px) * (wx - px) + (wy - py) * (wy - py));
+          px = wx; py = wy;
+        }
+        snprintf(buf, sizeof(buf), "Path: %.2fm", (double)totalDist);
+        ui.drawString(buf, 120, 100);
+      }
+
+      drawGridMinimap(70, 115, 100, 85, -1, true);
 
       ui.setTextColor(TFT_GREEN);
       ui.setTextSize(1);
@@ -6406,7 +6689,7 @@ static bool selfTestTick() {
         if (INVERT_RIGHT_ENCODER_COUNT) pulsesR = -pulsesR;
         if (INVERT_LEFT_ENCODER_COUNT) pulsesL = -pulsesL;
         st_result.motorR_pulses = pulsesR;  // same-side encoder
-        st_result.motorR_cross = pulsesL;   // cross encoder
+        st_result.motorR_cross = pulsesL;   // cross encodePID
         st_result.motorR_enc_moved = (abs(pulsesR) > 50);
         // Detect swap: cross encoder moved more than same-side
         if (abs(pulsesL) > 50 && abs(pulsesR) < 50) {
@@ -6656,11 +6939,16 @@ static void sqTestReset() {
 // Extern wrapper for enterScreen() which is defined before sqTestReset()
 void sqTestResetExtern() { sqTestReset(); }
 
-// Steering PID state for square test
+// Steering PID state for square test (drive phase)
 static float sq_steerI = 0.0f;
 static float sq_prev_yaw_err = 0.0f;
-static unsigned long sq_pid_last_ms = 0;
+static uint32_t sq_pid_last_us = 0;
 static float sq_dFilt = 0.0f;  // low-pass filtered derivative
+// Turn PID state for square test (turn phase)
+static float sq_turnI = 0.0f;
+static float sq_turn_prev_err = 0.0f;
+static float sq_turn_dFilt = 0.0f;
+static uint32_t sq_turn_pid_last_us = 0;
 // Turn settle state (matches turn test logic)
 static unsigned long sq_first_in_tol_ms = 0;
 static unsigned long sq_turn_start_ms = 0;
@@ -6674,8 +6962,12 @@ static void sqTestStart() {
   testLogInit("SQUARE", sq_side_len_m * 4.0f);
   sq_steerI = 0.0f;
   sq_prev_yaw_err = 0.0f;
-  sq_pid_last_ms = 0;
+  sq_pid_last_us = 0;
   sq_dFilt = 0.0f;
+  sq_turnI = 0.0f;
+  sq_turn_prev_err = 0.0f;
+  sq_turn_dFilt = 0.0f;
+  sq_turn_pid_last_us = 0;
   Serial.printf("=== SQUARE TEST START  side=%.2fm ===\n", (double)sq_side_len_m);
 }
 
@@ -6760,20 +7052,34 @@ static bool sqTestTick() {
 
     case SQ_TURN: {
       // Pivot to face the next side — matches turn test logic
-      float yaw_err = sq_target_yaw - imu_yaw;
-      while (yaw_err > 180.0f) yaw_err -= 360.0f;
-      while (yaw_err < -180.0f) yaw_err += 360.0f;
+      float yaw_err = wrapDeg(sq_target_yaw - imu_yaw);
 
-      const float SQ_TURN_TOLERANCE = 2.0f;       // degrees (matches turn test)
+      const float SQ_TURN_TOLERANCE = 5.0f;       // degrees (matches BFS tolerance)
       const unsigned long SQ_TURN_SETTLE_MS = 300; // must hold in tolerance this long
 
       if (fabsf(yaw_err) < SQ_TURN_TOLERANCE) {
-        if (sq_first_in_tol_ms == 0) sq_first_in_tol_ms = now;
-        if ((now - sq_first_in_tol_ms) >= SQ_TURN_SETTLE_MS) {
-          // Turn settled — IMU-aware pause (keeps imu_yaw fresh)
+        // Require BOTH position in tolerance AND low angular rate (prevents coast-through)
+        bool gyroStill = fabsf(imu_gz_dps) < 8.0f;
+        if (sq_first_in_tol_ms == 0 && gyroStill) {
+          sq_first_in_tol_ms = now;
+          unsigned long elT = now - sq_turn_start_ms;
+          Serial.printf("SQT%d SETTLE_START t=%lu err=%.2f gz=%.1f yaw=%.2f\n",
+                        sq_side, elT, (double)yaw_err, (double)imu_gz_dps, (double)imu_yaw);
+        }
+        if (!gyroStill) sq_first_in_tol_ms = 0;  // reset if still rotating
+        if (sq_first_in_tol_ms != 0 && (now - sq_first_in_tol_ms) >= SQ_TURN_SETTLE_MS) {
+          // Turn settled — log final state
+          { unsigned long elT = now - sq_turn_start_ms;
+            Serial.printf("SQT%d SETTLED t=%lu err=%.2f gz=%.1f yaw=%.2f finalI=%.2f\n",
+                          sq_side, elT, (double)yaw_err, (double)imu_gz_dps, (double)imu_yaw, (double)sq_turnI); }
+          // IMU-aware pause (keeps imu_yaw fresh)
           stopAllMotors();
           { unsigned long t0s = millis();
-            while ((millis() - t0s) < 150) { imuIntegrateOnce(); delay(5); } }
+            uint32_t lastImuPollUs = (uint32_t)micros();
+            while ((millis() - t0s) < 150) {
+              uint32_t nUs = (uint32_t)micros();
+              if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
+            } }
           readWheelEncodersForce();
           sq_enc_start_L = encoderL_count;
           sq_enc_start_R = encoderR_count;
@@ -6798,22 +7104,89 @@ static bool sqTestTick() {
         // Left tolerance — reset settle timer
         sq_first_in_tol_ms = 0;
 
-        // Pivot with proportional speed
+        // PID-based turn: compute real dt (microsecond precision)
+        float dt;
+        { uint32_t nowUs = (uint32_t)micros();
+          if (sq_turn_pid_last_us == 0) {
+            dt = 0.010f;
+          } else {
+            uint32_t dtUs = nowUs - sq_turn_pid_last_us;
+            if (dtUs < 100) dtUs = 100;
+            if (dtUs > 50000) dtUs = 50000;
+            dt = (float)dtUs * 1e-6f;
+          }
+          sq_turn_pid_last_us = nowUs;
+        }
+
+        // Leaky integral (corrects steady-state bias in pivot)
+        const float sqTurnKi = 2.0f;
+        const float sqTurnKd = 0.05f;
+        const float sqTurnILeakTau = 0.8f;
+        sq_turnI -= sq_turnI * (dt / sqTurnILeakTau);
+        if (fabsf(yaw_err) > 0.5f) {
+          sq_turnI += yaw_err * dt;
+        }
+        // Anti-windup: clamp integral contribution to ±20 PWM
+        const float sqTurnIMaxPwm = 20.0f;
+        float iLim = sqTurnIMaxPwm / sqTurnKi;
+        if (sq_turnI > iLim) sq_turnI = iLim;
+        if (sq_turnI < -iLim) sq_turnI = -iLim;
+
+        // Low-pass filtered derivative
+        float rawDeriv = (yaw_err - sq_turn_prev_err) / dt;
+        sq_turn_prev_err = yaw_err;
+        const float sqTurnDFilterTau = 0.030f;
+        float dAlpha = dt / (sqTurnDFilterTau + dt);
+        sq_turn_dFilt += dAlpha * (rawDeriv - sq_turn_dFilt);
+
+        // Base PWM from proportional scaling
+        float absErr = fabsf(yaw_err);
+        float basePwm;
+        if (absErr > 45.0f) {
+          basePwm = BFS_TURN_PWM;  // full speed for large errors
+        } else if (absErr > 15.0f) {
+          basePwm = 110.0f + (absErr - 15.0f) * (BFS_TURN_PWM - 110.0f) / 30.0f;
+        } else if (absErr > 5.0f) {
+          // Crawl zone: ramp from 110 down to 100 between 15° and 5°
+          float t = (absErr - 5.0f) / 10.0f;
+          basePwm = 100.0f + t * 10.0f;
+        } else {
+          // Fine zone: stays at 100 (motor minimum)
+          basePwm = 100.0f;
+        }
+
+        // I and D corrections: sign-aware relative to error direction.
+        float errSign = (yaw_err > 0.0f) ? 1.0f : -1.0f;
+        float correction = (sqTurnKi * sq_turnI + sqTurnKd * sq_turn_dFilt) * errSign;
+        float turnPwmF = basePwm + correction;
+        if (turnPwmF > 200.0f) turnPwmF = 200.0f;
+        if (turnPwmF < 100) turnPwmF = 100;
+
         int sign = (yaw_err > 0.0f) ? 1 : -1;
-        float pwmScale = fabsf(yaw_err) / 45.0f;
-        if (pwmScale > 1.0f) pwmScale = 1.0f;
-        if (pwmScale < 0.35f) pwmScale = 0.35f;
-        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
-        if (turnPwm < 115) turnPwm = 115;
-        setMotorsPivotPwm(sign, turnPwm);
+        setMotorsPivotPwm(sign, (uint8_t)(turnPwmF + 0.5f));
         applyMotorOutputs();
+
+        // Detailed turn logging every ~50ms
+        static unsigned long sq_turn_last_log_ms = 0;
+        if ((now - sq_turn_last_log_ms) >= 50u) {
+          sq_turn_last_log_ms = now;
+          unsigned long elT = now - sq_turn_start_ms;
+          Serial.printf("SQT%d t=%lu err=%.2f yaw=%.2f tgt=%.2f gz=%.1f pwm=%d I=%.2f D=%.1f base=%.0f corr=%.1f\n",
+                        sq_side, elT, (double)yaw_err, (double)imu_yaw, (double)sq_target_yaw,
+                        (double)imu_gz_dps, (int)(turnPwmF + 0.5f),
+                        (double)sq_turnI, (double)sq_turn_dFilt, (double)basePwm, (double)correction);
+        }
       }
 
       // Timeout safety
       if ((now - sq_turn_start_ms) > 5000) {
         stopAllMotors();
         { unsigned long t0s = millis();
-          while ((millis() - t0s) < 150) { imuIntegrateOnce(); delay(5); } }
+          uint32_t lastImuPollUs = (uint32_t)micros();
+          while ((millis() - t0s) < 150) {
+            uint32_t nUs = (uint32_t)micros();
+            if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
+          } }
         readWheelEncodersForce();
         sq_enc_start_L = encoderL_count;
         sq_enc_start_R = encoderR_count;
@@ -6854,18 +7227,18 @@ static bool sqTestTick() {
         brakeToStop(140, 400);
         // IMU-aware settle wait — keeps imu_yaw fresh during pause
         { unsigned long t0settle = millis();
-          while ((millis() - t0settle) < 300) { imuIntegrateOnce(); delay(5); } }
+          uint32_t lastImuPollUs = (uint32_t)micros();
+          while ((millis() - t0settle) < 300) {
+            uint32_t nUs = (uint32_t)micros();
+            if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
+          } }
 
         sq_result.side_dist_m[sq_side] = sq_driven_m;
         sq_result.side_dist_err_m[sq_side] = sq_driven_m - sq_side_len_m;
         sq_result.heading_after[sq_side] = imu_yaw;
         // Expected heading after side N: start_yaw - N*90 (turning right = negative yaw for CCW-positive IMU)
-        float expected_yaw = sq_start_yaw - (float)(sq_side) * 90.0f;
-        while (expected_yaw > 180.0f) expected_yaw -= 360.0f;
-        while (expected_yaw < -180.0f) expected_yaw += 360.0f;
-        sq_result.heading_err[sq_side] = imu_yaw - expected_yaw;
-        while (sq_result.heading_err[sq_side] > 180.0f) sq_result.heading_err[sq_side] -= 360.0f;
-        while (sq_result.heading_err[sq_side] < -180.0f) sq_result.heading_err[sq_side] += 360.0f;
+        float expected_yaw = wrapDeg(sq_start_yaw - (float)(sq_side) * 90.0f);
+        sq_result.heading_err[sq_side] = wrapDeg(imu_yaw - expected_yaw);
 
         Serial.printf("SQ: side %d done dist=%.3f err=%.3f yaw=%.1f yawErr=%.1f\n",
                       sq_side, (double)sq_driven_m, (double)sq_result.side_dist_err_m[sq_side],
@@ -6887,9 +7260,7 @@ static bool sqTestTick() {
           sq_result.elapsed_ms = now - sq_start_ms;
           sq_result.total_dist_m = 0;
           for (int i = 0; i < 4; i++) sq_result.total_dist_m += sq_result.side_dist_m[i];
-          sq_result.yaw_drift_deg = imu_yaw - sq_start_yaw;
-          while (sq_result.yaw_drift_deg > 180.0f) sq_result.yaw_drift_deg -= 360.0f;
-          while (sq_result.yaw_drift_deg < -180.0f) sq_result.yaw_drift_deg += 360.0f;
+          sq_result.yaw_drift_deg = wrapDeg(imu_yaw - sq_start_yaw);
           readWheelEncodersForce();
           int32_t totDL = encoderL_count - sq_enc_total_start_L;
           int32_t totDR = encoderR_count - sq_enc_total_start_R;
@@ -6913,34 +7284,40 @@ static bool sqTestTick() {
           sq_target_yaw = imu_yaw - 90.0f;
           sq_steerI = 0.0f;
           sq_prev_yaw_err = 0.0f;
-          sq_pid_last_ms = 0;
+          sq_pid_last_us = 0;
           sq_dFilt = 0.0f;
+          sq_turnI = 0.0f;
+          // Initialize prev_err to actual initial error to avoid derivative spike
+          sq_turn_prev_err = wrapDeg(sq_target_yaw - imu_yaw);
+          sq_turn_dFilt = 0.0f;
+          sq_turn_pid_last_us = 0;
           sq_first_in_tol_ms = 0;
           sq_turn_start_ms = millis();
           sq_phase = SQ_TURN;
-          Serial.printf("SQ: turning to %.1f for side %d\n", (double)sq_target_yaw, sq_side);
+          Serial.printf("SQ: turning to %.1f for side %d (initErr=%.1f)\n", (double)sq_target_yaw, sq_side,
+                        (double)sq_turn_prev_err);
         }
       } else {
         // Drive with yaw PID correction (P + I + D)
-        float yaw_err = sq_target_yaw - imu_yaw;
-        while (yaw_err > 180.0f) yaw_err -= 360.0f;
-        while (yaw_err < -180.0f) yaw_err += 360.0f;
+        float yaw_err = wrapDeg(sq_target_yaw - imu_yaw);
 
         // Leaky integral for steady-state bias correction
         const float sq_steerKi = 4.0f;
         const float sq_steerKd = 0.20f;
         const float sq_iLeakTau = 1.0f;
-        // Measure real dt; clamp to [1ms, 50ms] to prevent spikes after stalls
+        // Measure real dt; clamp to [100us, 50ms] to prevent spikes after stalls
         float dt;
-        if (sq_pid_last_ms == 0) {
-          dt = 0.010f;
-        } else {
-          unsigned long dtMs = now - sq_pid_last_ms;
-          if (dtMs < 1) dtMs = 1;
-          if (dtMs > 50) dtMs = 50;
-          dt = dtMs / 1000.0f;
+        { uint32_t nowUs = (uint32_t)micros();
+          if (sq_pid_last_us == 0) {
+            dt = 0.010f;
+          } else {
+            uint32_t dtUs = nowUs - sq_pid_last_us;
+            if (dtUs < 100) dtUs = 100;
+            if (dtUs > 50000) dtUs = 50000;
+            dt = (float)dtUs * 1e-6f;
+          }
+          sq_pid_last_us = nowUs;
         }
-        sq_pid_last_ms = now;
         sq_steerI -= sq_steerI * (dt / sq_iLeakTau);
         if (fabsf(yaw_err) > 0.1f) {
           sq_steerI += yaw_err * dt;
@@ -6978,7 +7355,7 @@ static bool sqTestTick() {
         }
 
         float basePwm = BFS_DRIVE_PWM * speedFactor;
-        if (basePwm < 105.0f) basePwm = 105.0f;
+        if (basePwm < 110.0f) basePwm = 110.0f;
 
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
         float rightPwm = basePwm + steerCorr - (float)motor_bias_pwm;
@@ -7277,7 +7654,7 @@ static unsigned long str_lastLogMs = 0;
 // Steering PID state for straight test
 static float str_steerI = 0.0f;
 static float str_prev_yaw_err = 0.0f;
-static unsigned long str_pid_last_ms = 0;
+static uint32_t str_pid_last_us = 0;
 static float str_dFilt = 0.0f;  // low-pass filtered derivative
 
 static void strTestReset() {
@@ -7296,7 +7673,7 @@ static void strTestStart() {
   str_lastLogMs = 0;
   str_steerI = 0.0f;
   str_prev_yaw_err = 0.0f;
-  str_pid_last_ms = 0;
+  str_pid_last_us = 0;
   str_dFilt = 0.0f;
   Serial.printf("=== STRAIGHT TEST START  target=%.2fm ===\n", (double)str_target_m);
 }
@@ -7361,7 +7738,11 @@ static bool strTestTick() {
         brakeToStop(140, 400);
         // IMU-aware settle wait
         { unsigned long t0settle = millis();
-          while ((millis() - t0settle) < 300) { imuIntegrateOnce(); delay(5); } }
+          uint32_t lastImuPollUs = (uint32_t)micros();
+          while ((millis() - t0settle) < 300) {
+            uint32_t nUs = (uint32_t)micros();
+            if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
+          } }
 
         const int32_t totDL = encoderL_count - str_enc_start_L;
         const int32_t totDR = encoderR_count - str_enc_start_R;
@@ -7384,25 +7765,25 @@ static bool strTestTick() {
                       (double)str_result.enc_diff_mm, str_result.elapsed_ms);
       } else {
         // Drive with yaw PID correction (P + I + D)
-        float yaw_err = str_start_yaw - imu_yaw;
-        while (yaw_err > 180.0f) yaw_err -= 360.0f;
-        while (yaw_err < -180.0f) yaw_err += 360.0f;
+        float yaw_err = wrapDeg(str_start_yaw - imu_yaw);
 
         // Leaky integral to fight steady-state drift from motor/encoder asymmetry
         const float str_steerKi = 4.0f;
         const float str_steerKd = 0.20f;
         const float str_iLeakTau = 1.0f;
-        // Measure real dt; clamp to [1ms, 50ms] to prevent spikes after stalls
+        // Measure real dt; clamp to [100us, 50ms] to prevent spikes after stalls
         float dt;
-        if (str_pid_last_ms == 0) {
-          dt = 0.010f;
-        } else {
-          unsigned long dtMs = now - str_pid_last_ms;
-          if (dtMs < 1) dtMs = 1;
-          if (dtMs > 50) dtMs = 50;
-          dt = dtMs / 1000.0f;
+        { uint32_t nowUs = (uint32_t)micros();
+          if (str_pid_last_us == 0) {
+            dt = 0.010f;
+          } else {
+            uint32_t dtUs = nowUs - str_pid_last_us;
+            if (dtUs < 100) dtUs = 100;
+            if (dtUs > 50000) dtUs = 50000;
+            dt = (float)dtUs * 1e-6f;
+          }
+          str_pid_last_us = nowUs;
         }
-        str_pid_last_ms = now;
         str_steerI -= str_steerI * (dt / str_iLeakTau);
         if (fabsf(yaw_err) > 0.1f) {
           str_steerI += yaw_err * dt;
@@ -7441,7 +7822,7 @@ static bool strTestTick() {
         }
 
         float basePwm = BFS_DRIVE_PWM * speedFactor;
-        if (basePwm < 105.0f) basePwm = 105.0f;
+        if (basePwm < 110.0f) basePwm = 110.0f;
 
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
         float rightPwm = basePwm + steerCorr - (float)motor_bias_pwm;
@@ -7689,9 +8070,7 @@ static bool trnTestTick() {
       // Target yaw: start + direction * target_deg
       // For right turn: yaw decreases (trn_direction = -1)
       float target_yaw = trn_start_yaw + trn_direction * trn_target_deg;
-      float yaw_err = target_yaw - imu_yaw;
-      while (yaw_err > 180.0f) yaw_err -= 360.0f;
-      while (yaw_err < -180.0f) yaw_err += 360.0f;
+      float yaw_err = wrapDeg(target_yaw - imu_yaw);
 
       float turned_deg = fabsf(imu_yaw - trn_start_yaw);
 
@@ -8702,7 +9081,11 @@ void loop() {
 
     const bool motorsStopped = (motor_command == 0) && (motor_enabled == 0);
     const bool accelStill = ok && fabsf(gx_dps) < 5.0f && fabsf(gy_dps) < 5.0f;
-    if (!runActive && motorsStopped && accelStill && ok) {
+    // Also block bias updates during any test/run (square, straight, BFS)
+    const bool testActive = (sq_phase != SQ_IDLE && sq_phase != SQ_DONE) ||
+                            (str_phase != STR_IDLE && str_phase != STR_DONE) ||
+                            (bfs_run_phase != BFS_PHASE_IDLE);
+    if (!runActive && !testActive && motorsStopped && accelStill && ok) {
       imu_bias_refining = true;
       if (stillWinStartMs == 0) {
         stillWinStartMs = now;
@@ -8783,9 +9166,7 @@ void loop() {
       if (dt_s > 0.0f && dt_s < 0.5f) {
         // currentYaw += (rawGyroZ - gyroBiasZ) * deltaTime
         imu_yaw += imu_gz_dps * dt_s;
-        // Wrap to [-180, 180]
-        while (imu_yaw > 180.0f) imu_yaw -= 360.0f;
-        while (imu_yaw < -180.0f) imu_yaw += 360.0f;
+        imu_yaw = wrapDeg(imu_yaw);
       }
     }
   }
@@ -8833,6 +9214,50 @@ void loop() {
         case 9:
           enterScreen(SCREEN_TURN_TEST);
           break;
+        case 10: {
+          // Clear all runlog files from SPIFFS
+          if (spiffs_ok) {
+            int delCount = 0;
+            char paths[32][32];
+            int count = 0;
+            File root = SPIFFS.open("/");
+            File f = root.openNextFile();
+            while (f && count < 32) {
+              const char* nm = f.name();
+              if (nm && strstr(nm, "runlog") && strstr(nm, ".csv")) {
+                snprintf(paths[count], sizeof(paths[count]), "%s%s",
+                         (nm[0] == '/') ? "" : "/", nm);
+                count++;
+              }
+              f.close();
+              f = root.openNextFile();
+            }
+            root.close();
+            for (int i2 = 0; i2 < count; i2++) {
+              if (SPIFFS.remove(paths[i2])) delCount++;
+            }
+            // Also remove start_debug.txt if present
+            SPIFFS.remove("/start_debug.txt");
+            // Show confirmation on screen
+            ui.fillScreen(TFT_BLACK);
+            ui.setTextColor(TFT_GREEN);
+            ui.setTextSize(2);
+            ui.drawString("LOGS CLEARED", 120, 100);
+            ui.setTextSize(1);
+            ui.drawString(String(delCount) + " file(s) deleted", 120, 130);
+            ui.pushSprite(0, 0);
+            delay(1000);
+            Serial.printf("CLR_LOGS: deleted %d file(s)\n", delCount);
+          } else {
+            ui.fillScreen(TFT_BLACK);
+            ui.setTextColor(TFT_RED);
+            ui.setTextSize(2);
+            ui.drawString("FS ERROR", 120, 110);
+            ui.pushSprite(0, 0);
+            delay(1000);
+          }
+          break;
+        }
       }
     }
 
@@ -8863,23 +9288,27 @@ void loop() {
         uint8_t r1, c1, r2, c2;
         gridHEdgeFromIndex(grid_hwall_cursor, r1, c1, r2, c2);
         gridToggleWall(r1, c1, r2, c2);
+        manual_wp_count = 0; // layout changed, reset waypoints
       } else if (bfs_setup_step == 3) {
         // V-Wall editor: click toggles wall at cursor
         uint8_t r1, c1, r2, c2;
         gridVEdgeFromIndex(grid_vwall_cursor, r1, c1, r2, c2);
         gridToggleWall(r1, c1, r2, c2);
+        manual_wp_count = 0; // layout changed, reset waypoints
       } else if (bfs_setup_step == 4) {
         // H-Bottle editor: click toggles bottle at cursor
         uint8_t r1, c1, r2, c2;
         gridHEdgeFromIndex(grid_hbottle_cursor, r1, c1, r2, c2);
         gridToggleBottle(r1, c1, r2, c2);
+        manual_wp_count = 0; // layout changed, reset waypoints
       } else if (bfs_setup_step == 5) {
         // V-Bottle editor: click toggles bottle at cursor
         uint8_t r1, c1, r2, c2;
         gridVEdgeFromIndex(grid_vbottle_cursor, r1, c1, r2, c2);
         gridToggleBottle(r1, c1, r2, c2);
+        manual_wp_count = 0; // layout changed, reset waypoints
       } else if (bfs_setup_step == 6) {
-        // Gate editor: 3-state toggle (none → gate → last gate → remove)
+        // Gate editor: 2-state toggle (none → gate → remove)
         uint8_t row, col;
         gridSquarePosition(grid_gate_cursor, row, col);
         bool hasGate = gridHasGate(row, col);
@@ -8890,7 +9319,7 @@ void loop() {
             grid_course.gate_count++;
           }
         } else {
-          // Find this gate's index
+          // Gate exists → remove it
           int8_t gateIdx = -1;
           for (uint8_t gi = 0; gi < grid_course.gate_count; gi++) {
             if (grid_course.gates[gi].row == row && grid_course.gates[gi].col == col) {
@@ -8898,38 +9327,59 @@ void loop() {
               break;
             }
           }
-          if (gateIdx >= 0 && grid_course.last_gate_idx != gateIdx) {
-            // Gate exists but not marked as last → mark as last
-            grid_course.last_gate_idx = gateIdx;
-          } else {
-            // Gate is already marked as last → remove gate
-            // Clear last_gate_idx if it was this gate
-            if (grid_course.last_gate_idx == gateIdx) grid_course.last_gate_idx = -1;
-            // Remove the gate
+          if (gateIdx >= 0) {
             for (uint8_t j = (uint8_t)gateIdx; j < grid_course.gate_count - 1; j++)
               grid_course.gates[j] = grid_course.gates[j + 1];
             grid_course.gate_count--;
-            // Adjust last_gate_idx if it pointed after the removed gate
-            if (grid_course.last_gate_idx > gateIdx) grid_course.last_gate_idx--;
-            if (grid_course.last_gate_idx >= grid_course.gate_count) grid_course.last_gate_idx = -1;
           }
         }
+        manual_wp_count = 0; // layout changed, reset waypoints
       } else if (bfs_setup_step == 7) {
-        // Confirm screen: click starts BFS run via IMU calibration screen.
-        bfsInitializeGraph();
-        bfs_start_node = bfs_start_edge_node;
-        bfs_goal_node = bfs_end_center_node;
-        bool pathOk = (grid_course.gate_count > 0) ?
-                       bfsComputePathWithGates() :
-                       bfsComputePath(bfs_start_node, bfs_goal_node);
+        // Waypoint editor: click on last waypoint deletes it, otherwise adds new
+        if (manual_wp_count > 0 &&
+            manual_wp_col[manual_wp_count - 1] == manual_wp_cursor_col &&
+            manual_wp_row[manual_wp_count - 1] == manual_wp_cursor_row) {
+          manual_wp_count--;
+          Serial.printf("WP: deleted #%d at col=%d row=%d\n",
+                        (int)(manual_wp_count + 1), (int)manual_wp_cursor_col, (int)manual_wp_cursor_row);
+        } else if (manual_wp_count < MANUAL_WP_MAX) {
+          manual_wp_col[manual_wp_count] = manual_wp_cursor_col;
+          manual_wp_row[manual_wp_count] = manual_wp_cursor_row;
+          manual_wp_count++;
+          Serial.printf("WP: added #%d at col=%d row=%d\n",
+                        (int)manual_wp_count, (int)manual_wp_cursor_col, (int)manual_wp_cursor_row);
+        }
+      } else if (bfs_setup_step == 8) {
+        // Confirm screen: click starts run using manual waypoints.
+        bool pathOk = manualWaypointsToPath();
         if (pathOk) {
-          bfsSimplifyPath();
           bfs_run_active = true;
           bfs_current_target = bfsGetNextTarget();
           savePersistedSettings();
           bfs_run_phase = BFS_PHASE_IDLE;
           bfs_run_total_driven_m = 0.0f;
-          bfs_run_start_ms = 0;
+          // Compute total path distance for time-based speed scaling
+          bfs_run_total_path_dist_m = 0.0f;
+          for (uint16_t si = 0; si + 1 < bfs_state.path_length; si++) {
+            uint8_t a = bfs_state.path[si], b = bfs_state.path[si + 1];
+            float ddx = bfs_state.nodes[b].x_m - bfs_state.nodes[a].x_m;
+            float ddy = bfs_state.nodes[b].y_m - bfs_state.nodes[a].y_m;
+            bfs_run_total_path_dist_m += sqrtf(ddx * ddx + ddy * ddy);
+          }
+          Serial.printf("NAV: total_path_dist=%.2fm runTimeS=%.1fs\n",
+                        (double)bfs_run_total_path_dist_m, (double)runTimeS);
+          // Estimate non-driving overhead for time-based speed scaling.
+          {
+            int numSeg = (int)(bfs_state.path_length - 1);
+            float overheadS = 1.5f + (float)numSeg * 1.5f;
+            bfs_run_effective_drive_time_s = runTimeS - overheadS;
+            if (bfs_run_effective_drive_time_s < runTimeS * 0.3f)
+              bfs_run_effective_drive_time_s = runTimeS * 0.3f;
+            Serial.printf("NAV: numSeg=%d overhead=%.1fs effectiveDrive=%.1fs\n",
+                          numSeg, (double)overheadS, (double)bfs_run_effective_drive_time_s);
+          }
+          bfs_run_start_ms = 0;  // Will be set when robot first moves (2026 rules)
+          bfs_run_initialized = false;
           bfs_run_cumulative_yaw_deg = 0.0f;
 
           // Two-stage IMU calibration before entering BFS_RUN.
@@ -8941,43 +9391,56 @@ void loop() {
       settings_dirty_ms = millis();
     }
 
-    // Hold (800ms): advance from editor steps, or start run from confirm
+    // Hold (800ms): advance from editor steps, undo waypoint, or go back from confirm
     if (!bfsNavLongPressHandled && M5.BtnA.pressedFor(800)) {
       bfsNavLongPressHandled = true;
       if (bfs_setup_step >= 2 && bfs_setup_step <= 6) {
         // Editor steps: advance to next step
         bfs_setup_step++;
         if (bfs_setup_step == 7) {
-          // Entering confirm screen — pre-compute path for preview display
-          bfsInitializeGraph();
-          bfs_start_node = bfs_start_edge_node;
-          bfs_goal_node = bfs_end_center_node;
-          bool previewOk = (grid_course.gate_count > 0) ?
-                            bfsComputePathWithGates() :
-                            bfsComputePath(bfs_start_node, bfs_goal_node);
-          if (previewOk) {
-            bfsSimplifyPath();
-          } else {
-            Serial.println("BFS: path preview failed (no valid path)");
-          }
+          // Entering waypoint editor — init cursor near start position
+          float spacing_m = (float)grid_course.spacing_cm * 0.01f;
+          float sx = 0.5f * ((float)grid_course.start_c1 + (float)grid_course.start_c2) * spacing_m;
+          float sy = 0.5f * ((float)grid_course.start_r1 + (float)grid_course.start_r2) * spacing_m;
+          manual_wp_cursor_col = (uint8_t)(sx / 0.25f + 0.5f);
+          manual_wp_cursor_row = (uint8_t)(sy / 0.25f + 0.5f);
+          if (manual_wp_cursor_col >= MANUAL_GRID_COLS) manual_wp_cursor_col = MANUAL_GRID_COLS - 1;
+          if (manual_wp_cursor_row >= MANUAL_GRID_ROWS) manual_wp_cursor_row = MANUAL_GRID_ROWS - 1;
+          manual_wp_cursor_idx = manual_wp_cursor_row * MANUAL_GRID_COLS + manual_wp_cursor_col;
         }
       } else if (bfs_setup_step == 7) {
-        // Confirm screen: hold goes back one step
-        bfs_setup_step = 6;
+        // Waypoint editor: hold advances to confirm screen
+        if (manual_wp_count > 0) {
+          bfs_setup_step = 8;
+          // Pre-compute path for preview display
+          manualWaypointsToPath();
+        }
+      } else if (bfs_setup_step == 8) {
+        // Confirm screen: hold goes back to waypoint editor
+        bfs_setup_step = 7;
       }
     }
 
-    // Very long press (2s): exit back to main menu
+    // Very long press (2s): undo waypoint in step 7, exit to menu otherwise
     if (!bfsNavExitHandled && M5.BtnA.pressedFor(2000)) {
       bfsNavExitHandled = true;
-      savePersistedSettings();
-      enterScreen(SCREEN_MAIN_MENU);
+      if (bfs_setup_step == 7 && manual_wp_count > 0) {
+        // Undo last waypoint
+        manual_wp_count--;
+        Serial.printf("WP: undo, now %d waypoints\n", (int)manual_wp_count);
+      } else {
+        savePersistedSettings();
+        enterScreen(SCREEN_MAIN_MENU);
+      }
     }
 
     stopAllMotors();
   }
 
   else if (currentScreen == SCREEN_BFS_RUN) {
+    // Fresh IMU read every loop iteration — prevents yaw drift during display pushSprite blocks
+    if (imu_present && imu_control_enabled) imuIntegrateOnce();
+
     // BFS path-following run screen
     if ((now - boot_ms) > 500 && M5.BtnA.wasClicked()) {
       // Stop BFS run
@@ -8987,9 +9450,10 @@ void loop() {
       enterScreen(SCREEN_BFS_NAV);
     }
 
-    // Initialize on first entry
-    if (bfs_run_start_ms == 0) {
-      bfs_run_start_ms = now;
+    // Initialize on first entry (bfs_run_start_ms is already set when user clicked start)
+    if (bfs_run_phase == BFS_PHASE_IDLE && !bfs_run_initialized) {
+      bfs_run_initialized = true;
+      // bfs_run_start_ms will be set when robot first moves (2026 rule: Run Time begins when Robot begins to move)
       bfs_run_start_yaw = imu_yaw;
       bfs_run_cumulative_yaw_deg = imu_yaw;
       // Reset encoder health counters for this run
@@ -9070,10 +9534,7 @@ void loop() {
         float current_grid_heading = bfs_run_initial_heading_deg + (bfs_run_start_yaw - imu_yaw);
         // The turn delta in grid frame is (target - current).
         // Convert to IMU frame: IMU turns opposite to grid, so negate.
-        float turn_delta = target_heading_deg - current_grid_heading;
-        // Normalize
-        while (turn_delta > 180.0f) turn_delta -= 360.0f;
-        while (turn_delta < -180.0f) turn_delta += 360.0f;
+        float turn_delta = wrapDeg(target_heading_deg - current_grid_heading);
         // Apply relative to current fresh IMU yaw
         bfs_run_target_yaw_deg = imu_yaw - turn_delta;
 
@@ -9085,6 +9546,12 @@ void loop() {
         bfs_run_phase = BFS_PHASE_TURN;
         bfs_turn_first_in_tol_ms = 0;  // reset settle timer for new turn
         bfs_turn_start_ms = now;       // record when turn started
+        // Reset ALL turn PID state to prevent cumulative error
+        bfs_turn_integral = 0.0f;
+        // Initialize prev_err to actual initial error to avoid derivative spike
+        bfs_turn_prev_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
+        bfs_turn_dFilt = 0.0f;
+        bfs_turn_pid_last_us = (uint32_t)micros();
         Serial.printf("BFS_RUN: segment %s->%s dist=%.2f heading=%.1f target_yaw=%.1f\n",
                       bfs_state.nodes[curNode].name, bfs_state.nodes[nextNode].name,
                       (double)bfs_run_segment_dist_m, (double)(target_heading_deg),
@@ -9093,16 +9560,16 @@ void loop() {
     }
     else if (bfs_run_phase == BFS_PHASE_TURN) {
       // Pivot in place to face the next waypoint
-      float yaw_err = bfs_run_target_yaw_deg - imu_yaw;
-      // Normalize to [-180, 180]
-      while (yaw_err > 180.0f) yaw_err -= 360.0f;
-      while (yaw_err < -180.0f) yaw_err += 360.0f;
+      float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
       if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
         // In tolerance — stop motors and hold for settle time (like turn test)
         stopAllMotors();
-        if (bfs_turn_first_in_tol_ms == 0) bfs_turn_first_in_tol_ms = now;
-        if ((now - bfs_turn_first_in_tol_ms) >= BFS_TURN_SETTLE_MS) {
+        // Require BOTH position in tolerance AND low angular rate
+        bool gyroStill = fabsf(imu_gz_dps) < 8.0f;
+        if (bfs_turn_first_in_tol_ms == 0 && gyroStill) bfs_turn_first_in_tol_ms = now;
+        if (!gyroStill) bfs_turn_first_in_tol_ms = 0;
+        if (bfs_turn_first_in_tol_ms != 0 && (now - bfs_turn_first_in_tol_ms) >= BFS_TURN_SETTLE_MS) {
           // Settled — enter BRAKE then SETTLE before driving
           bfs_turn_first_in_tol_ms = 0;
           bfs_run_brake_start_ms = now;
@@ -9116,17 +9583,68 @@ void loop() {
         // Out of tolerance — reset settle timer
         bfs_turn_first_in_tol_ms = 0;
 
-        // Pivot: positive error = turn left (CCW), negative = turn right (CW)
+        // PID-based turn: compute real dt (microsecond precision)
+        float dt;
+        { uint32_t nowUs = (uint32_t)micros();
+          uint32_t dtUs = nowUs - bfs_turn_pid_last_us;
+          if (dtUs < 100) dtUs = 100;
+          if (dtUs > 50000) dtUs = 50000;
+          dt = (float)dtUs * 1e-6f;
+          bfs_turn_pid_last_us = nowUs;
+        }
+
+        // Leaky integral (only accumulate when error is meaningful)
+        const float turnKi = 1.0f;
+        const float turnKd = 0.03f;
+        const float turnILeakTau = 1.0f;
+        bfs_turn_integral -= bfs_turn_integral * (dt / turnILeakTau);
+        if (fabsf(yaw_err) > 0.5f) {
+          bfs_turn_integral += yaw_err * dt;
+        }
+        // Anti-windup: clamp integral contribution to ±12 PWM
+        const float turnIMaxPwm = 12.0f;
+        float iLim = turnIMaxPwm / turnKi;
+        if (bfs_turn_integral > iLim) bfs_turn_integral = iLim;
+        if (bfs_turn_integral < -iLim) bfs_turn_integral = -iLim;
+
+        // Low-pass filtered derivative
+        float rawDeriv = (yaw_err - bfs_turn_prev_err) / dt;
+        bfs_turn_prev_err = yaw_err;
+        const float turnDFilterTau = 0.030f;
+        float dAlpha = dt / (turnDFilterTau + dt);
+        bfs_turn_dFilt += dAlpha * (rawDeriv - bfs_turn_dFilt);
+
+        // Base PWM from proportional scaling with proper crawl zone
+        float absErr = fabsf(yaw_err);
+        float basePwm;
+        if (absErr > 45.0f) {
+          basePwm = BFS_TURN_PWM;  // full speed for large errors
+        } else if (absErr > 15.0f) {
+          basePwm = 110.0f + (absErr - 15.0f) * (BFS_TURN_PWM - 110.0f) / 30.0f;
+        } else if (absErr > 5.0f) {
+          // Crawl zone: ramp from 110 down to 100 between 15° and 5°
+          float t = (absErr - 5.0f) / 10.0f;
+          basePwm = 100.0f + t * 10.0f;
+        } else {
+          // Fine zone: stays at 100 (motor minimum)
+          basePwm = 100.0f;
+        }
+
+        // I and D corrections: sign-aware relative to error direction.
+        float errSign = (yaw_err > 0.0f) ? 1.0f : -1.0f;
+        float correction = (turnKi * bfs_turn_integral + turnKd * bfs_turn_dFilt) * errSign;
+        float turnPwmF = basePwm + correction;
+        if (turnPwmF > 200.0f) turnPwmF = 200.0f;
+        if (turnPwmF < 100) turnPwmF = 100;
+
         int sign = (yaw_err > 0.0f) ? 1 : -1;
-
-        float pwmScale = fabsf(yaw_err) / 45.0f;
-        if (pwmScale > 1.0f) pwmScale = 1.0f;
-        if (pwmScale < 0.35f) pwmScale = 0.35f;
-        uint8_t turnPwm = (uint8_t)(BFS_TURN_PWM * pwmScale);
-        if (turnPwm < BFS_TURN_CRAWL_PWM) turnPwm = BFS_TURN_CRAWL_PWM;
-
-        setMotorsPivotPwm(sign, turnPwm);
+        setMotorsPivotPwm(sign, (uint8_t)(turnPwmF + 0.5f));
         applyMotorOutputs();
+        // 2026 rule: Run Time begins when Robot begins to move
+        if (bfs_run_start_ms == 0) {
+          bfs_run_start_ms = millis();
+          Serial.printf("BFS_RUN: runtime started at first motor move\n");
+        }
       }
 
       // Timeout safety: 5 seconds max
@@ -9183,6 +9701,12 @@ void loop() {
         bfs_run_drive_start_ms = millis();  // for ENC_MODE_TIMED fallback
         bfs_run_phase = BFS_PHASE_DRIVE;
         bfs_drive_pd_first = true;  // reset PD state for new segment
+        // Reset ALL drive PID state to prevent cumulative error between segments
+        bfs_drive_integral = 0.0f;
+        bfs_drive_prev_err = 0.0f;
+        bfs_drive_dFilt = 0.0f;
+        bfs_drive_pid_last_us = 0;
+        bfs_drive_steer_ramp_start_ms = millis();  // post-turn steering ramp
         Serial.printf("BFS_RUN: SETTLE done, starting DRIVE encL=%ld encR=%ld var_g2=%.6f\n",
                       (long)encoderL_count, (long)encoderR_count, (double)var_g2);
       }
@@ -9199,7 +9723,11 @@ void loop() {
         brakeToStop(140, 400);
         // IMU-aware settle wait
         { unsigned long t0settle = millis();
-          while ((millis() - t0settle) < 300) { imuIntegrateOnce(); delay(5); } }
+          uint32_t lastImuPollUs = (uint32_t)micros();
+          while ((millis() - t0settle) < 300) {
+            uint32_t nUs = (uint32_t)micros();
+            if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
+          } }
         bfs_run_total_driven_m += bfs_run_driven_m;
         bfs_run_phase = BFS_PHASE_ARRIVED;
         Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (brakeToStop)\n",
@@ -9207,32 +9735,42 @@ void loop() {
                       (double)bfs_run_total_driven_m);
       } else {
         // Drive with yaw correction
-        float yaw_err = bfs_run_target_yaw_deg - imu_yaw;
-        while (yaw_err > 180.0f) yaw_err -= 360.0f;
-        while (yaw_err < -180.0f) yaw_err += 360.0f;
+        float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
-        // PD steering: proportional + derivative on yaw error using micros()-based dt.
-        static float prevYawErrDeg = 0.0f;
-        static uint32_t prevYawErrUs = 0;
-        if (bfs_drive_pd_first) {
-          prevYawErrDeg = yaw_err;
-          prevYawErrUs = (uint32_t)micros();
-          bfs_drive_pd_first = false;
-        }
-        const uint32_t nowUs = (uint32_t)micros();
-        float dTerm = 0.0f;
-        if (prevYawErrUs != 0) {
-          const uint32_t dtUs = nowUs - prevYawErrUs;
-          if (dtUs > 0) {
-            const float dt_s = (float)dtUs * 1e-6f;
-            if (dt_s > 0.0f && dt_s < 0.5f) {
-              const float dErr = yaw_err - prevYawErrDeg;
-              dTerm = BFS_DRIVE_STEER_KD * (dErr / dt_s);
-            }
+        // Full PID steering (matching square test quality)
+        // Full PID steering: compute real dt (microsecond precision)
+        float dt;
+        { uint32_t nowUs = (uint32_t)micros();
+          if (bfs_drive_pid_last_us == 0) {
+            dt = 0.010f;
+            bfs_drive_prev_err = yaw_err;
+          } else {
+            uint32_t dtUs = nowUs - bfs_drive_pid_last_us;
+            if (dtUs < 100) dtUs = 100;
+            if (dtUs > 50000) dtUs = 50000;
+            dt = (float)dtUs * 1e-6f;
           }
+          bfs_drive_pid_last_us = nowUs;
         }
-        prevYawErrUs = nowUs;
-        prevYawErrDeg = yaw_err;
+
+        // Leaky integral for steady-state bias correction
+        const float driveILeakTau = 1.0f;
+        bfs_drive_integral -= bfs_drive_integral * (dt / driveILeakTau);
+        if (fabsf(yaw_err) > 0.1f) {
+          bfs_drive_integral += yaw_err * dt;
+        }
+        // Anti-windup: clamp integral contribution to ±25 PWM
+        const float driveIMaxCorr = 25.0f;
+        float driveILim = driveIMaxCorr / BFS_DRIVE_STEER_KI;
+        if (bfs_drive_integral > driveILim) bfs_drive_integral = driveILim;
+        if (bfs_drive_integral < -driveILim) bfs_drive_integral = -driveILim;
+
+        // Low-pass filtered derivative
+        float rawDeriv = (yaw_err - bfs_drive_prev_err) / dt;
+        bfs_drive_prev_err = yaw_err;
+        const float driveDFilterTau = 0.030f;
+        float dAlpha = dt / (driveDFilterTau + dt);
+        bfs_drive_dFilt += dAlpha * (rawDeriv - bfs_drive_dFilt);
 
         // Deceleration zone: boost KP in last 0.30m (like straight test)
         float remaining = bfs_run_segment_dist_m - bfs_run_driven_m;
@@ -9241,9 +9779,22 @@ void loop() {
           effectiveKp = BFS_DRIVE_STEER_KP * 1.5f;
         }
 
-        float steerCorr = effectiveKp * yaw_err + dTerm;
+        float steerCorr = effectiveKp * yaw_err
+                        + BFS_DRIVE_STEER_KI * bfs_drive_integral
+                        + BFS_DRIVE_STEER_KD * bfs_drive_dFilt;
         if (steerCorr > 60.0f) steerCorr = 60.0f;
         if (steerCorr < -60.0f) steerCorr = -60.0f;
+
+        // Post-turn steering ramp: suppress correction briefly to avoid jerk
+        if (bfs_drive_steer_ramp_start_ms > 0) {
+          unsigned long rampElapsed = now - bfs_drive_steer_ramp_start_ms;
+          if (rampElapsed < BFS_DRIVE_STEER_RAMP_MS) {
+            float rampFactor = (float)rampElapsed / (float)BFS_DRIVE_STEER_RAMP_MS;
+            steerCorr *= rampFactor;
+          } else {
+            bfs_drive_steer_ramp_start_ms = 0;  // ramp complete
+          }
+        }
 
         // Deceleration zone: ramp down over last 0.20m (matching straight test)
         float speedFactor = 1.0f;
@@ -9252,8 +9803,33 @@ void loop() {
           if (speedFactor < 0.30f) speedFactor = 0.30f;
         }
 
-        float basePwm = BFS_DRIVE_PWM * speedFactor;
-        if (basePwm < 105.0f) basePwm = 105.0f;
+        // Time-based drive PWM: scale speed to finish path within runTimeS.
+        // Subtract estimated non-driving overhead so nominalMps reflects actual drive speed needed.
+        float drivePwm = (float)BFS_DRIVE_PWM;
+        if (runTimeS > 0.0f && bfs_run_effective_drive_time_s > 0.1f && bfs_run_total_path_dist_m > 0.1f) {
+          float elapsedS = (float)(now - bfs_run_start_ms) * 0.001f;
+          float remainPathM = bfs_run_total_path_dist_m - bfs_run_total_driven_m - bfs_run_driven_m;
+          if (remainPathM < 0.0f) remainPathM = 0.0f;
+          // Subtract estimated future overhead from remaining wall-clock time
+          // Current segment brakeToStop+IMU_settle = 0.7s, each future segment ≈ 1.5s
+          int segsAfterCurrent = (int)(bfs_state.path_length - bfs_state.path_index) - 1;
+          if (segsAfterCurrent < 0) segsAfterCurrent = 0;
+          float futureOverheadS = 0.7f + (float)segsAfterCurrent * 1.5f;
+          float remainTimeS = runTimeS - elapsedS - futureOverheadS;
+          if (remainTimeS < 0.5f) remainTimeS = 0.5f;
+          // Target speed to use remaining effective drive time (1.05x bias → prefer overshoot)
+          float targetMps = remainPathM / (remainTimeS * 1.05f);
+          float nominalMps = bfs_run_total_path_dist_m / bfs_run_effective_drive_time_s;
+          // Clamp: never go below 60% or above 130% of nominal
+          if (targetMps < nominalMps * 0.60f) targetMps = nominalMps * 0.60f;
+          if (targetMps > nominalMps * 1.30f) targetMps = nominalMps * 1.30f;
+          drivePwm = (float)BFS_DRIVE_PWM * (targetMps / nominalMps);
+        }
+        if (drivePwm < 110.0f) drivePwm = 110.0f;
+        if (drivePwm > 220.0f) drivePwm = 220.0f;
+
+        float basePwm = drivePwm * speedFactor;
+        if (basePwm < 110.0f) basePwm = 110.0f;
         // Positive yaw_err → need to turn LEFT (CCW, increase IMU yaw)
         // → slow left wheel, speed up right wheel
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
@@ -9269,6 +9845,11 @@ void loop() {
 
         setMotorsForwardPwm((uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f));
         applyMotorOutputs();
+        // 2026 rule: Run Time begins when Robot begins to move
+        if (bfs_run_start_ms == 0) {
+          bfs_run_start_ms = millis();
+          Serial.printf("BFS_RUN: runtime started at first drive move\n");
+        }
 
         // Periodic debug
         static unsigned long lastBfsDriveLog = 0;
@@ -11558,9 +12139,13 @@ void loop() {
     }
   }
 
-  // Render the active screen
+  // Render the active screen — throttle during active tests to reduce loop jitter
   static unsigned long lastDisplay = 0;
-  if (now - lastDisplay > DISPLAY_REFRESH_MS) {
+  const bool testRunning = (sq_phase != SQ_IDLE && sq_phase != SQ_DONE) ||
+                           (str_phase != STR_IDLE && str_phase != STR_DONE) ||
+                           (bfs_run_phase != BFS_PHASE_IDLE) || runActive;
+  const unsigned long displayInterval = testRunning ? 200u : DISPLAY_REFRESH_MS;
+  if (now - lastDisplay > displayInterval) {
     lastDisplay = now;
     renderCurrentScreen();
   }
@@ -11606,11 +12191,11 @@ static void calibrateImuGyroBias() {
   imu_cal_progress = 0;
 
   const unsigned long t0 = millis();
-  // 1.5s hands-off wait
-  while ((millis() - t0) < 1500u) {
+  // 0.5s hands-off wait (enough for post-button vibrations to settle)
+  while ((millis() - t0) < 500u) {
     float ax, ay, az, gx, gy, gz, tmp;
     (void)imu6886Read(&ax, &ay, &az, &gx, &gy, &gz, &tmp);
-    imu_cal_progress = (int)(((millis() - t0) * 15u) / 1500u);
+    imu_cal_progress = (int)(((millis() - t0) * 15u) / 500u);
     if (imu_cal_progress < 0) imu_cal_progress = 0;
     if (imu_cal_progress > 15) imu_cal_progress = 15;
     drawImuCalScreen();
@@ -11621,15 +12206,15 @@ static void calibrateImuGyroBias() {
   double sumGz = 0.0;
   int samples = 0;
   int attempts = 0;
-  const int MAX_ATTEMPTS = 3000;  // bail if IMU fails repeatedly
-  while (samples < 1000 && attempts < MAX_ATTEMPTS) {
+  const int MAX_ATTEMPTS = 1500;  // bail if IMU fails repeatedly
+  while (samples < 500 && attempts < MAX_ATTEMPTS) {
     float ax, ay, az, gx, gy, gz, tmp;
     const bool ok = imu6886Read(&ax, &ay, &az, &gx, &gy, &gz, &tmp);
     attempts++;
     if (ok) {
       sumGz += (double)gz;
       samples += 1;
-      imu_cal_progress = 15 + (samples * 85) / 1000;
+      imu_cal_progress = 15 + (samples * 85) / 500;
       if (imu_cal_progress > 100) imu_cal_progress = 100;
     }
     if ((attempts & 0xF) == 0) {
@@ -11639,8 +12224,8 @@ static void calibrateImuGyroBias() {
     }
     yield();
   }
-  if (samples < 1000) {
-    Serial.printf("IMU CAL: only got %d/1000 samples in %d attempts — sensor may be disconnected\n", samples, attempts);
+  if (samples < 500) {
+    Serial.printf("IMU CAL: only got %d/500 samples in %d attempts — sensor may be disconnected\n", samples, attempts);
   }
 
   const double avg = (samples > 0) ? (sumGz / (double)samples) : 0.0;
