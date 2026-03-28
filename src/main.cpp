@@ -3354,7 +3354,7 @@ static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering r
 #define BFS_TURN_CRAWL_DEG 15.0f
 #define BFS_TURN_CRAWL_PWM 115
 #define BFS_DRIVE_PWM 130
-#define BFS_DRIVE_STEER_KP 2.0f
+#define BFS_DRIVE_STEER_KP 0.5f
 #define BFS_DRIVE_STEER_KI 1.0f
 #define BFS_DRIVE_STEER_KD 0.06f
 #define BFS_ARRIVE_TOLERANCE_M 0.08f
@@ -3647,7 +3647,7 @@ static float runDebug_turnRemainingDeg = NAN;
 
 // Stall avoidance during RUN: if we are commanding motion, keep PWM above this.
 // Tune based on testing.
-#define RUN_MIN_PWM 95.0f
+#define RUN_MIN_PWM 170.0f
 
 // Test mode: lock RUN PWM (bypasses speed PI). Useful for heading tuning and diagnosing power/brownout.
 // NOTE: v73 phased navigation uses a distance-based S-curve profile instead.
@@ -3657,15 +3657,15 @@ static float runDebug_turnRemainingDeg = NAN;
 // Distance-based speed profile (S-curve) to reduce wheel slip and improve repeatability.
 // Applied per drive phase using down-course distance (forwardM).
 #define RUN_SPEED_PROFILE_ENABLE 0
-#define RUN_SPEED_PROFILE_MAX_PWM 235.0f
-#define RUN_SPEED_PROFILE_MIN_PWM 110.0f
+#define RUN_SPEED_PROFILE_MAX_PWM 255.0f
+#define RUN_SPEED_PROFILE_MIN_PWM 170.0f
 #define RUN_SPEED_PROFILE_ACCEL_M 0.35f
 #define RUN_SPEED_PROFILE_DECEL_M 1.00f
 
 // Extra kick at the beginning of each run to break static friction.
 // Prevents early NO_MOTION stop if the car doesn't start rolling.
 #define RUN_SPEED_PROFILE_START_BOOST_MS 400
-#define RUN_SPEED_PROFILE_START_BOOST_PWM 90.0f
+#define RUN_SPEED_PROFILE_START_BOOST_PWM 170.0f
 
 // If the car still hasn't moved (encoder pulses) shortly after start,
 // keep applying an extra kick for a bit longer.
@@ -3673,6 +3673,28 @@ static float runDebug_turnRemainingDeg = NAN;
 #define RUN_START_ASSIST_MS 1200
 #define RUN_START_ASSIST_PWM 90.0f
 #define RUN_START_ASSIST_MAX_PULSES 60
+
+// No-motion ramp: If no encoder movement, ramp to full 255 PWM over this many ms.
+#define NO_MOTION_RAMP_TO_MAX_MS 3000u
+#define NO_MOTION_RAMP_DELAY_MS 300u
+#define NO_MOTION_RAMP_START_PWM 200.0f
+#define NO_MOTION_RAMP_MAX_PWM 255.0f
+
+static float calcNoMotionRampPwm(float currentPwm, uint32_t noMotionMs) {
+  if (noMotionMs < NO_MOTION_RAMP_DELAY_MS) {
+    return currentPwm;
+  }
+  uint32_t rampMs = noMotionMs - NO_MOTION_RAMP_DELAY_MS;
+  float frac = (float)rampMs / (float)NO_MOTION_RAMP_TO_MAX_MS;
+  if (frac < 0.0f) frac = 0.0f;
+  if (frac > 1.0f) frac = 1.0f;
+  float target = NO_MOTION_RAMP_START_PWM + frac * (NO_MOTION_RAMP_MAX_PWM - NO_MOTION_RAMP_START_PWM);
+  if (target > NO_MOTION_RAMP_MAX_PWM) target = NO_MOTION_RAMP_MAX_PWM;
+  if (target < currentPwm) {
+    return currentPwm;
+  }
+  return target;
+}
 
 // Phased CAN navigation (stop/turn/drive segments)
 // Active only when CAN DIST is enabled and IMU control is OK.
@@ -4537,8 +4559,8 @@ void driveMotor(uint8_t motor_addr, uint8_t direction, uint8_t speed) {
     if (motor_addr == MOTOR_R_ADDR) logical_dir = logical_dir ? 0 : 1;
   #endif
     reg_dir = logical_dir ? 1 : 2;
-    // Per-motor minimum PWM (just above stall threshold)
-    uint8_t minPwm = 110;
+    // Use global RUN_MIN_PWM for consistency across all motor commands
+    uint8_t minPwm = (uint8_t)RUN_MIN_PWM;
     pwm = (speed < minPwm) ? minPwm : speed;
   }
 
@@ -4889,6 +4911,7 @@ static uint8_t hw_min_pwm_R = 0;       // result: right motor minimum PWM
 static int32_t hw_find_enc_snap_L = 0; // encoder snapshot for current step
 static int32_t hw_find_enc_snap_R = 0;
 static unsigned long hw_find_step_ms = 0; // when current step started
+static unsigned long hw_find_start_ms = 0; // when sweep started (for ramp behavior)
 static bool hw_find_done = false;      // sweep completed?
 static const uint8_t HW_FIND_START_PWM = 50;  // start ramp from here
 static const unsigned long HW_FIND_STEP_DURATION_MS = 300; // time at each PWM level
@@ -7390,24 +7413,15 @@ static bool sqTestTick() {
           }
 
           const uint32_t sinceEncMoveMs_sq = (lastMotionMs_sq != 0) ? ((uint32_t)now - (uint32_t)lastMotionMs_sq) : 0u;
-          const uint32_t NO_MOTION_BOOST_AFTER_MS = 300u;
-          const uint32_t NO_MOTION_BOOST_RAMP_MS = 1200u; // time to reach max boost
-          const float NO_MOTION_BOOST_PWM_START = 20.0f;
-          const float NO_MOTION_BOOST_PWM_MAX = 80.0f; // gentle max boost to overcome stiction
-          const float MAX_SQ_SAFE_PWM = 160.0f; // cap to keep speeds moderate and limit drift
-          if (sinceEncMoveMs_sq >= NO_MOTION_BOOST_AFTER_MS && sinceEncMoveMs_sq < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
-            float frac;
-            if (sinceEncMoveMs_sq >= NO_MOTION_BOOST_RAMP_MS) frac = 1.0f;
-            else frac = (float)(sinceEncMoveMs_sq - NO_MOTION_BOOST_AFTER_MS) / (float)(NO_MOTION_BOOST_RAMP_MS - NO_MOTION_BOOST_AFTER_MS);
-            if (frac < 0.0f) frac = 0.0f;
-            if (frac > 1.0f) frac = 1.0f;
-            float boost = NO_MOTION_BOOST_PWM_START + frac * (NO_MOTION_BOOST_PWM_MAX - NO_MOTION_BOOST_PWM_START);
+          if (sinceEncMoveMs_sq >= NO_MOTION_RAMP_DELAY_MS && sinceEncMoveMs_sq < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+            float targetRamp = calcNoMotionRampPwm(0.0f, sinceEncMoveMs_sq);
+            const float MAX_SQ_SAFE_PWM = 160.0f;
             if (leftPwm > 0.0f) {
-              leftPwm += boost;
+              leftPwm = fmaxf(leftPwm, targetRamp);
               if (leftPwm > MAX_SQ_SAFE_PWM) leftPwm = MAX_SQ_SAFE_PWM;
             }
             if (rightPwm > 0.0f) {
-              rightPwm += boost;
+              rightPwm = fmaxf(rightPwm, targetRamp);
               if (rightPwm > MAX_SQ_SAFE_PWM) rightPwm = MAX_SQ_SAFE_PWM;
             }
           }
@@ -7768,8 +7782,8 @@ static bool strTestTick() {
         float yaw_err = wrapDeg(str_start_yaw - imu_yaw);
 
         // Leaky integral to fight steady-state drift from motor/encoder asymmetry
-        const float str_steerKi = 4.0f;
-        const float str_steerKd = 0.20f;
+        const float str_steerKi = 0.8f;
+        const float str_steerKd = 0.05f;
         const float str_iLeakTau = 1.0f;
         // Measure real dt; clamp to [100us, 50ms] to prevent spikes after stalls
         float dt;
@@ -7811,8 +7825,8 @@ static bool strTestTick() {
         float steerCorr = effectiveKp * yaw_err
                         + str_steerKi * str_steerI
                         + str_steerKd * str_dFilt;
-        if (steerCorr > 60.0f) steerCorr = 60.0f;
-        if (steerCorr < -60.0f) steerCorr = -60.0f;
+        if (steerCorr > 30.0f) steerCorr = 30.0f;
+        if (steerCorr < -30.0f) steerCorr = -30.0f;
 
         // Decel near end — short zone + high floor to maintain steering authority
         float speedFactor = 1.0f;
@@ -7824,16 +7838,14 @@ static bool strTestTick() {
         float basePwm = BFS_DRIVE_PWM * speedFactor;
         if (basePwm < 110.0f) basePwm = 110.0f;
 
-        float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
-        float rightPwm = basePwm + steerCorr - (float)motor_bias_pwm;
+        // Apply steering correction (inverted for correct left/right response)
+        float leftPwm = basePwm + steerCorr + (float)motor_bias_pwm;
+        float rightPwm = basePwm - steerCorr - (float)motor_bias_pwm;
         if (leftPwm < 0.0f) leftPwm = 0.0f;
         if (rightPwm < 0.0f) rightPwm = 0.0f;
         if (leftPwm > 255.0f) leftPwm = 255.0f;
         if (rightPwm > 255.0f) rightPwm = 255.0f;
-        // Prevent one-wheel stall: if either motor is commanded above zero
-        // but below the hardware minimum, clamp it up so it actually spins
-        if (leftPwm > 0.0f && leftPwm < 100.0f) leftPwm = 100.0f;
-        if (rightPwm > 0.0f && rightPwm < 110.0f) rightPwm = 110.0f;
+        // Allow steering to reduce one motor below basePwm (but not below 0)
 
         // Auto-boost if not moving
         {
@@ -7846,14 +7858,16 @@ static bool strTestTick() {
             str_lastMotionMs = now;
           }
           const uint32_t sinceMotionMs = (str_lastMotionMs != 0) ? ((uint32_t)now - (uint32_t)str_lastMotionMs) : 0u;
-          if (sinceMotionMs >= 300u && sinceMotionMs < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
-            float frac = (float)(sinceMotionMs - 300u) / 900.0f;
-            if (frac > 1.0f) frac = 1.0f;
-            float boost = 20.0f + frac * 60.0f;
-            leftPwm += boost;
-            rightPwm += boost;
-            if (leftPwm > 160.0f) leftPwm = 160.0f;
-            if (rightPwm > 160.0f) rightPwm = 160.0f;
+          if (sinceMotionMs >= NO_MOTION_RAMP_DELAY_MS && sinceMotionMs < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+            float targetRamp = calcNoMotionRampPwm(0.0f, sinceMotionMs);
+            if (leftPwm > 0.0f) {
+              leftPwm = fmaxf(leftPwm, targetRamp);
+              if (leftPwm > 255.0f) leftPwm = 255.0f;
+            }
+            if (rightPwm > 0.0f) {
+              rightPwm = fmaxf(rightPwm, targetRamp);
+              if (rightPwm > 255.0f) rightPwm = 255.0f;
+            }
           }
         }
 
@@ -11633,18 +11647,16 @@ void loop() {
                                     canPhase == CANP_TURN_BACK_IN || canPhase == CANP_TURN_TO_CENTER ||
                                     canPhase == CANP_TURN_SETTLE))) {
             // Auto-boost: if we're commanding forward motion but encoders show no movement,
-            // gently increase PWM to try to overcome static friction. Conservative defaults
-            // are used to avoid unsafe commands. Boost only applies when target > 0.
+            // ramp PWM toward 255 over NO_MOTION_RAMP_TO_MAX_MS.
             const uint32_t sinceEncMoveMs = (lastMotionMs != 0) ? ((uint32_t)now - (uint32_t)lastMotionMs) : 0u;
-            const uint32_t NO_MOTION_BOOST_AFTER_MS = 300u; // wait this long before attempting boost
-            const float NO_MOTION_BOOST_PWM = 20.0f;       // additive PWM to try
-            if (effectiveTargetForwardRate > 0.0f && sinceEncMoveMs >= NO_MOTION_BOOST_AFTER_MS && sinceEncMoveMs < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+            if (effectiveTargetForwardRate > 0.0f && sinceEncMoveMs >= NO_MOTION_RAMP_DELAY_MS && sinceEncMoveMs < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+              float targetRamp = calcNoMotionRampPwm(0.0f, sinceEncMoveMs);
               if (leftPWMf > 0.0f) {
-                leftPWMf += NO_MOTION_BOOST_PWM;
+                leftPWMf = fmaxf(leftPWMf, targetRamp);
                 if (leftPWMf > 255.0f) leftPWMf = 255.0f;
               }
               if (rightPWMf > 0.0f) {
-                rightPWMf += NO_MOTION_BOOST_PWM;
+                rightPWMf = fmaxf(rightPWMf, targetRamp);
                 if (rightPWMf > 255.0f) rightPWMf = 255.0f;
               }
             }
@@ -11801,6 +11813,7 @@ void loop() {
         hw_find_done = false;
         hw_find_motor = 0; // start with left motor
         hw_find_pwm = HW_FIND_START_PWM;
+        hw_find_start_ms = millis();
         hw_min_pwm_L = 0;
         hw_min_pwm_R = 0;
         stopAllMotors();
@@ -11866,6 +11879,7 @@ void loop() {
             // Switch to right motor
             hw_find_motor = 1;
             hw_find_pwm = HW_FIND_START_PWM;
+            hw_find_start_ms = millis();
             readWheelEncodersInternal(true);
             hw_find_enc_snap_L = encoderL_count;
             hw_find_enc_snap_R = encoderR_count;
@@ -11884,8 +11898,15 @@ void loop() {
                           (int)hw_min_pwm_L, (int)hw_min_pwm_R);
           }
         } else {
-          // No movement yet — increment PWM and continue
-          hw_find_pwm++;
+          // No movement yet — ramp PWM toward 255 in first 3 seconds 
+          uint32_t sinceStartMs = (uint32_t)(now - hw_find_start_ms);
+          float frac = (float)sinceStartMs / (float)NO_MOTION_RAMP_TO_MAX_MS;
+          if (frac < 0.0f) frac = 0.0f;
+          if (frac > 1.0f) frac = 1.0f;
+          uint8_t targetPwm = (uint8_t)(HW_FIND_START_PWM + frac * (NO_MOTION_RAMP_MAX_PWM - NO_MOTION_RAMP_START_PWM) + 0.5f);
+          if (targetPwm < hw_find_pwm + 1) targetPwm = hw_find_pwm + 1;
+          if (targetPwm > 255) targetPwm = 255;
+          hw_find_pwm = targetPwm;
           readWheelEncodersInternal(true);
           hw_find_enc_snap_L = encoderL_count;
           hw_find_enc_snap_R = encoderR_count;
@@ -11945,18 +11966,17 @@ void loop() {
           lastMotionMs_hw = now;
         }
         const uint32_t sinceEncMoveMs_hw = (lastMotionMs_hw != 0) ? ((uint32_t)now - (uint32_t)lastMotionMs_hw) : 0u;
-        const uint32_t NO_MOTION_BOOST_AFTER_MS = 300u;
-        const float NO_MOTION_BOOST_PWM = 20.0f;
-        if (motor_enabled && sinceEncMoveMs_hw >= NO_MOTION_BOOST_AFTER_MS && sinceEncMoveMs_hw < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+        if (motor_enabled && sinceEncMoveMs_hw >= NO_MOTION_RAMP_DELAY_MS && sinceEncMoveMs_hw < (uint32_t)RUN_NO_MOTION_TIMEOUT_MS) {
+          float targetRamp = calcNoMotionRampPwm(0.0f, sinceEncMoveMs_hw);
           if (motor_l_speed > 0) {
-            int v = (int)motor_l_speed + (int)NO_MOTION_BOOST_PWM;
-            if (v > 255) v = 255;
-            motor_l_speed = (uint8_t)v;
+            float f = fmaxf((float)motor_l_speed, targetRamp);
+            if (f > 255.0f) f = 255.0f;
+            motor_l_speed = (uint8_t)f;
           }
           if (motor_r_speed > 0) {
-            int v = (int)motor_r_speed + (int)NO_MOTION_BOOST_PWM;
-            if (v > 255) v = 255;
-            motor_r_speed = (uint8_t)v;
+            float f = fmaxf((float)motor_r_speed, targetRamp);
+            if (f > 255.0f) f = 255.0f;
+            motor_r_speed = (uint8_t)f;
           }
         }
       }
