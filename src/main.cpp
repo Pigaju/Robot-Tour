@@ -9523,7 +9523,7 @@ void loop() {
 
         // Add 10cm to first segment to compensate for initial placement offset
         if (bfs_state.path_index == 1) {  // just advanced from 0→1, so this is the first segment
-          bfs_run_segment_dist_m += 0.10f;
+          bfs_run_segment_dist_m += 0.125f;
         }
 
         // Target heading in SCREEN frame (row→screenX, col→screenY):
