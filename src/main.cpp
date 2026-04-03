@@ -3357,7 +3357,7 @@ static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering r
 // BFS drive stall detection: skip segment if stuck
 static float bfs_drive_last_progress_m = 0.0f;
 static unsigned long bfs_drive_last_progress_ms = 0;
-#define BFS_DRIVE_STALL_TIMEOUT_MS 2500   // no progress for this long → skip segment
+#define BFS_DRIVE_STALL_TIMEOUT_MS 800    // no progress for this long → PWM burst to break free
 #define BFS_DRIVE_STALL_THRESHOLD_M 0.02f // minimum movement to count as progress
 
 // BFS run tuning
@@ -9813,18 +9813,21 @@ void loop() {
                       (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
                       (double)bfs_run_total_driven_m);
       } else {
-        // --- Stall detection: skip segment if stuck ---
+        // --- Anti-stall: PWM burst if stuck ---
         if ((bfs_run_driven_m - bfs_drive_last_progress_m) >= BFS_DRIVE_STALL_THRESHOLD_M) {
           bfs_drive_last_progress_m = bfs_run_driven_m;
           bfs_drive_last_progress_ms = now;
         }
         if ((now - bfs_drive_last_progress_ms) >= BFS_DRIVE_STALL_TIMEOUT_MS) {
-          stopAllMotors();
-          bfs_run_total_driven_m += bfs_run_driven_m;
-          bfs_run_phase = BFS_PHASE_ARRIVED;
-          Serial.printf("BFS_DRIVE: STALL skip at %.3f/%.2fm, moving to next segment\n",
+          // Brief full-power burst to break free
+          setMotorsForwardPwm(220, 220);
+          applyMotorOutputs();
+          delay(50);
+          bfs_drive_last_progress_ms = now;  // reset timer after burst
+          Serial.printf("BFS_DRIVE: STALL burst at %.3f/%.2fm\n",
                         (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m);
-        } else {
+        }
+
         // Drive with yaw correction
         float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
@@ -9956,7 +9959,6 @@ void loop() {
                         encoderL_found ? 'Y' : 'N', encoderR_found ? 'Y' : 'N',
                         (long)encoderL_count, (long)encoderR_count);
         }
-        } // end if not stalled
       }
     }
   }
