@@ -3360,10 +3360,13 @@ static unsigned long bfs_drive_last_progress_ms = 0;
 #define BFS_DRIVE_STALL_TIMEOUT_MS 800    // no progress for this long → PWM burst to break free
 #define BFS_DRIVE_STALL_THRESHOLD_M 0.02f // minimum movement to count as progress
 
+// BFS expected heading tracker (independent of IMU drift)
+static float bfs_expected_heading_deg = 0.0f;  // accumulated from turn commands
+
 // BFS run tuning
 #define BFS_TURN_PWM 130
 #define BFS_TURN_TOLERANCE_DEG 5.0f
-#define BFS_TURN_SETTLE_MS 300
+#define BFS_TURN_SETTLE_MS 100
 #define BFS_TURN_CRAWL_DEG 15.0f
 #define BFS_TURN_CRAWL_PWM 115
 #define BFS_DRIVE_PWM 130
@@ -9498,6 +9501,9 @@ void loop() {
       // Initialize run logging for BFS
       testLogInit("BFS_NAV", bfs_run_total_path_dist_m);
 
+      // Initialize expected heading tracker
+      bfs_expected_heading_deg = bfs_run_initial_heading_deg;
+
       // Start by computing first segment
       bfs_run_phase = BFS_PHASE_ARRIVED;  // Will immediately compute first segment
       Serial.printf("BFS_RUN: init yaw=%.1f initial_heading=%.1f path_len=%d path_idx=%d\n",
@@ -9607,10 +9613,16 @@ void loop() {
         bfs_turn_prev_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
         bfs_turn_dFilt = 0.0f;
         bfs_turn_pid_last_us = (uint32_t)micros();
-        Serial.printf("BFS_RUN: segment %s->%s dist=%.2f heading=%.1f target_yaw=%.1f\n",
+        // Update expected heading tracker and check for turn errors
+        bfs_expected_heading_deg = target_heading_deg;
+        float actual_grid_heading = bfs_run_initial_heading_deg + (bfs_run_start_yaw - imu_yaw);
+        float heading_err = wrapDeg(bfs_expected_heading_deg - actual_grid_heading);
+        Serial.printf("BFS_RUN: segment %s->%s dist=%.2f heading=%.1f target_yaw=%.1f expected=%.1f actual=%.1f err=%.1f\n",
                       bfs_state.nodes[curNode].name, bfs_state.nodes[nextNode].name,
                       (double)bfs_run_segment_dist_m, (double)(target_heading_deg),
-                      (double)bfs_run_target_yaw_deg);
+                      (double)bfs_run_target_yaw_deg,
+                      (double)bfs_expected_heading_deg, (double)actual_grid_heading,
+                      (double)heading_err);
       }
     }
     else if (bfs_run_phase == BFS_PHASE_TURN) {
@@ -9743,7 +9755,7 @@ void loop() {
     else if (bfs_run_phase == BFS_PHASE_BRAKE) {
       // Brief electronic brake with motors commanded to 0 PWM.
       stopAllMotors();
-      if ((now - bfs_run_brake_start_ms) >= 150u) {
+      if ((now - bfs_run_brake_start_ms) >= 75u) {
         if (bfs_run_after_brake_phase == BFS_PHASE_SETTLE) {
           bfs_run_settle_start_ms = now;
           bfs_settle_mean_g = 0.0f;
@@ -9805,15 +9817,8 @@ void loop() {
       bfs_run_driven_m = getAverageDistanceMeters();
 
       if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
-        // Reached waypoint: closed-loop reverse brake (like straight test)
-        brakeToStop(140, 400);
-        // IMU-aware settle wait
-        { unsigned long t0settle = millis();
-          uint32_t lastImuPollUs = (uint32_t)micros();
-          while ((millis() - t0settle) < 300) {
-            uint32_t nUs = (uint32_t)micros();
-            if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
-          } }
+        // Reached waypoint: quick reverse brake then transition (non-blocking settle via BRAKE phase)
+        brakeToStop(140, 200);
         bfs_run_total_driven_m += bfs_run_driven_m;
         bfs_run_phase = BFS_PHASE_ARRIVED;
         Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (brakeToStop)\n",
