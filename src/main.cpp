@@ -9061,7 +9061,8 @@ void loop() {
 
     // Stall detection (relocated from gridHasWall): if commanded PWM high
     // but horizontal acceleration is very low for >400ms, latch cutoff.
-    {
+    // Skip during BFS runs — BFS has its own anti-stall burst logic.
+    if (!bfs_run_active) {
       const int maxPwm = (abs(motor_l_speed) > abs(motor_r_speed)) ? abs(motor_l_speed) : abs(motor_r_speed);
       const bool pwmHigh = (maxPwm > 100);
       const float horiz_g = sqrtf(imu_ax_g * imu_ax_g + imu_ay_g * imu_ay_g);
