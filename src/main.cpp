@@ -3018,7 +3018,8 @@ void runImuCalibration() {
       imu_calibrating = false;
       imu_cal_progress = 100;
       persistImuGyroBiasIfNeeded();
-      Serial.printf("IMU CAL DONE bias=%.3f dps\n", (double)imu_gz_bias_dps);
+      imu_yaw = 0.0f;  // Reset accumulated yaw so next run starts clean
+      Serial.printf("IMU CAL DONE bias=%.3f dps yaw reset\n", (double)imu_gz_bias_dps);
     }
   }
 }
