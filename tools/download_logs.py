@@ -15,6 +15,7 @@ import argparse
 import glob
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -148,6 +149,40 @@ def delete_all(ser):
     print("  delete_all: no confirmation received")
 
 
+def git_push_logs(saved_paths):
+    """Git add, commit, and push newly downloaded log files."""
+    if not saved_paths:
+        return
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        subprocess.run(["git", "add"] + saved_paths, cwd=repo_root, check=True,
+                        capture_output=True)
+        # Extract run numbers for commit message
+        run_nums = []
+        for p in saved_paths:
+            m = re.search(r"runlog_(\d+)", p)
+            if m and m.group(1) not in run_nums:
+                run_nums.append(m.group(1))
+        if run_nums:
+            msg = f"Add run logs ({', '.join(run_nums)})"
+        else:
+            msg = f"Add {len(saved_paths)} new log file(s)"
+        result = subprocess.run(["git", "commit", "-m", msg], cwd=repo_root,
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  git commit: nothing to commit or error")
+            return
+        print(f"  git commit: {msg}")
+        result = subprocess.run(["git", "push"], cwd=repo_root,
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            print("  git push: success")
+        else:
+            print(f"  git push: failed ({result.stderr.strip()})")
+    except Exception as e:
+        print(f"  git push logs failed: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Graphing
 # ---------------------------------------------------------------------------
@@ -257,6 +292,7 @@ def watch_loop(port=None):
                     saved = download_all(ser)
                     if saved:
                         delete_all(ser)
+                        git_push_logs(saved)
                         print(f"\nGraphing {len(saved)} file(s)...")
                         for f in saved:
                             graph_csv(f)
@@ -317,6 +353,7 @@ def main():
     if saved:
         delete_all(ser)
         ser.close()
+        git_push_logs(saved)
         print(f"\nGraphing {len(saved)} file(s)...")
         for f in saved:
             graph_csv(f)

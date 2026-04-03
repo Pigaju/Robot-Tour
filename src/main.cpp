@@ -2806,7 +2806,7 @@ static bool imu_control_enabled = true;
 // Motor bias (feedforward): constant PWM offset applied to left motor to compensate for
 // mechanical differences (e.g., left wheel has more drag). Positive = boost left motor.
 // This is applied as feedforward BEFORE the feedback loop, reducing how hard the PID must work.
-static int16_t motor_bias_pwm = -15;
+static int16_t motor_bias_pwm = -10;
 #define MOTOR_BIAS_STEP_PWM 1
 #define MOTOR_BIAS_MAX_PWM 40
 
@@ -3018,8 +3018,7 @@ void runImuCalibration() {
       imu_calibrating = false;
       imu_cal_progress = 100;
       persistImuGyroBiasIfNeeded();
-      imu_yaw = 0.0f;  // Reset accumulated yaw so next run starts clean
-      Serial.printf("IMU CAL DONE bias=%.3f dps yaw reset\n", (double)imu_gz_bias_dps);
+      Serial.printf("IMU CAL DONE bias=%.3f dps\n", (double)imu_gz_bias_dps);
     }
   }
 }
@@ -3340,12 +3339,6 @@ static float bfs_turn_prev_err = 0.0f;
 static float bfs_turn_dFilt = 0.0f;
 static uint32_t bfs_turn_pid_last_us = 0;
 
-// BFS turn encoder fusion state
-static int32_t bfs_turn_enc_start_L = 0;
-static int32_t bfs_turn_enc_start_R = 0;
-static float bfs_turn_imu_start_yaw = 0.0f;  // IMU yaw when turn began
-#define BFS_TURN_ENC_FUSION_WEIGHT 0.3f       // 0=pure IMU, 1=pure encoder
-
 // BFS drive PID state (reset between segments)
 static float bfs_drive_integral = 0.0f;
 static float bfs_drive_prev_err = 0.0f;
@@ -3354,22 +3347,13 @@ static uint32_t bfs_drive_pid_last_us = 0;
 static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering ramp
 #define BFS_DRIVE_STEER_RAMP_MS 150  // suppress steering for this long after turn→drive
 
-// BFS drive stall detection: skip segment if stuck
-static float bfs_drive_last_progress_m = 0.0f;
-static unsigned long bfs_drive_last_progress_ms = 0;
-#define BFS_DRIVE_STALL_TIMEOUT_MS 800    // no progress for this long → PWM burst to break free
-#define BFS_DRIVE_STALL_THRESHOLD_M 0.02f // minimum movement to count as progress
-
-// BFS expected heading tracker (independent of IMU drift)
-static float bfs_expected_heading_deg = 0.0f;  // accumulated from turn commands
-
 // BFS run tuning
 #define BFS_TURN_PWM 130
-#define BFS_TURN_TOLERANCE_DEG 7.0f
-#define BFS_TURN_SETTLE_MS 100
+#define BFS_TURN_TOLERANCE_DEG 5.0f
+#define BFS_TURN_SETTLE_MS 300
 #define BFS_TURN_CRAWL_DEG 15.0f
 #define BFS_TURN_CRAWL_PWM 115
-#define BFS_DRIVE_PWM 130
+#define BFS_DRIVE_PWM 160
 #define BFS_DRIVE_STEER_KP 2.0f
 #define BFS_DRIVE_STEER_KI 1.0f
 #define BFS_DRIVE_STEER_KD 0.06f
@@ -9064,7 +9048,7 @@ void loop() {
 
     // Stall detection (relocated from gridHasWall): if commanded PWM high
     // but horizontal acceleration is very low for >400ms, latch cutoff.
-    // Skip during BFS runs — BFS has its own anti-stall burst logic.
+    // DISABLED during BFS navigation — BFS has its own stall-skip logic.
     if (!bfs_run_active) {
       const int maxPwm = (abs(motor_l_speed) > abs(motor_r_speed)) ? abs(motor_l_speed) : abs(motor_r_speed);
       const bool pwmHigh = (maxPwm > 100);
@@ -9386,9 +9370,10 @@ void loop() {
           Serial.printf("NAV: total_path_dist=%.2fm runTimeS=%.1fs\n",
                         (double)bfs_run_total_path_dist_m, (double)runTimeS);
           // Estimate non-driving overhead for time-based speed scaling.
+          // Real data: avg ~3.0s per transition (turn+brake+settle).
           {
             int numSeg = (int)(bfs_state.path_length - 1);
-            float overheadS = 1.5f + (float)numSeg * 1.5f;
+            float overheadS = 1.5f + (float)numSeg * 3.0f;
             bfs_run_effective_drive_time_s = runTimeS - overheadS;
             if (bfs_run_effective_drive_time_s < runTimeS * 0.3f)
               bfs_run_effective_drive_time_s = runTimeS * 0.3f;
@@ -9464,7 +9449,10 @@ void loop() {
       bfs_run_phase = BFS_PHASE_DONE;
       bfs_run_active = false;
       stopAllMotors();
-      runLogSaveToSpiffs();
+#if RUNLOG_STREAM_TO_SPIFFS
+      lastRunStopReason = "USER_STOP";
+      runLogStreamEnd();
+#endif
       enterScreen(SCREEN_BFS_NAV);
     }
 
@@ -9478,6 +9466,33 @@ void loop() {
       enc_read_attempts = 0;
       enc_read_failures = 0;
       enc_read_recoveries = 0;
+
+      // Initialize SPIFFS logging for this BFS run
+      runMeta.id = runMetaNextId++;
+      if (prefs_ok) prefs.putULong("run_id_next", runMetaNextId);
+      runMeta.runDistanceM = bfs_run_total_path_dist_m;
+      runMeta.runTimeS = runTimeS;
+      runMeta.canDistanceM = 0.0f;
+      syncPulsesPerMeterDerived();
+      runMeta.pulsesPerMeter = pulsesPerMeter;
+      runMeta.pulsesPerMeterL = pulsesPerMeterL;
+      runMeta.pulsesPerMeterR = pulsesPerMeterR;
+      runMeta.motor_bias_pwm = motor_bias_pwm;
+      runMeta.i2c_clock_hz = i2c_clock_hz;
+      runMeta.control_period_ms = control_period_ms;
+      runMeta.control_mode = (uint8_t)control_mode;
+      runMeta.imu_present = imu_present ? 1 : 0;
+      runMeta.imu_ok_at_start = imu_ok ? 1 : 0;
+      runMeta.run_lock_pwm_enable = 0;
+      runMeta.run_lock_pwm_value = 0.0f;
+      runMeta.run_softstart_ms = 0;
+      runMeta.start_ms = millis();
+      runLogReset();
+#if RUNLOG_STREAM_TO_SPIFFS
+      runLogStreamBegin();
+#endif
+      Serial.printf("BFS_RUN: log init id=%lu dist=%.2f time=%.1f\n",
+                    (unsigned long)runMeta.id, (double)bfs_run_total_path_dist_m, (double)runTimeS);
 
       // Compute the grid-frame heading the robot faces at the start position.
       // The robot is placed at a border edge midpoint, facing INWARD.
@@ -9498,12 +9513,6 @@ void loop() {
         }
       }
 
-      // Initialize run logging for BFS
-      testLogInit("BFS_NAV", bfs_run_total_path_dist_m);
-
-      // Initialize expected heading tracker
-      bfs_expected_heading_deg = bfs_run_initial_heading_deg;
-
       // Start by computing first segment
       bfs_run_phase = BFS_PHASE_ARRIVED;  // Will immediately compute first segment
       Serial.printf("BFS_RUN: init yaw=%.1f initial_heading=%.1f path_len=%d path_idx=%d\n",
@@ -9517,7 +9526,10 @@ void loop() {
       bfs_run_phase = BFS_PHASE_DONE;
       bfs_run_active = false;
       stopAllMotors();
-      runLogSaveToSpiffs();
+#if RUNLOG_STREAM_TO_SPIFFS
+      lastRunStopReason = "BFS_TIMEOUT";
+      runLogStreamEnd();
+#endif
     }
 
     // Settling statistics for BFS_PHASE_SETTLE (accelerometer variance)
@@ -9536,33 +9548,11 @@ void loop() {
         // Reached final goal
         bfs_run_phase = BFS_PHASE_DONE;
         bfs_run_active = false;
-        runLogSaveToSpiffs();
+#if RUNLOG_STREAM_TO_SPIFFS
+        lastRunStopReason = "BFS_DONE";
+        runLogStreamEnd();
+#endif
       } else {
-        // Quick IMU bias refresh while stationary at waypoint (~50ms)
-        // Minimizes gyro drift accumulation between segments.
-        {
-          double sumGz = 0.0;
-          int samples = 0;
-          unsigned long t0 = millis();
-          while (millis() - t0 < 50) {
-            float ax_g = 0, ay_g = 0, az_g = 0;
-            float gx_dps = 0, gy_dps = 0, gz_dps_local = 0;
-            float temp_c = 0;
-            if (imu6886Read(&ax_g, &ay_g, &az_g, &gx_dps, &gy_dps, &gz_dps_local, &temp_c)) {
-              sumGz += (double)gz_dps_local;
-              samples++;
-            }
-            delayMicroseconds(500);
-          }
-          if (samples >= 10) {
-            float newBias = (float)(sumGz / (double)samples);
-            if (fabsf(newBias) < IMU_GZ_BIAS_CLAMP_DPS) {
-              imu_gz_bias_dps = newBias;
-            }
-          }
-          imuIntegrateOnce();
-        }
-
         // Compute heading and distance to next waypoint
         uint8_t curNode = bfs_state.path[bfs_state.path_index];
         bfsAdvancePath();
@@ -9572,8 +9562,9 @@ void loop() {
         float dy = bfs_state.nodes[nextNode].y_m - bfs_state.nodes[curNode].y_m;
         bfs_run_segment_dist_m = sqrtf(dx * dx + dy * dy);
 
-        // Add 10cm to first segment to compensate for initial placement offset
-        if (bfs_state.path_index == 1) {  // just advanced from 0→1, so this is the first segment
+        // First segment boost: robot starts slightly behind the first waypoint
+        // due to placement tolerance, so add 12.4cm to compensate.
+        if (bfs_state.path_index == 1) {
           bfs_run_segment_dist_m += 0.125f;
         }
 
@@ -9602,60 +9593,21 @@ void loop() {
         bfs_run_phase = BFS_PHASE_TURN;
         bfs_turn_first_in_tol_ms = 0;  // reset settle timer for new turn
         bfs_turn_start_ms = now;       // record when turn started
-        // Snapshot encoder positions and IMU yaw for encoder-based turn fusion
-        readWheelEncodersInternal(true);
-        bfs_turn_enc_start_L = encoderL_count;
-        bfs_turn_enc_start_R = encoderR_count;
-        bfs_turn_imu_start_yaw = imu_yaw;
         // Reset ALL turn PID state to prevent cumulative error
         bfs_turn_integral = 0.0f;
         // Initialize prev_err to actual initial error to avoid derivative spike
         bfs_turn_prev_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
         bfs_turn_dFilt = 0.0f;
         bfs_turn_pid_last_us = (uint32_t)micros();
-        // Update expected heading tracker and check for turn errors
-        bfs_expected_heading_deg = target_heading_deg;
-        float actual_grid_heading = bfs_run_initial_heading_deg + (bfs_run_start_yaw - imu_yaw);
-        float heading_err = wrapDeg(bfs_expected_heading_deg - actual_grid_heading);
-        Serial.printf("BFS_RUN: segment %s->%s dist=%.2f heading=%.1f target_yaw=%.1f expected=%.1f actual=%.1f err=%.1f\n",
+        Serial.printf("BFS_RUN: segment %s->%s dist=%.2f heading=%.1f target_yaw=%.1f\n",
                       bfs_state.nodes[curNode].name, bfs_state.nodes[nextNode].name,
                       (double)bfs_run_segment_dist_m, (double)(target_heading_deg),
-                      (double)bfs_run_target_yaw_deg,
-                      (double)bfs_expected_heading_deg, (double)actual_grid_heading,
-                      (double)heading_err);
+                      (double)bfs_run_target_yaw_deg);
       }
     }
     else if (bfs_run_phase == BFS_PHASE_TURN) {
       // Pivot in place to face the next waypoint
-      readWheelEncodersInternal(true);
-
-      // IMU-based yaw error
-      float imu_yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
-
-      // Encoder-based yaw error via differential wheel travel
-      float enc_yaw_err = imu_yaw_err;  // fallback
-      bool enc_fusion_ok = encoderL_found && encoderR_found
-                         && (pulsesPerMeterL > 1.0f) && (pulsesPerMeterR > 1.0f);
-      if (enc_fusion_ok) {
-        const int32_t dL = encoderL_count - bfs_turn_enc_start_L;
-        const int32_t dR = encoderR_count - bfs_turn_enc_start_R;
-        const float dLcorr = (INVERT_LEFT_ENCODER_COUNT ? -(float)dL : (float)dL);
-        const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
-        const float sL = dLcorr / pulsesPerMeterL;
-        const float sR = dRcorr / pulsesPerMeterR;
-        float enc_delta_deg = ((sR - sL) / TURN_TRACK_WIDTH_M) * (180.0f / (float)M_PI);
-        float enc_estimated_yaw = bfs_turn_imu_start_yaw + enc_delta_deg;
-        enc_yaw_err = wrapDeg(bfs_run_target_yaw_deg - enc_estimated_yaw);
-      }
-
-      // Fused yaw error: blend IMU (fast, drifts) with encoder (noisy, no drift)
-      float yaw_err;
-      if (enc_fusion_ok && fabsf(imu_yaw_err - enc_yaw_err) <= TURN_IMU_ENC_DISAGREE_DEG) {
-        yaw_err = (1.0f - BFS_TURN_ENC_FUSION_WEIGHT) * imu_yaw_err
-                + BFS_TURN_ENC_FUSION_WEIGHT * enc_yaw_err;
-      } else {
-        yaw_err = imu_yaw_err;
-      }
+      float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
       if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
         // In tolerance — stop motors and hold for settle time (like turn test)
@@ -9715,14 +9667,14 @@ void loop() {
         if (absErr > 45.0f) {
           basePwm = BFS_TURN_PWM;  // full speed for large errors
         } else if (absErr > 15.0f) {
-          basePwm = 120.0f + (absErr - 15.0f) * (BFS_TURN_PWM - 120.0f) / 30.0f;
-        } else if (absErr > 7.0f) {
-          // Crawl zone: ramp from 120 down to 115 between 15° and 7°
-          float t = (absErr - 7.0f) / 8.0f;
-          basePwm = 115.0f + t * 5.0f;
+          basePwm = 110.0f + (absErr - 15.0f) * (BFS_TURN_PWM - 110.0f) / 30.0f;
+        } else if (absErr > 5.0f) {
+          // Crawl zone: ramp from 110 down to 100 between 15° and 5°
+          float t = (absErr - 5.0f) / 10.0f;
+          basePwm = 100.0f + t * 10.0f;
         } else {
-          // Fine zone: 115 minimum (reliable movement)
-          basePwm = 115.0f;
+          // Fine zone: stays at 100 (motor minimum)
+          basePwm = 100.0f;
         }
 
         // I and D corrections: sign-aware relative to error direction.
@@ -9737,13 +9689,13 @@ void loop() {
         applyMotorOutputs();
         // 2026 rule: Run Time begins when Robot begins to move
         if (bfs_run_start_ms == 0) {
-          bfs_run_start_ms = millis();
+          bfs_run_start_ms = now;
           Serial.printf("BFS_RUN: runtime started at first motor move\n");
         }
       }
 
-      // Timeout safety: 5 seconds max
-      if (bfs_turn_start_ms > 0 && (now - bfs_turn_start_ms) > 5000) {
+      // Timeout safety: 2.5 seconds max
+      if (bfs_turn_start_ms > 0 && (now - bfs_turn_start_ms) > 2500) {
         stopAllMotors();
         bfs_turn_first_in_tol_ms = 0;
         bfs_run_brake_start_ms = now;
@@ -9755,7 +9707,7 @@ void loop() {
     else if (bfs_run_phase == BFS_PHASE_BRAKE) {
       // Brief electronic brake with motors commanded to 0 PWM.
       stopAllMotors();
-      if ((now - bfs_run_brake_start_ms) >= 75u) {
+      if ((now - bfs_run_brake_start_ms) >= 150u) {
         if (bfs_run_after_brake_phase == BFS_PHASE_SETTLE) {
           bfs_run_settle_start_ms = now;
           bfs_settle_mean_g = 0.0f;
@@ -9802,9 +9754,6 @@ void loop() {
         bfs_drive_dFilt = 0.0f;
         bfs_drive_pid_last_us = 0;
         bfs_drive_steer_ramp_start_ms = millis();  // post-turn steering ramp
-        // Reset stall detection for new segment
-        bfs_drive_last_progress_m = 0.0f;
-        bfs_drive_last_progress_ms = millis();
         Serial.printf("BFS_RUN: SETTLE done, starting DRIVE encL=%ld encR=%ld var_g2=%.6f\n",
                       (long)encoderL_count, (long)encoderR_count, (double)var_g2);
       }
@@ -9816,39 +9765,78 @@ void loop() {
       // Compute distance driven using unified encoder odometry helper
       bfs_run_driven_m = getAverageDistanceMeters();
 
+      // Detect new segment: reset per-drive statics that persist across segments
+      static bool bfs_drive_seg_reset = true;
+      {
+        static int bfs_drive_last_seg_idx = -1;
+        if ((int)bfs_state.path_index != bfs_drive_last_seg_idx) {
+          bfs_drive_last_seg_idx = (int)bfs_state.path_index;
+          bfs_drive_seg_reset = true;
+        }
+      }
+
+      // --- Heading-error abort: if yaw error > 30° for 300ms, skip segment ---
+      {
+        static unsigned long bfs_drive_heading_abort_ms = 0;
+        if (bfs_drive_seg_reset) bfs_drive_heading_abort_ms = 0;
+        float yaw_err_check = fabsf(wrapDeg(bfs_run_target_yaw_deg - imu_yaw));
+        if (yaw_err_check > 30.0f) {
+          if (bfs_drive_heading_abort_ms == 0) bfs_drive_heading_abort_ms = now;
+          if ((now - bfs_drive_heading_abort_ms) > 300) {
+            stopAllMotors();
+            bfs_run_total_driven_m += bfs_run_driven_m;
+            bfs_run_phase = BFS_PHASE_ARRIVED;
+            bfs_drive_heading_abort_ms = 0;
+            Serial.printf("BFS_RUN: HEADING ABORT yawErr=%.1f > 30deg, skipping segment\n",
+                          (double)yaw_err_check);
+            goto bfs_drive_done;  // skip rest of DRIVE logic this iteration
+          }
+        } else {
+          bfs_drive_heading_abort_ms = 0;
+        }
+      }
+
+      // --- Drive stall skip: if no forward progress for 2s, skip segment ---
+      {
+        static float bfs_drive_last_progress_m = 0.0f;
+        static unsigned long bfs_drive_last_progress_ms = 0;
+        if (bfs_drive_seg_reset) {
+          bfs_drive_last_progress_m = 0.0f;
+          bfs_drive_last_progress_ms = 0;
+          bfs_drive_seg_reset = false;  // consumed
+        }
+        if (bfs_drive_last_progress_ms == 0 || bfs_run_driven_m > bfs_drive_last_progress_m + 0.02f) {
+          bfs_drive_last_progress_m = bfs_run_driven_m;
+          bfs_drive_last_progress_ms = now;
+        }
+        if ((now - bfs_drive_last_progress_ms) > 2000) {
+          stopAllMotors();
+          bfs_run_total_driven_m += bfs_run_driven_m;
+          bfs_run_phase = BFS_PHASE_ARRIVED;
+          bfs_drive_last_progress_ms = 0;
+          bfs_drive_last_progress_m = 0.0f;
+          Serial.printf("BFS_RUN: DRIVE STALL no progress for 2s, skipping segment driven=%.2f/%.2f\n",
+                        (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m);
+          goto bfs_drive_done;
+        }
+      }
+
       if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
-        // Reached waypoint: quick reverse brake then transition (non-blocking settle via BRAKE phase)
-        brakeToStop(140, 200);
+        // Reached waypoint: closed-loop reverse brake (like straight test)
+        brakeToStop(140, 400);
+        // IMU-aware settle wait
+        { unsigned long t0settle = millis();
+          uint32_t lastImuPollUs = (uint32_t)micros();
+          while ((millis() - t0settle) < 300) {
+            uint32_t nUs = (uint32_t)micros();
+            if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
+          } }
         bfs_run_total_driven_m += bfs_run_driven_m;
         bfs_run_phase = BFS_PHASE_ARRIVED;
         Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (brakeToStop)\n",
                       (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
                       (double)bfs_run_total_driven_m);
       } else {
-        // --- Anti-stall: PWM burst if stuck ---
-        if ((bfs_run_driven_m - bfs_drive_last_progress_m) >= BFS_DRIVE_STALL_THRESHOLD_M) {
-          bfs_drive_last_progress_m = bfs_run_driven_m;
-          bfs_drive_last_progress_ms = now;
-        }
-        if ((now - bfs_drive_last_progress_ms) >= BFS_DRIVE_STALL_TIMEOUT_MS) {
-          // Brief full-power burst to break free
-          setMotorsForwardPwm(220, 220);
-          applyMotorOutputs();
-          delay(50);
-          bfs_drive_last_progress_ms = now;  // reset timer after burst
-          Serial.printf("BFS_DRIVE: STALL burst at %.3f/%.2fm\n",
-                        (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m);
-        }
-
-        // Safety: cap segment drive time to prevent infinite stall loops
-        if ((now - bfs_run_drive_start_ms) > 8000u) {
-          stopAllMotors();
-          bfs_run_total_driven_m += bfs_run_driven_m;
-          bfs_run_phase = BFS_PHASE_ARRIVED;
-          Serial.printf("BFS_DRIVE: TIMEOUT at %.3f/%.2fm, skipping\n",
-                        (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m);
-        }
-
         // Drive with yaw correction
         float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
@@ -9911,11 +9899,11 @@ void loop() {
           }
         }
 
-        // Deceleration zone: ramp down over last 0.12m (shorter to maintain PWM longer)
+        // Deceleration zone: ramp down over last 0.20m (matching straight test)
         float speedFactor = 1.0f;
-        if (remaining < 0.12f) {
-          speedFactor = remaining / 0.12f;
-          if (speedFactor < 0.50f) speedFactor = 0.50f;
+        if (remaining < 0.20f) {
+          speedFactor = remaining / 0.20f;
+          if (speedFactor < 0.30f) speedFactor = 0.30f;
         }
 
         // Time-based drive PWM: scale speed to finish path within runTimeS.
@@ -9926,25 +9914,25 @@ void loop() {
           float remainPathM = bfs_run_total_path_dist_m - bfs_run_total_driven_m - bfs_run_driven_m;
           if (remainPathM < 0.0f) remainPathM = 0.0f;
           // Subtract estimated future overhead from remaining wall-clock time
-          // Current segment brakeToStop+IMU_settle = 0.7s, each future segment ≈ 1.5s
+          // Current segment brakeToStop+IMU_settle = 0.7s, each future segment ≈ 3.0s
           int segsAfterCurrent = (int)(bfs_state.path_length - bfs_state.path_index) - 1;
           if (segsAfterCurrent < 0) segsAfterCurrent = 0;
-          float futureOverheadS = 0.7f + (float)segsAfterCurrent * 1.5f;
+          float futureOverheadS = 0.7f + (float)segsAfterCurrent * 3.0f;
           float remainTimeS = runTimeS - elapsedS - futureOverheadS;
           if (remainTimeS < 0.5f) remainTimeS = 0.5f;
-          // Target speed to use remaining effective drive time (1.05x bias → prefer slight overshoot)
+          // Target speed to use remaining effective drive time (1.05x bias → prefer overshoot)
           float targetMps = remainPathM / (remainTimeS * 1.05f);
           float nominalMps = bfs_run_total_path_dist_m / bfs_run_effective_drive_time_s;
-          // Smart speed: allow slowing to 40% when ahead (smoother), cap at 120% (avoid stalls)
-          if (targetMps < nominalMps * 0.40f) targetMps = nominalMps * 0.40f;
-          if (targetMps > nominalMps * 1.20f) targetMps = nominalMps * 1.20f;
+          // Wide range: slow to 50% when ahead, speed up to 170% when behind
+          if (targetMps < nominalMps * 0.50f) targetMps = nominalMps * 0.50f;
+          if (targetMps > nominalMps * 1.70f) targetMps = nominalMps * 1.70f;
           drivePwm = (float)BFS_DRIVE_PWM * (targetMps / nominalMps);
         }
-        if (drivePwm < 120.0f) drivePwm = 120.0f;
+        if (drivePwm < 110.0f) drivePwm = 110.0f;
         if (drivePwm > 220.0f) drivePwm = 220.0f;
 
         float basePwm = drivePwm * speedFactor;
-        if (basePwm < 120.0f) basePwm = 120.0f;
+        if (basePwm < 110.0f) basePwm = 110.0f;
         // Positive yaw_err → need to turn LEFT (CCW, increase IMU yaw)
         // → slow left wheel, speed up right wheel
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
@@ -9954,32 +9942,16 @@ void loop() {
         if (rightPwm < 0.0f) rightPwm = 0.0f;
         if (leftPwm > 255.0f) leftPwm = 255.0f;
         if (rightPwm > 255.0f) rightPwm = 255.0f;
-        // Prevent one-wheel stall
-        if (leftPwm > 0.0f && leftPwm < 110.0f) leftPwm = 110.0f;
-        if (rightPwm > 0.0f && rightPwm < 115.0f) rightPwm = 115.0f;
+        // Prevent one-wheel stall (matching straight test)
+        if (leftPwm > 0.0f && leftPwm < 100.0f) leftPwm = 100.0f;
+        if (rightPwm > 0.0f && rightPwm < 110.0f) rightPwm = 110.0f;
 
         setMotorsForwardPwm((uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f));
         applyMotorOutputs();
         // 2026 rule: Run Time begins when Robot begins to move
         if (bfs_run_start_ms == 0) {
-          bfs_run_start_ms = millis();
+          bfs_run_start_ms = now;
           Serial.printf("BFS_RUN: runtime started at first drive move\n");
-        }
-
-        // Log sample at ~10Hz for post-run analysis
-        static unsigned long lastBfsLogSample = 0;
-        if (now - lastBfsLogSample >= 100) {
-          lastBfsLogSample = now;
-          const int32_t sL = encoderL_count - bfs_run_enc_start_L;
-          const int32_t sR = encoderR_count - bfs_run_enc_start_R;
-          const float dLm = (INVERT_LEFT_ENCODER_COUNT ? -(float)sL : (float)sL) / pulsesPerMeterL;
-          const float dRm = (INVERT_RIGHT_ENCODER_COUNT ? -(float)sR : (float)sR) / pulsesPerMeterR;
-          testLogAppendSample(now, bfs_run_total_driven_m + bfs_run_driven_m,
-                              imu_yaw, bfs_run_target_yaw_deg, yaw_err,
-                              imu_gz_dps, 0.0f, remaining,
-                              basePwm, steerCorr,
-                              (uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f),
-                              dLm, dRm, bfs_drive_integral);
         }
 
         // Periodic debug
@@ -9996,7 +9968,27 @@ void loop() {
                         encoderL_found ? 'Y' : 'N', encoderR_found ? 'Y' : 'N',
                         (long)encoderL_count, (long)encoderR_count);
         }
+
+        // 10Hz SPIFFS log append (BFS drive telemetry)
+        static unsigned long lastBfsLogAppendMs = 0;
+        if ((now - lastBfsLogAppendMs) >= 100u) {
+          lastBfsLogAppendMs = now;
+          float bfsT = (bfs_run_start_ms > 0) ? (float)(now - bfs_run_start_ms) : 0.0f;
+          float bfsDist = bfs_run_total_driven_m + bfs_run_driven_m;
+          const int32_t dL = encoderL_count - bfs_run_enc_start_L;
+          const int32_t dR = encoderR_count - bfs_run_enc_start_R;
+          float dLm = (pulsesPerMeterL > 1.0f) ? ((float)(INVERT_LEFT_ENCODER_COUNT ? -dL : dL) / pulsesPerMeterL) : 0.0f;
+          float dRm = (pulsesPerMeterR > 1.0f) ? ((float)(INVERT_RIGHT_ENCODER_COUNT ? -dR : dR) / pulsesPerMeterR) : 0.0f;
+          testLogAppendSample(
+            (unsigned long)bfsT, bfsDist, imu_yaw, bfs_run_target_yaw_deg,
+            yaw_err, imu_gz_dps,
+            0.0f, remaining,
+            basePwm, steerCorr,
+            (uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f),
+            dLm, dRm, bfs_drive_integral);
+        }
       }
+      bfs_drive_done:;
     }
   }
 
