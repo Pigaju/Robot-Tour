@@ -9837,8 +9837,9 @@ void loop() {
         bfs_run_drive_start_ms = millis();  // for ENC_MODE_TIMED fallback
         bfs_run_phase = BFS_PHASE_DRIVE;
         bfs_drive_pd_first = true;  // reset PD state for new segment
-        // Reset ALL drive PID state to prevent cumulative error between segments
-        bfs_drive_integral = 0.0f;
+        // Carry forward steering integral from prior segment to reduce settling time.
+        // The mechanical bias is persistent, so starting from 0 wastes the first ~1s re-learning it.
+        // (bfs_drive_integral retains its value from the previous DRIVE phase)
         bfs_drive_prev_err = 0.0f;
         bfs_drive_dFilt = 0.0f;
         bfs_drive_pid_last_us = 0;
@@ -9893,7 +9894,6 @@ void loop() {
         if (bfs_drive_seg_reset) {
           bfs_drive_last_progress_m = 0.0f;
           bfs_drive_last_progress_ms = 0;
-          bfs_drive_seg_reset = false;  // consumed
         }
         if (bfs_drive_last_progress_ms == 0 || bfs_run_driven_m > bfs_drive_last_progress_m + 0.02f) {
           bfs_drive_last_progress_m = bfs_run_driven_m;
@@ -9909,6 +9909,54 @@ void loop() {
                         (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m);
           goto bfs_drive_done;
         }
+      }
+
+      // --- Single-wheel stall: if one encoder stops while the other keeps going
+      //     for 500ms, the robot is pivoting, not driving. Skip segment. ---
+      {
+        static float bfs_swstall_last_distL = 0.0f;
+        static float bfs_swstall_last_distR = 0.0f;
+        static unsigned long bfs_swstall_start_ms = 0;
+        if (bfs_drive_seg_reset) {
+          bfs_swstall_last_distL = 0.0f;
+          bfs_swstall_last_distR = 0.0f;
+          bfs_swstall_start_ms = 0;
+        }
+        // Compute per-wheel distances this segment
+        float swDistL = 0.0f, swDistR = 0.0f;
+        if (pulsesPerMeterL > 1.0f) {
+          float dLf = INVERT_LEFT_ENCODER_COUNT ? -(float)(encoderL_count - bfs_run_enc_start_L)
+                                                :  (float)(encoderL_count - bfs_run_enc_start_L);
+          swDistL = dLf / pulsesPerMeterL;
+        }
+        if (pulsesPerMeterR > 1.0f) {
+          float dRf = INVERT_RIGHT_ENCODER_COUNT ? -(float)(encoderR_count - bfs_run_enc_start_R)
+                                                 :  (float)(encoderR_count - bfs_run_enc_start_R);
+          swDistR = dRf / pulsesPerMeterR;
+        }
+        float dL_delta = swDistL - bfs_swstall_last_distL;
+        float dR_delta = swDistR - bfs_swstall_last_distR;
+        bool l_moving = dL_delta > 0.005f;
+        bool r_moving = dR_delta > 0.005f;
+        if (l_moving) bfs_swstall_last_distL = swDistL;
+        if (r_moving) bfs_swstall_last_distR = swDistR;
+        // One wheel stalled while other moves => pivoting
+        bool oneStalled = (l_moving && !r_moving) || (!l_moving && r_moving);
+        if (oneStalled && bfs_run_driven_m > 0.10f) {  // skip check in first 10cm
+          if (bfs_swstall_start_ms == 0) bfs_swstall_start_ms = now;
+          if ((now - bfs_swstall_start_ms) > 500) {
+            stopAllMotors();
+            bfs_run_total_driven_m += bfs_run_driven_m;
+            bfs_run_phase = BFS_PHASE_ARRIVED;
+            bfs_swstall_start_ms = 0;
+            Serial.printf("BFS_RUN: SINGLE-WHEEL STALL L=%.3f R=%.3f, skipping segment\n",
+                          (double)swDistL, (double)swDistR);
+            goto bfs_drive_done;
+          }
+        } else {
+          bfs_swstall_start_ms = 0;
+        }
+        bfs_drive_seg_reset = false;  // consumed
       }
 
       if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
@@ -9989,11 +10037,12 @@ void loop() {
           }
         }
 
-        // Deceleration zone: ramp down over last 0.20m (matching straight test)
+        // Deceleration zone: ramp down over last 0.15m
+        // Floor at 0.60 so basePwm stays >= 130*0.60 = 78 (above motor floors)
         float speedFactor = 1.0f;
-        if (remaining < 0.20f) {
-          speedFactor = remaining / 0.20f;
-          if (speedFactor < 0.30f) speedFactor = 0.30f;
+        if (remaining < 0.15f) {
+          speedFactor = remaining / 0.15f;
+          if (speedFactor < 0.60f) speedFactor = 0.60f;
         }
 
         // Time-based drive PWM: scale speed to finish path within runTimeS.
@@ -10033,7 +10082,7 @@ void loop() {
         }
 
         float basePwm = drivePwm * speedFactor;
-        if (basePwm < 90.0f) basePwm = 90.0f;
+        if (basePwm < 110.0f) basePwm = 110.0f;
         // Positive yaw_err → need to turn LEFT (CCW, increase IMU yaw)
         // → slow left wheel, speed up right wheel
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
