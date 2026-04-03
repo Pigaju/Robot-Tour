@@ -9605,27 +9605,32 @@ void loop() {
           bfs_run_segment_dist_m += 0.125f;
         }
 
-        // Target heading in SCREEN frame (row→screenX, col→screenY):
-        // screen_dx ∝ dy (row change), screen_dy ∝ dx (col change)
-        float target_heading_deg = atan2f(dx, dy) * (180.0f / (float)M_PI);
+        // Compute turn delta purely from grid geometry (immune to gyro drift).
+        // Next segment heading in grid frame:
+        float next_heading_deg = atan2f(dx, dy) * (180.0f / (float)M_PI);
 
-        // Compute the grid heading the robot CURRENTLY faces.
-        // At run start: IMU=start_yaw corresponded to grid heading=initial_heading_deg.
-        // Current grid heading = initial_heading + (start_yaw - current_imu_yaw)
-        // (IMU yaw decreases when turning CW in grid frame)
-        // Integrate IMU so imu_yaw is up-to-date before computing turn target.
-        imuIntegrateOnce();
-        float current_grid_heading = bfs_run_initial_heading_deg + (bfs_run_start_yaw - imu_yaw);
-        // The turn delta in grid frame is (target - current).
-        // Convert to IMU frame: IMU turns opposite to grid, so negate.
-        float turn_delta = wrapDeg(target_heading_deg - current_grid_heading);
-        // Snap turn_delta to nearest 90° — on a grid all turns are multiples of 90°.
-        // This eliminates floating-point rounding from atan2/heading math.
+        // Previous segment heading: what direction the robot just drove.
+        // For the first segment, use the initial grid heading from run setup.
+        float prev_heading_deg;
+        if (bfs_state.path_index >= 2) {
+          uint8_t prevNode = bfs_state.path[bfs_state.path_index - 2];
+          float pdx = bfs_state.nodes[curNode].x_m - bfs_state.nodes[prevNode].x_m;
+          float pdy = bfs_state.nodes[curNode].y_m - bfs_state.nodes[prevNode].y_m;
+          prev_heading_deg = atan2f(pdx, pdy) * (180.0f / (float)M_PI);
+        } else {
+          prev_heading_deg = bfs_run_initial_heading_deg;
+        }
+
+        // Turn delta = change in grid heading between segments (always a multiple of 90°).
+        float turn_delta = wrapDeg(next_heading_deg - prev_heading_deg);
+        // Snap to nearest 90° for precision on a grid.
         float snapped = roundf(turn_delta / 90.0f) * 90.0f;
         if (fabsf(turn_delta - snapped) < 45.0f) {
           turn_delta = snapped;
         }
-        // Apply relative to current fresh IMU yaw
+        // Apply relative to current fresh IMU yaw — pure relative turn,
+        // no accumulated grid heading tracking, immune to gyro drift.
+        imuIntegrateOnce();
         bfs_run_target_yaw_deg = imu_yaw - turn_delta;
 
         // Reset segment encoder tracking
@@ -9642,10 +9647,10 @@ void loop() {
         bfs_turn_prev_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
         bfs_turn_dFilt = 0.0f;
         bfs_turn_pid_last_us = (uint32_t)micros();
-        Serial.printf("BFS_RUN: segment %s->%s dist=%.2f heading=%.1f target_yaw=%.1f\n",
+        Serial.printf("BFS_RUN: segment %s->%s dist=%.2f turnDelta=%.1f target_yaw=%.1f cur_yaw=%.1f\n",
                       bfs_state.nodes[curNode].name, bfs_state.nodes[nextNode].name,
-                      (double)bfs_run_segment_dist_m, (double)(target_heading_deg),
-                      (double)bfs_run_target_yaw_deg);
+                      (double)bfs_run_segment_dist_m, (double)turn_delta,
+                      (double)bfs_run_target_yaw_deg, (double)imu_yaw);
       }
     }
     else if (bfs_run_phase == BFS_PHASE_TURN) {
