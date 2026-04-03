@@ -2806,7 +2806,7 @@ static bool imu_control_enabled = true;
 // Motor bias (feedforward): constant PWM offset applied to left motor to compensate for
 // mechanical differences (e.g., left wheel has more drag). Positive = boost left motor.
 // This is applied as feedforward BEFORE the feedback loop, reducing how hard the PID must work.
-static int16_t motor_bias_pwm = -10;
+static int16_t motor_bias_pwm = -15;
 #define MOTOR_BIAS_STEP_PWM 1
 #define MOTOR_BIAS_MAX_PWM 40
 
@@ -3365,7 +3365,7 @@ static float bfs_expected_heading_deg = 0.0f;  // accumulated from turn commands
 
 // BFS run tuning
 #define BFS_TURN_PWM 130
-#define BFS_TURN_TOLERANCE_DEG 5.0f
+#define BFS_TURN_TOLERANCE_DEG 7.0f
 #define BFS_TURN_SETTLE_MS 100
 #define BFS_TURN_CRAWL_DEG 15.0f
 #define BFS_TURN_CRAWL_PWM 115
@@ -9715,14 +9715,14 @@ void loop() {
         if (absErr > 45.0f) {
           basePwm = BFS_TURN_PWM;  // full speed for large errors
         } else if (absErr > 15.0f) {
-          basePwm = 110.0f + (absErr - 15.0f) * (BFS_TURN_PWM - 110.0f) / 30.0f;
-        } else if (absErr > 5.0f) {
-          // Crawl zone: ramp from 110 down to 100 between 15° and 5°
-          float t = (absErr - 5.0f) / 10.0f;
-          basePwm = 100.0f + t * 10.0f;
+          basePwm = 120.0f + (absErr - 15.0f) * (BFS_TURN_PWM - 120.0f) / 30.0f;
+        } else if (absErr > 7.0f) {
+          // Crawl zone: ramp from 120 down to 115 between 15° and 7°
+          float t = (absErr - 7.0f) / 8.0f;
+          basePwm = 115.0f + t * 5.0f;
         } else {
-          // Fine zone: stays at 100 (motor minimum)
-          basePwm = 100.0f;
+          // Fine zone: 115 minimum (reliable movement)
+          basePwm = 115.0f;
         }
 
         // I and D corrections: sign-aware relative to error direction.
@@ -9840,6 +9840,15 @@ void loop() {
                         (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m);
         }
 
+        // Safety: cap segment drive time to prevent infinite stall loops
+        if ((now - bfs_run_drive_start_ms) > 8000u) {
+          stopAllMotors();
+          bfs_run_total_driven_m += bfs_run_driven_m;
+          bfs_run_phase = BFS_PHASE_ARRIVED;
+          Serial.printf("BFS_DRIVE: TIMEOUT at %.3f/%.2fm, skipping\n",
+                        (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m);
+        }
+
         // Drive with yaw correction
         float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
@@ -9902,11 +9911,11 @@ void loop() {
           }
         }
 
-        // Deceleration zone: ramp down over last 0.20m (matching straight test)
+        // Deceleration zone: ramp down over last 0.12m (shorter to maintain PWM longer)
         float speedFactor = 1.0f;
-        if (remaining < 0.20f) {
-          speedFactor = remaining / 0.20f;
-          if (speedFactor < 0.30f) speedFactor = 0.30f;
+        if (remaining < 0.12f) {
+          speedFactor = remaining / 0.12f;
+          if (speedFactor < 0.50f) speedFactor = 0.50f;
         }
 
         // Time-based drive PWM: scale speed to finish path within runTimeS.
@@ -9931,11 +9940,11 @@ void loop() {
           if (targetMps > nominalMps * 1.20f) targetMps = nominalMps * 1.20f;
           drivePwm = (float)BFS_DRIVE_PWM * (targetMps / nominalMps);
         }
-        if (drivePwm < 110.0f) drivePwm = 110.0f;
+        if (drivePwm < 120.0f) drivePwm = 120.0f;
         if (drivePwm > 220.0f) drivePwm = 220.0f;
 
         float basePwm = drivePwm * speedFactor;
-        if (basePwm < 110.0f) basePwm = 110.0f;
+        if (basePwm < 120.0f) basePwm = 120.0f;
         // Positive yaw_err → need to turn LEFT (CCW, increase IMU yaw)
         // → slow left wheel, speed up right wheel
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
@@ -9945,9 +9954,9 @@ void loop() {
         if (rightPwm < 0.0f) rightPwm = 0.0f;
         if (leftPwm > 255.0f) leftPwm = 255.0f;
         if (rightPwm > 255.0f) rightPwm = 255.0f;
-        // Prevent one-wheel stall (matching straight test)
-        if (leftPwm > 0.0f && leftPwm < 100.0f) leftPwm = 100.0f;
-        if (rightPwm > 0.0f && rightPwm < 110.0f) rightPwm = 110.0f;
+        // Prevent one-wheel stall
+        if (leftPwm > 0.0f && leftPwm < 110.0f) leftPwm = 110.0f;
+        if (rightPwm > 0.0f && rightPwm < 115.0f) rightPwm = 115.0f;
 
         setMotorsForwardPwm((uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f));
         applyMotorOutputs();
