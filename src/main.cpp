@@ -3340,6 +3340,12 @@ static float bfs_turn_prev_err = 0.0f;
 static float bfs_turn_dFilt = 0.0f;
 static uint32_t bfs_turn_pid_last_us = 0;
 
+// BFS turn encoder fusion state
+static int32_t bfs_turn_enc_start_L = 0;
+static int32_t bfs_turn_enc_start_R = 0;
+static float bfs_turn_imu_start_yaw = 0.0f;  // IMU yaw when turn began
+#define BFS_TURN_ENC_FUSION_WEIGHT 0.3f       // 0=pure IMU, 1=pure encoder, 0.3=30% encoder
+
 // BFS drive PID state (reset between segments)
 static float bfs_drive_integral = 0.0f;
 static float bfs_drive_prev_err = 0.0f;
@@ -3347,6 +3353,16 @@ static float bfs_drive_dFilt = 0.0f;
 static uint32_t bfs_drive_pid_last_us = 0;
 static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering ramp
 #define BFS_DRIVE_STEER_RAMP_MS 150  // suppress steering for this long after turn→drive
+
+// BFS drive stall detection & jitter recovery
+static float bfs_drive_last_progress_m = 0.0f;    // driven_m at last progress check
+static unsigned long bfs_drive_last_progress_ms = 0; // time of last meaningful progress
+static bool bfs_drive_jitter_active = false;
+static unsigned long bfs_drive_jitter_start_ms = 0;
+#define BFS_DRIVE_STALL_TIMEOUT_MS 2300   // no progress for this long → jitter
+#define BFS_DRIVE_STALL_THRESHOLD_M 0.02f // must move at least this much to count as progress
+#define BFS_DRIVE_JITTER_DURATION_MS 120  // brief pivot kick duration
+#define BFS_DRIVE_JITTER_PWM 140          // moderate PWM for the kick
 
 // BFS run tuning
 #define BFS_TURN_PWM 130
@@ -9513,6 +9529,32 @@ void loop() {
         bfs_run_phase = BFS_PHASE_DONE;
         bfs_run_active = false;
       } else {
+        // Quick IMU bias refresh while stationary at waypoint (~50ms)
+        // Minimizes gyro drift accumulation between segments.
+        {
+          double sumGz = 0.0;
+          int samples = 0;
+          unsigned long t0 = millis();
+          while (millis() - t0 < 50) {
+            float ax_g = 0, ay_g = 0, az_g = 0;
+            float gx_dps = 0, gy_dps = 0, gz_dps_local = 0;
+            float temp_c = 0;
+            if (imu6886Read(&ax_g, &ay_g, &az_g, &gx_dps, &gy_dps, &gz_dps_local, &temp_c)) {
+              sumGz += (double)gz_dps_local;
+              samples++;
+            }
+            delayMicroseconds(500);
+          }
+          if (samples >= 10) {
+            float newBias = (float)(sumGz / (double)samples);
+            if (fabsf(newBias) < IMU_GZ_BIAS_CLAMP_DPS) {
+              imu_gz_bias_dps = newBias;
+            }
+          }
+          // Keep IMU integration running during the delay
+          imuIntegrateOnce();
+        }
+
         // Compute heading and distance to next waypoint
         uint8_t curNode = bfs_state.path[bfs_state.path_index];
         bfsAdvancePath();
@@ -9552,6 +9594,11 @@ void loop() {
         bfs_run_phase = BFS_PHASE_TURN;
         bfs_turn_first_in_tol_ms = 0;  // reset settle timer for new turn
         bfs_turn_start_ms = now;       // record when turn started
+        // Snapshot encoder positions and IMU yaw for encoder-based turn fusion
+        readWheelEncodersInternal(true);
+        bfs_turn_enc_start_L = encoderL_count;
+        bfs_turn_enc_start_R = encoderR_count;
+        bfs_turn_imu_start_yaw = imu_yaw;
         // Reset ALL turn PID state to prevent cumulative error
         bfs_turn_integral = 0.0f;
         // Initialize prev_err to actual initial error to avoid derivative spike
@@ -9566,7 +9613,41 @@ void loop() {
     }
     else if (bfs_run_phase == BFS_PHASE_TURN) {
       // Pivot in place to face the next waypoint
-      float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
+      // Read encoders for fusion
+      readWheelEncodersInternal(true);
+
+      // IMU-based yaw error
+      float imu_yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
+
+      // Encoder-based yaw error: compute how much the robot has turned via differential encoders
+      float enc_yaw_err = imu_yaw_err;  // fallback to IMU if encoders unavailable
+      bool enc_fusion_ok = encoderL_found && encoderR_found
+                         && (pulsesPerMeterL > 1.0f) && (pulsesPerMeterR > 1.0f);
+      if (enc_fusion_ok) {
+        const int32_t dL = encoderL_count - bfs_turn_enc_start_L;
+        const int32_t dR = encoderR_count - bfs_turn_enc_start_R;
+        const float dLcorr = (INVERT_LEFT_ENCODER_COUNT ? -(float)dL : (float)dL);
+        const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
+        const float sL = dLcorr / pulsesPerMeterL;
+        const float sR = dRcorr / pulsesPerMeterR;
+        // Heading change from encoders: theta = (sR - sL) / track_width
+        float enc_delta_deg = ((sR - sL) / TURN_TRACK_WIDTH_M) * (180.0f / (float)M_PI);
+        // Encoder estimates current yaw as: start_yaw + enc_delta
+        // So encoder-based error = target - (start_yaw + enc_delta)
+        float enc_estimated_yaw = bfs_turn_imu_start_yaw + enc_delta_deg;
+        enc_yaw_err = wrapDeg(bfs_run_target_yaw_deg - enc_estimated_yaw);
+      }
+
+      // Fused yaw error: blend IMU (fast, drifts) with encoder (noisy, no drift)
+      float yaw_err;
+      if (enc_fusion_ok && fabsf(imu_yaw_err - enc_yaw_err) <= TURN_IMU_ENC_DISAGREE_DEG) {
+        // Agree within 8°: blend them
+        yaw_err = (1.0f - BFS_TURN_ENC_FUSION_WEIGHT) * imu_yaw_err
+                + BFS_TURN_ENC_FUSION_WEIGHT * enc_yaw_err;
+      } else {
+        // Disagree too much: trust IMU (more reliable for large disagreements)
+        yaw_err = imu_yaw_err;
+      }
 
       if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
         // In tolerance — stop motors and hold for settle time (like turn test)
@@ -9713,6 +9794,10 @@ void loop() {
         bfs_drive_dFilt = 0.0f;
         bfs_drive_pid_last_us = 0;
         bfs_drive_steer_ramp_start_ms = millis();  // post-turn steering ramp
+        // Reset stall detection for new segment
+        bfs_drive_last_progress_m = 0.0f;
+        bfs_drive_last_progress_ms = millis();
+        bfs_drive_jitter_active = false;
         Serial.printf("BFS_RUN: SETTLE done, starting DRIVE encL=%ld encR=%ld var_g2=%.6f\n",
                       (long)encoderL_count, (long)encoderR_count, (double)var_g2);
       }
@@ -9740,6 +9825,49 @@ void loop() {
                       (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
                       (double)bfs_run_total_driven_m);
       } else {
+        // --- Stall detection & jitter recovery ---
+        // Track progress: if driven_m hasn't advanced enough, robot may be stuck
+        if ((bfs_run_driven_m - bfs_drive_last_progress_m) >= BFS_DRIVE_STALL_THRESHOLD_M) {
+          bfs_drive_last_progress_m = bfs_run_driven_m;
+          bfs_drive_last_progress_ms = now;
+        }
+
+        // Active jitter kick: brief alternating pivot then resume normal drive
+        if (bfs_drive_jitter_active) {
+          if ((now - bfs_drive_jitter_start_ms) < BFS_DRIVE_JITTER_DURATION_MS) {
+            // Brief pivot kick in yaw error direction to break free
+            float yaw_err_jitter = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
+            int jitterSign = (yaw_err_jitter > 0.0f) ? 1 : -1;
+            // Alternate: first half pivot one way, second half forward burst
+            if ((now - bfs_drive_jitter_start_ms) < BFS_DRIVE_JITTER_DURATION_MS / 2) {
+              setMotorsPivotPwm(jitterSign, BFS_DRIVE_JITTER_PWM);
+            } else {
+              setMotorsForwardPwm(BFS_DRIVE_JITTER_PWM, BFS_DRIVE_JITTER_PWM);
+            }
+            applyMotorOutputs();
+            // Keep IMU running during jitter
+            if (imu_present && imu_control_enabled) imuIntegrateOnce();
+            // Skip normal drive logic during jitter
+            // (jitter_active flag checked below prevents normal drive)
+          } else {
+            // Jitter done — reset stall timer and integral, resume normal driving
+            bfs_drive_jitter_active = false;
+            bfs_drive_last_progress_m = bfs_run_driven_m;
+            bfs_drive_last_progress_ms = now;
+            bfs_drive_integral = 0.0f;  // prevent integral windup from stuck period
+            Serial.println("BFS_DRIVE: jitter done, resuming normal drive");
+          }
+        }
+
+        // Check for stall: no progress for 2.3s
+        if (!bfs_drive_jitter_active && (now - bfs_drive_last_progress_ms) >= BFS_DRIVE_STALL_TIMEOUT_MS) {
+          bfs_drive_jitter_active = true;
+          bfs_drive_jitter_start_ms = now;
+          Serial.printf("BFS_DRIVE: STALL detected at %.3f/%.2fm, starting jitter kick\n",
+                        (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m);
+        }
+
+        if (!bfs_drive_jitter_active) {
         // Drive with yaw correction
         float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
@@ -9823,12 +9951,13 @@ void loop() {
           float futureOverheadS = 0.7f + (float)segsAfterCurrent * 1.5f;
           float remainTimeS = runTimeS - elapsedS - futureOverheadS;
           if (remainTimeS < 0.5f) remainTimeS = 0.5f;
-          // Target speed to use remaining effective drive time (1.05x bias → prefer overshoot)
+          // Target speed to use remaining effective drive time (1.05x bias → prefer slight overshoot)
           float targetMps = remainPathM / (remainTimeS * 1.05f);
           float nominalMps = bfs_run_total_path_dist_m / bfs_run_effective_drive_time_s;
-          // Clamp: never go below 60% or above 130% of nominal
-          if (targetMps < nominalMps * 0.60f) targetMps = nominalMps * 0.60f;
-          if (targetMps > nominalMps * 1.30f) targetMps = nominalMps * 1.30f;
+          // Smart speed: allow slowing to 40% when ahead of schedule (smoother, more precise)
+          // but cap at 120% to avoid excessive speed that causes stalls
+          if (targetMps < nominalMps * 0.40f) targetMps = nominalMps * 0.40f;
+          if (targetMps > nominalMps * 1.20f) targetMps = nominalMps * 1.20f;
           drivePwm = (float)BFS_DRIVE_PWM * (targetMps / nominalMps);
         }
         if (drivePwm < 110.0f) drivePwm = 110.0f;
@@ -9871,6 +10000,7 @@ void loop() {
                         encoderL_found ? 'Y' : 'N', encoderR_found ? 'Y' : 'N',
                         (long)encoderL_count, (long)encoderR_count);
         }
+        } // end if (!bfs_drive_jitter_active)
       }
     }
   }
