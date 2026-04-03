@@ -9461,6 +9461,7 @@ void loop() {
       bfs_run_phase = BFS_PHASE_DONE;
       bfs_run_active = false;
       stopAllMotors();
+      runLogSaveToSpiffs();
       enterScreen(SCREEN_BFS_NAV);
     }
 
@@ -9494,6 +9495,9 @@ void loop() {
         }
       }
 
+      // Initialize run logging for BFS
+      testLogInit("BFS_NAV", bfs_run_total_path_dist_m);
+
       // Start by computing first segment
       bfs_run_phase = BFS_PHASE_ARRIVED;  // Will immediately compute first segment
       Serial.printf("BFS_RUN: init yaw=%.1f initial_heading=%.1f path_len=%d path_idx=%d\n",
@@ -9507,6 +9511,7 @@ void loop() {
       bfs_run_phase = BFS_PHASE_DONE;
       bfs_run_active = false;
       stopAllMotors();
+      runLogSaveToSpiffs();
     }
 
     // Settling statistics for BFS_PHASE_SETTLE (accelerometer variance)
@@ -9525,6 +9530,7 @@ void loop() {
         // Reached final goal
         bfs_run_phase = BFS_PHASE_DONE;
         bfs_run_active = false;
+        runLogSaveToSpiffs();
       } else {
         // Quick IMU bias refresh while stationary at waypoint (~50ms)
         // Minimizes gyro drift accumulation between segments.
@@ -9944,6 +9950,22 @@ void loop() {
         if (bfs_run_start_ms == 0) {
           bfs_run_start_ms = millis();
           Serial.printf("BFS_RUN: runtime started at first drive move\n");
+        }
+
+        // Log sample at ~10Hz for post-run analysis
+        static unsigned long lastBfsLogSample = 0;
+        if (now - lastBfsLogSample >= 100) {
+          lastBfsLogSample = now;
+          const int32_t sL = encoderL_count - bfs_run_enc_start_L;
+          const int32_t sR = encoderR_count - bfs_run_enc_start_R;
+          const float dLm = (INVERT_LEFT_ENCODER_COUNT ? -(float)sL : (float)sL) / pulsesPerMeterL;
+          const float dRm = (INVERT_RIGHT_ENCODER_COUNT ? -(float)sR : (float)sR) / pulsesPerMeterR;
+          testLogAppendSample(now, bfs_run_total_driven_m + bfs_run_driven_m,
+                              imu_yaw, bfs_run_target_yaw_deg, yaw_err,
+                              imu_gz_dps, 0.0f, remaining,
+                              basePwm, steerCorr,
+                              (uint8_t)(leftPwm + 0.5f), (uint8_t)(rightPwm + 0.5f),
+                              dLm, dRm, bfs_drive_integral);
         }
 
         // Periodic debug
