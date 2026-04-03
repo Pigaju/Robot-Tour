@@ -3354,15 +3354,11 @@ static uint32_t bfs_drive_pid_last_us = 0;
 static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering ramp
 #define BFS_DRIVE_STEER_RAMP_MS 150  // suppress steering for this long after turn→drive
 
-// BFS drive stall detection & jitter recovery
+// BFS drive stall detection: skip segment if stuck
 static float bfs_drive_last_progress_m = 0.0f;    // driven_m at last progress check
 static unsigned long bfs_drive_last_progress_ms = 0; // time of last meaningful progress
-static bool bfs_drive_jitter_active = false;
-static unsigned long bfs_drive_jitter_start_ms = 0;
-#define BFS_DRIVE_STALL_TIMEOUT_MS 2300   // no progress for this long → jitter
+#define BFS_DRIVE_STALL_TIMEOUT_MS 2500   // no progress for this long → skip segment
 #define BFS_DRIVE_STALL_THRESHOLD_M 0.02f // must move at least this much to count as progress
-#define BFS_DRIVE_JITTER_DURATION_MS 120  // brief pivot kick duration
-#define BFS_DRIVE_JITTER_PWM 140          // moderate PWM for the kick
 
 // BFS run tuning
 #define BFS_TURN_PWM 130
@@ -9797,7 +9793,6 @@ void loop() {
         // Reset stall detection for new segment
         bfs_drive_last_progress_m = 0.0f;
         bfs_drive_last_progress_ms = millis();
-        bfs_drive_jitter_active = false;
         Serial.printf("BFS_RUN: SETTLE done, starting DRIVE encL=%ld encR=%ld var_g2=%.6f\n",
                       (long)encoderL_count, (long)encoderR_count, (double)var_g2);
       }
@@ -9825,49 +9820,20 @@ void loop() {
                       (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
                       (double)bfs_run_total_driven_m);
       } else {
-        // --- Stall detection & jitter recovery ---
-        // Track progress: if driven_m hasn't advanced enough, robot may be stuck
+        // --- Stall detection: skip segment if stuck ---
         if ((bfs_run_driven_m - bfs_drive_last_progress_m) >= BFS_DRIVE_STALL_THRESHOLD_M) {
           bfs_drive_last_progress_m = bfs_run_driven_m;
           bfs_drive_last_progress_ms = now;
         }
 
-        // Active jitter kick: brief alternating pivot then resume normal drive
-        if (bfs_drive_jitter_active) {
-          if ((now - bfs_drive_jitter_start_ms) < BFS_DRIVE_JITTER_DURATION_MS) {
-            // Brief pivot kick in yaw error direction to break free
-            float yaw_err_jitter = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
-            int jitterSign = (yaw_err_jitter > 0.0f) ? 1 : -1;
-            // Alternate: first half pivot one way, second half forward burst
-            if ((now - bfs_drive_jitter_start_ms) < BFS_DRIVE_JITTER_DURATION_MS / 2) {
-              setMotorsPivotPwm(jitterSign, BFS_DRIVE_JITTER_PWM);
-            } else {
-              setMotorsForwardPwm(BFS_DRIVE_JITTER_PWM, BFS_DRIVE_JITTER_PWM);
-            }
-            applyMotorOutputs();
-            // Keep IMU running during jitter
-            if (imu_present && imu_control_enabled) imuIntegrateOnce();
-            // Skip normal drive logic during jitter
-            // (jitter_active flag checked below prevents normal drive)
-          } else {
-            // Jitter done — reset stall timer and integral, resume normal driving
-            bfs_drive_jitter_active = false;
-            bfs_drive_last_progress_m = bfs_run_driven_m;
-            bfs_drive_last_progress_ms = now;
-            bfs_drive_integral = 0.0f;  // prevent integral windup from stuck period
-            Serial.println("BFS_DRIVE: jitter done, resuming normal drive");
-          }
-        }
-
-        // Check for stall: no progress for 2.3s
-        if (!bfs_drive_jitter_active && (now - bfs_drive_last_progress_ms) >= BFS_DRIVE_STALL_TIMEOUT_MS) {
-          bfs_drive_jitter_active = true;
-          bfs_drive_jitter_start_ms = now;
-          Serial.printf("BFS_DRIVE: STALL detected at %.3f/%.2fm, starting jitter kick\n",
+        // No progress for 2.5s → stop and skip to next segment
+        if ((now - bfs_drive_last_progress_ms) >= BFS_DRIVE_STALL_TIMEOUT_MS) {
+          stopAllMotors();
+          bfs_run_total_driven_m += bfs_run_driven_m;
+          bfs_run_phase = BFS_PHASE_ARRIVED;
+          Serial.printf("BFS_DRIVE: STALL skip at %.3f/%.2fm, moving to next segment\n",
                         (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m);
-        }
-
-        if (!bfs_drive_jitter_active) {
+        } else {
         // Drive with yaw correction
         float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
@@ -10000,7 +9966,7 @@ void loop() {
                         encoderL_found ? 'Y' : 'N', encoderR_found ? 'Y' : 'N',
                         (long)encoderL_count, (long)encoderR_count);
         }
-        } // end if (!bfs_drive_jitter_active)
+        } // end if not stalled
       }
     }
   }
