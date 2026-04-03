@@ -3344,7 +3344,7 @@ static uint32_t bfs_turn_pid_last_us = 0;
 static int32_t bfs_turn_enc_start_L = 0;
 static int32_t bfs_turn_enc_start_R = 0;
 static float bfs_turn_imu_start_yaw = 0.0f;  // IMU yaw when turn began
-#define BFS_TURN_ENC_FUSION_WEIGHT 0.3f       // 0=pure IMU, 1=pure encoder, 0.3=30% encoder
+#define BFS_TURN_ENC_FUSION_WEIGHT 0.3f       // 0=pure IMU, 1=pure encoder
 
 // BFS drive PID state (reset between segments)
 static float bfs_drive_integral = 0.0f;
@@ -3355,10 +3355,10 @@ static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering r
 #define BFS_DRIVE_STEER_RAMP_MS 150  // suppress steering for this long after turn→drive
 
 // BFS drive stall detection: skip segment if stuck
-static float bfs_drive_last_progress_m = 0.0f;    // driven_m at last progress check
-static unsigned long bfs_drive_last_progress_ms = 0; // time of last meaningful progress
+static float bfs_drive_last_progress_m = 0.0f;
+static unsigned long bfs_drive_last_progress_ms = 0;
 #define BFS_DRIVE_STALL_TIMEOUT_MS 2500   // no progress for this long → skip segment
-#define BFS_DRIVE_STALL_THRESHOLD_M 0.02f // must move at least this much to count as progress
+#define BFS_DRIVE_STALL_THRESHOLD_M 0.02f // minimum movement to count as progress
 
 // BFS run tuning
 #define BFS_TURN_PWM 130
@@ -9547,7 +9547,6 @@ void loop() {
               imu_gz_bias_dps = newBias;
             }
           }
-          // Keep IMU integration running during the delay
           imuIntegrateOnce();
         }
 
@@ -9609,14 +9608,13 @@ void loop() {
     }
     else if (bfs_run_phase == BFS_PHASE_TURN) {
       // Pivot in place to face the next waypoint
-      // Read encoders for fusion
       readWheelEncodersInternal(true);
 
       // IMU-based yaw error
       float imu_yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
-      // Encoder-based yaw error: compute how much the robot has turned via differential encoders
-      float enc_yaw_err = imu_yaw_err;  // fallback to IMU if encoders unavailable
+      // Encoder-based yaw error via differential wheel travel
+      float enc_yaw_err = imu_yaw_err;  // fallback
       bool enc_fusion_ok = encoderL_found && encoderR_found
                          && (pulsesPerMeterL > 1.0f) && (pulsesPerMeterR > 1.0f);
       if (enc_fusion_ok) {
@@ -9626,10 +9624,7 @@ void loop() {
         const float dRcorr = (INVERT_RIGHT_ENCODER_COUNT ? -(float)dR : (float)dR);
         const float sL = dLcorr / pulsesPerMeterL;
         const float sR = dRcorr / pulsesPerMeterR;
-        // Heading change from encoders: theta = (sR - sL) / track_width
         float enc_delta_deg = ((sR - sL) / TURN_TRACK_WIDTH_M) * (180.0f / (float)M_PI);
-        // Encoder estimates current yaw as: start_yaw + enc_delta
-        // So encoder-based error = target - (start_yaw + enc_delta)
         float enc_estimated_yaw = bfs_turn_imu_start_yaw + enc_delta_deg;
         enc_yaw_err = wrapDeg(bfs_run_target_yaw_deg - enc_estimated_yaw);
       }
@@ -9637,11 +9632,9 @@ void loop() {
       // Fused yaw error: blend IMU (fast, drifts) with encoder (noisy, no drift)
       float yaw_err;
       if (enc_fusion_ok && fabsf(imu_yaw_err - enc_yaw_err) <= TURN_IMU_ENC_DISAGREE_DEG) {
-        // Agree within 8°: blend them
         yaw_err = (1.0f - BFS_TURN_ENC_FUSION_WEIGHT) * imu_yaw_err
                 + BFS_TURN_ENC_FUSION_WEIGHT * enc_yaw_err;
       } else {
-        // Disagree too much: trust IMU (more reliable for large disagreements)
         yaw_err = imu_yaw_err;
       }
 
@@ -9825,8 +9818,6 @@ void loop() {
           bfs_drive_last_progress_m = bfs_run_driven_m;
           bfs_drive_last_progress_ms = now;
         }
-
-        // No progress for 2.5s → stop and skip to next segment
         if ((now - bfs_drive_last_progress_ms) >= BFS_DRIVE_STALL_TIMEOUT_MS) {
           stopAllMotors();
           bfs_run_total_driven_m += bfs_run_driven_m;
@@ -9920,8 +9911,7 @@ void loop() {
           // Target speed to use remaining effective drive time (1.05x bias → prefer slight overshoot)
           float targetMps = remainPathM / (remainTimeS * 1.05f);
           float nominalMps = bfs_run_total_path_dist_m / bfs_run_effective_drive_time_s;
-          // Smart speed: allow slowing to 40% when ahead of schedule (smoother, more precise)
-          // but cap at 120% to avoid excessive speed that causes stalls
+          // Smart speed: allow slowing to 40% when ahead (smoother), cap at 120% (avoid stalls)
           if (targetMps < nominalMps * 0.40f) targetMps = nominalMps * 0.40f;
           if (targetMps > nominalMps * 1.20f) targetMps = nominalMps * 1.20f;
           drivePwm = (float)BFS_DRIVE_PWM * (targetMps / nominalMps);
