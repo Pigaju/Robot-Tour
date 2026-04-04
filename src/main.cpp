@@ -2819,7 +2819,10 @@ static bool imu_control_enabled = true;
 // Motor bias (feedforward): constant PWM offset applied to left motor to compensate for
 // mechanical differences (e.g., left wheel has more drag). Positive = boost left motor.
 // This is applied as feedforward BEFORE the feedback loop, reducing how hard the PID must work.
-static int16_t motor_bias_pwm = -12;
+// NOTE: Set to 0 — the old value of -12 had the wrong sign (boosting the already-faster
+// right motor, causing 6-11° veer at every segment start). The steering PID integral
+// handles motor asymmetry naturally via carry-forward across segments.
+static int16_t motor_bias_pwm = 0;
 #define MOTOR_BIAS_STEP_PWM 1
 #define MOTOR_BIAS_MAX_PWM 40
 
