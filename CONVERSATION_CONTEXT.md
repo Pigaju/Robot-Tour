@@ -31,10 +31,11 @@ Use this file to bootstrap a new chat window. Paste/attach it so the assistant h
 | Turn PID | Ki=1.0, Kd=0.15, err/45 base, floor 115 | |
 | Encoder PPM | L=924.5, R=888.0 | NVS |
 | PWM floor (satshift) | L=90, R=95 | ~line 10050 |
-| Launch ramp | Adaptive: quadratic 130→target, 500ms, encoder feedback | ~line 10075 |
+| Launch ramp | Adaptive: cubic t³ 130→target, 800ms, encoder feedback + speed limiter | ~line 10075 |
 | Decel zone | last 0.15m, speedFactor floor 0.60 | ~line 9993 |
 | Leaky integral tau | 1.0s | |
-| Anti-windup | ±25 PWM | |
+| Anti-windup | ±25 PWM |
+| steerI carry cap | ±5.0 between segments | | |
 | Heading abort | >30° for 300ms → skip segment | |
 | Stall detector | no avg progress for 2s → skip | |
 | Single-wheel stall | one encoder stopped 500ms → skip | |
@@ -100,12 +101,20 @@ Same in square test, straight test, BFS DRIVE, and RUN mode.
   - Early ramp exit when encoder speed ≥ 85% of target speed
   - At 250ms (midpoint), PWM is only 25% of the way to target → gives steering PID time to lock on
 
-## Current Status (Run 135 pending)
+### 9. Run 135 — Launch ramp still too aggressive + steerI catastrophic carry-forward (fixed)
+- **Problem 1**: Quadratic ramp (500ms) reached ~200 PWM by 430ms. Heading swings 5-11° on segments 4 and 6 during first 300ms of driving.
+- **Problem 2**: Physical bump on seg 10 caused 468°/s spin. steerI grew to -16.3 during stall. Carried into seg 11, producing 14 PWM correction with only 0.17° error → robot spiraled out.
+- **Fixes applied**:
+  - Cubic (t³) ease-in over 800ms: at 400ms midpoint, only 12.5% of PWM range (was 64% with quadratic)
+  - Speed limiter: if encoder speed > 130% of ramp target, hold at launchFloor
+  - Softer exponential stuck-detect: exp(3t) vs exp(4t), 150ms delay
+  - Cap steerI carry between segments to ±5.0 (≈±7.5 PWM max bias correction)
 
-- Runs 132-133: `enc=LEFT` — right encoder boot test failing again intermittently
-- Run 134: `enc=BOTH`, dist=13.250, 62 samples. Completed 9 segments before USER_STOP. Heading errors 4-25° from instant PWM spikes (now fixed)
-- Firmware uploaded with adaptive launch ramp
-- Turns are accurate and drift-immune
+## Current Status (Run 136 pending)
+
+- Run 135: `enc=BOTH`, dist=13.250, 124 samples, 10 segments before catastrophic heading error on seg 10 (physical bump, not software)
+- Turns are accurate (within 2.4° of target at DRIVE start)
+- Firmware uploaded with smoother cubic ramp + steerI capping
 - Remaining concerns: boot encoder test can still fail for right encoder (EMI-sensitive)
 
 ## Encoder Mode System
