@@ -32,10 +32,11 @@ Use this file to bootstrap a new chat window. Paste/attach it so the assistant h
 | Encoder PPM | L=924.5, R=888.0 | NVS |
 | PWM floor (satshift) | L=90, R=95 | ~line 10050 |
 | Launch ramp | Adaptive: cubic t³ 130→target, 800ms, encoder feedback + speed limiter | ~line 10075 |
-| Decel zone | Logarithmic decay, 30cm zone, ln(1+t*(e-1)), floor 0.45, coast-stop at arrival | ~line 10045 |
+| Decel zone | Logarithmic decay, 40cm zone, ln(1+t*(e-1)), floor 0.35, coast-stop at arrival | ~line 10045 |
 | Leaky integral tau | 1.0s | |
 | Anti-windup | ±25 PWM |
-| steerI carry cap | ±5.0 between segments | | |
+| steerI carry cap | ±3.0 between segments | | |
+| Steering correction clamp | ±80 PWM | ~line 10030 |
 | Heading abort | >30° for 300ms → skip segment | |
 | Stall detector | no avg progress for 2s → skip | |
 | Single-wheel stall | one encoder stopped 500ms → skip | |
@@ -123,11 +124,17 @@ Same in square test, straight test, BFS DRIVE, and RUN mode.
   - Settle reduced 300→200ms since arrival speed is much lower
   - Log curve onset is gentle at high speed, preventing abrupt torque imbalance
 
-## Current Status (Run 137 pending)
+### 11. Run 137 — Decel zone blowups + cascading steerI (fixed)
+- **Problem**: Segs 1-13 clean (big improvement from log decel + coast-stop), but seg 14 had catastrophic 29° blowup during decel zone — left wheel traveled 7.7cm more than right in last 200ms. Steering saturated at ±60. steerI cascaded: seg 17 started 31.8° off, seg 19 blew up again, seg 20 had 81.8° error with steerI=12.6.
+- **Fix #11** (three changes):
+  - Steering correction clamp ±60 → ±80: gives PID more authority to fight wheel speed differentials
+  - Decel zone 0.30m → 0.40m, floor 0.45 → 0.35: robot spends longer decelerating, arrives slower
+  - steerI carry-forward cap ±5.0 → ±3.0: tighter reset prevents cascading failures across segments
 
-- Run 136: Multiple catastrophic yaw errors caused by abrupt braking + asymmetric reverse-brake
-- Logarithmic deceleration + coast-stop uploaded (no more reverse-brake at waypoints)
-- Decel floor lowered to 0.45 so robot reaches motor-floor speed (~110 PWM) before arrival
+## Current Status (Run 138 pending)
+
+- Run 137: 13/22 segments clean, 4 catastrophic failures from decel-zone wheel differential + steerI cascade
+- Fix #11 uploaded: wider steering clamp, longer/deeper decel, tighter steerI cap
 - Remaining concerns: boot encoder test can still fail for right encoder (EMI-sensitive)
 
 ## Encoder Mode System
