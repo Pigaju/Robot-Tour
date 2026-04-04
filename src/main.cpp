@@ -9686,10 +9686,10 @@ void loop() {
       // Pivot in place to face the next waypoint
       float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
-      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG && fabsf(imu_gz_dps) < 30.0f) {
-        // In tolerance AND angular velocity low — stop motors and hold for settle
+      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG && fabsf(imu_gz_dps) < 10.0f) {
+        // In tolerance AND angular velocity truly low — stop motors and hold for settle
         // The gz check prevents false-settle when the robot blasts through the
-        // tolerance zone at high angular velocity (which caused 48° overshoot).
+        // tolerance zone at high angular velocity (which caused 7-15° overshoot).
         stopAllMotors();
         if (bfs_turn_first_in_tol_ms == 0) bfs_turn_first_in_tol_ms = now;
         if ((now - bfs_turn_first_in_tol_ms) >= BFS_TURN_SETTLE_MS) {
@@ -9871,6 +9871,20 @@ void loop() {
           }
         }
 
+        // Post-settle heading drift correction:
+        // The robot was at the target heading when the turn completed.
+        // Any discrepancy is accumulated IMU drift during the turn + settle phases.
+        // Correct 80% of the error to reduce post-turn heading offset.
+        {
+          float headingErr = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
+          if (fabsf(headingErr) > 2.0f) {
+            float correction = headingErr * 0.8f;
+            imu_yaw += correction;
+            Serial.printf("BFS_RUN: SETTLE drift correction %.1f deg (err was %.1f)\n",
+                          (double)correction, (double)headingErr);
+          }
+        }
+
         // Fresh encoder snapshot for the upcoming DRIVE
         readWheelEncodersInternal(true);
         bfs_run_enc_start_L = encoderL_count;
@@ -9878,12 +9892,10 @@ void loop() {
         bfs_run_drive_start_ms = millis();  // for ENC_MODE_TIMED fallback
         bfs_run_phase = BFS_PHASE_DRIVE;
         bfs_drive_pd_first = true;  // reset PD state for new segment
-        // Carry forward steering integral from prior segment to reduce settling time.
-        // The mechanical bias is persistent, so starting from 0 wastes the first ~1s re-learning it.
-        // Cap the carry-forward to ±1.5 (~±2.3 PWM) to prevent catastrophic accumulation
-        // after stalls or heading-abort segments.
-        if (bfs_drive_integral > 1.5f) bfs_drive_integral = 1.5f;
-        if (bfs_drive_integral < -1.5f) bfs_drive_integral = -1.5f;
+        // Reset steering integral at segment start.
+        // With motor_bias=0 there is no persistent mechanical bias to preserve.
+        // Carry-forward was contaminated by IMU drift during the previous segment.
+        bfs_drive_integral = 0.0f;
         bfs_drive_prev_err = 0.0f;
         bfs_drive_dFilt = 0.0f;
         bfs_drive_pid_last_us = 0;
@@ -10039,13 +10051,14 @@ void loop() {
         }
 
         // Leaky integral for steady-state bias correction
-        const float driveILeakTau = 1.0f;
+        // Faster leak (0.5s) to shed IMU-drift-related accumulation quickly
+        const float driveILeakTau = 0.5f;
         bfs_drive_integral -= bfs_drive_integral * (dt / driveILeakTau);
         if (fabsf(yaw_err) > 0.1f) {
           bfs_drive_integral += yaw_err * dt;
         }
-        // Anti-windup: clamp integral contribution to ±25 PWM
-        const float driveIMaxCorr = 25.0f;
+        // Anti-windup: clamp integral contribution to ±12 PWM (tighter to limit drift-driven windup)
+        const float driveIMaxCorr = 12.0f;
         float driveILim = driveIMaxCorr / BFS_DRIVE_STEER_KI;
         if (bfs_drive_integral > driveILim) bfs_drive_integral = driveILim;
         if (bfs_drive_integral < -driveILim) bfs_drive_integral = -driveILim;
