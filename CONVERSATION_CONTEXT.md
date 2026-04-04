@@ -32,7 +32,7 @@ Use this file to bootstrap a new chat window. Paste/attach it so the assistant h
 | Encoder PPM | L=924.5, R=888.0 | NVS |
 | PWM floor (satshift) | L=90, R=95 | ~line 10050 |
 | Launch ramp | Adaptive: cubic t³ 130→target, 800ms, encoder feedback + speed limiter | ~line 10075 |
-| Decel zone | Logarithmic decay, 30cm zone, ln(1+t*(e-1)), floor 0.55 | ~line 10045 |
+| Decel zone | Logarithmic decay, 30cm zone, ln(1+t*(e-1)), floor 0.45, coast-stop at arrival | ~line 10045 |
 | Leaky integral tau | 1.0s | |
 | Anti-windup | ±25 PWM |
 | steerI carry cap | ±5.0 between segments | | |
@@ -115,16 +115,19 @@ Same in square test, straight test, BFS DRIVE, and RUN mode.
   - Seg 8: 24.7° yaw swing (gz=65°/s) during decel
   - Seg 10: 23° yaw jump, gz=216°/s
   - Seg 14: gz=-325°/s, 35° error, complete loss of control
-- **Fix**: Logarithmic deceleration curve over 30cm:
-  - `speedFactor = 0.55 + 0.45 * ln(1 + t*(e-1))` where t = remaining/0.30
-  - At 30cm: 1.0 (220 PWM), 15cm: 0.83 (183), 7.5cm: 0.71 (156), 0cm: 0.55 (121)
-  - Double the decel distance (30cm vs 15cm) gives twice the time to slow down
+- **Fix**: Logarithmic deceleration curve over 30cm + coast-stop:
+  - `speedFactor = 0.45 + 0.55 * ln(1 + t*(e-1))` where t = remaining/0.30
+  - At 30cm: 1.0 (220 PWM), 15cm: 0.83 (183), 7.5cm: 0.71 (156), 0cm: 0.45 (→110 floor)
+  - Replaced `brakeToStop(140, 400)` (reverse PWM, per-wheel independent stop) with `stopAllMotors()` coast
+  - No more asymmetric braking — both wheels coast equally, steering PID active until arrival
+  - Settle reduced 300→200ms since arrival speed is much lower
   - Log curve onset is gentle at high speed, preventing abrupt torque imbalance
 
 ## Current Status (Run 137 pending)
 
-- Run 136: Multiple catastrophic yaw errors caused by abrupt braking (not turns)
-- Logarithmic deceleration uploaded — should eliminate braking-induced yaw torque
+- Run 136: Multiple catastrophic yaw errors caused by abrupt braking + asymmetric reverse-brake
+- Logarithmic deceleration + coast-stop uploaded (no more reverse-brake at waypoints)
+- Decel floor lowered to 0.45 so robot reaches motor-floor speed (~110 PWM) before arrival
 - Remaining concerns: boot encoder test can still fail for right encoder (EMI-sensitive)
 
 ## Encoder Mode System
