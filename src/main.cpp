@@ -3367,9 +3367,9 @@ static int  bfs_drive_last_seg_idx = -1;
 #define BFS_DRIVE_STEER_RAMP_MS 400  // suppress steering for this long after turn→drive
 
 // BFS run tuning
-#define BFS_TURN_PWM 130
+#define BFS_TURN_PWM 180
 #define BFS_TURN_TOLERANCE_DEG 2.0f
-#define BFS_TURN_SETTLE_MS 300
+#define BFS_TURN_SETTLE_MS 150
 #define BFS_TURN_CRAWL_DEG 15.0f
 #define BFS_TURN_CRAWL_PWM 115
 #define BFS_DRIVE_PWM 160
@@ -3467,6 +3467,7 @@ static void loadPersistedSettings() {
   pulsesPerMeter = legacyPpm;
   syncPulsesPerMeterDerived();
   motor_bias_pwm = (int16_t)prefs.getShort("mtr_bias3", (int16_t)motor_bias_pwm);
+  motor_bias_pwm = 0;  // Force to 0: NVS holds stale -12 that amplifies wheel asymmetry (Fix #17/#18)
 
   // Last-known-good gyro bias (used as a safe fallback if staged calibration is disturbed).
   imu_gz_bias_dps = prefs.getFloat(IMU_BIAS_PERSIST_KEY, imu_gz_bias_dps);
@@ -9783,7 +9784,7 @@ void loop() {
       // Electronic brake with motors commanded to 0 PWM.
       // 300ms gives enough time to arrest angular momentum (especially after turn timeout).
       stopAllMotors();
-      if ((now - bfs_run_brake_start_ms) >= 300u) {
+      if ((now - bfs_run_brake_start_ms) >= 150u) {
         if (bfs_run_after_brake_phase == BFS_PHASE_SETTLE) {
           bfs_run_settle_start_ms = now;
           bfs_settle_mean_g = 0.0f;
@@ -9847,12 +9848,12 @@ void loop() {
       // After a turn timeout the robot can still be spinning fast; accel variance
       // alone won't catch this because rotation-in-place is low-g.
       const bool gzQuiet = fabsf(imu_gz_dps) < 20.0f;
-      // Hard timeout: never stay in SETTLE longer than 1.5s
-      const bool settleTimeout = (now - bfs_run_settle_start_ms) >= 1500u;
+      // Hard timeout: never stay in SETTLE longer than 500ms
+      const bool settleTimeout = (now - bfs_run_settle_start_ms) >= 500u;
 
       if ((timeOk && varSmall && gzQuiet) || settleTimeout) {
         if (settleTimeout) {
-          Serial.println("BFS_RUN: SETTLE timeout (1.5s), forcing DRIVE");
+          Serial.println("BFS_RUN: SETTLE timeout (500ms), forcing DRIVE");
         }
         // Refine gyro bias from accumulated settle readings
         if (bfs_settle_gz_n >= 15) {
@@ -10004,11 +10005,11 @@ void loop() {
         // Reached waypoint: gentle brake to full stop.
         // Decel zone already brought speed to ~110 PWM; use light reverse-brake
         // with encoder feedback to ensure wheels are truly stopped before turning.
-        brakeToStop(80, 400);  // light brake (80 PWM max), 400ms timeout
+        brakeToStop(80, 200);  // light brake (80 PWM max), 200ms timeout
         // Brief IMU-aware settle after brake (let chassis vibrations die)
         { unsigned long t0settle = millis();
           uint32_t lastImuPollUs = (uint32_t)micros();
-          while ((millis() - t0settle) < 100) {
+          while ((millis() - t0settle) < 50) {
             uint32_t nUs = (uint32_t)micros();
             if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
           } }
@@ -10167,7 +10168,7 @@ void loop() {
         }
 
         float basePwm = drivePwm * speedFactor;
-        if (basePwm < 110.0f) basePwm = 110.0f;
+        if (basePwm < 120.0f) basePwm = 120.0f;
 
         // During launch ramp, cap steerCorr to ±20% of basePwm.
         // At low speed, large corrections cause massive wheel-speed differentials
