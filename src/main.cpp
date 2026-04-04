@@ -3358,6 +3358,9 @@ static float bfs_drive_prev_err = 0.0f;
 static float bfs_drive_dFilt = 0.0f;
 static uint32_t bfs_drive_pid_last_us = 0;
 static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering ramp
+// Segment-change detection (file-scope so run init can reset)
+static bool bfs_drive_seg_reset = true;
+static int  bfs_drive_last_seg_idx = -1;
 #define BFS_DRIVE_STEER_RAMP_MS 400  // suppress steering for this long after turn→drive
 
 // BFS run tuning
@@ -9483,6 +9486,28 @@ void loop() {
       // bfs_run_start_ms will be set when robot first moves (2026 rule: Run Time begins when Robot begins to move)
       bfs_run_start_yaw = imu_yaw;
       bfs_run_cumulative_yaw_deg = imu_yaw;
+
+      // Reset ALL PID state from previous run to prevent stale carry-over.
+      // Without this, bfs_drive_integral, turn PID state, and stale timestamps
+      // persist across runs causing inconsistent first-segment behavior.
+      bfs_drive_integral = 0.0f;
+      bfs_drive_prev_err = 0.0f;
+      bfs_drive_dFilt = 0.0f;
+      bfs_drive_pid_last_us = 0;
+      bfs_drive_steer_ramp_start_ms = 0;
+      bfs_drive_pd_first = true;
+      bfs_turn_integral = 0.0f;
+      bfs_turn_prev_err = 0.0f;
+      bfs_turn_dFilt = 0.0f;
+      bfs_turn_pid_last_us = 0;
+      bfs_turn_first_in_tol_ms = 0;
+      bfs_turn_start_ms = 0;
+      bfs_run_drive_start_ms = 0;
+      bfs_run_brake_start_ms = 0;
+      bfs_run_settle_start_ms = 0;
+      bfs_drive_seg_reset = true;
+      bfs_drive_last_seg_idx = -1;
+
       // Reset encoder health counters for this run
       enc_read_attempts = 0;
       enc_read_failures = 0;
@@ -9866,9 +9891,7 @@ void loop() {
       bfs_run_driven_m = getAverageDistanceMeters();
 
       // Detect new segment: reset per-drive statics that persist across segments
-      static bool bfs_drive_seg_reset = true;
       {
-        static int bfs_drive_last_seg_idx = -1;
         if ((int)bfs_state.path_index != bfs_drive_last_seg_idx) {
           bfs_drive_last_seg_idx = (int)bfs_state.path_index;
           bfs_drive_seg_reset = true;
