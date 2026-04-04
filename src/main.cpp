@@ -9963,18 +9963,19 @@ void loop() {
       }
 
       if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
-        // Reached waypoint: closed-loop reverse brake (like straight test)
-        brakeToStop(140, 400);
-        // IMU-aware settle wait
+        // Reached waypoint: coast-stop (decel zone already brought speed to ~110 PWM).
+        // No reverse-brake — avoids asymmetric wheel braking that causes yaw torque.
+        stopAllMotors();
+        // IMU-aware settle wait (200ms is enough at low arrival speed)
         { unsigned long t0settle = millis();
           uint32_t lastImuPollUs = (uint32_t)micros();
-          while ((millis() - t0settle) < 300) {
+          while ((millis() - t0settle) < 200) {
             uint32_t nUs = (uint32_t)micros();
             if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
           } }
         bfs_run_total_driven_m += bfs_run_driven_m;
         bfs_run_phase = BFS_PHASE_ARRIVED;
-        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (brakeToStop)\n",
+        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (coast-stop)\n",
                       (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
                       (double)bfs_run_total_driven_m);
       } else {
@@ -10044,9 +10045,11 @@ void loop() {
         // Log curve is gentle at onset (high speed) and progressively stronger.
         // speedFactor = minF + (1-minF) * ln(1 + t*(e-1))  where t = remaining/decelZone
         // At t=1: 1.0, at t=0.5: ~0.83, at t=0.25: ~0.71, at t=0: minF
+        // Floor at 0.45 so basePwm reaches ~99 at arrival (below 110 floor → 110),
+        // slow enough that coast-stop replaces reverse-brake with no yaw torque.
         float speedFactor = 1.0f;
         const float decelZone = 0.30f;
-        const float decelMinF = 0.55f;  // floor: basePwm never below drivePwm*0.55
+        const float decelMinF = 0.45f;
         if (remaining < decelZone) {
           float t = remaining / decelZone;  // 1.0 at edge → 0.0 at waypoint
           float logScale = logf(1.0f + t * 1.7183f);  // ln(1 + t*(e-1)), range 0→1
