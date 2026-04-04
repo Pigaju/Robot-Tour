@@ -32,7 +32,7 @@ Use this file to bootstrap a new chat window. Paste/attach it so the assistant h
 | Encoder PPM | L=924.5, R=888.0 | NVS |
 | PWM floor (satshift) | L=90, R=95 | ~line 10050 |
 | Launch ramp | Adaptive: cubic t³ 130→target, 800ms, encoder feedback + speed limiter | ~line 10075 |
-| Decel zone | last 0.15m, speedFactor floor 0.60 | ~line 9993 |
+| Decel zone | Logarithmic decay, 30cm zone, ln(1+t*(e-1)), floor 0.55 | ~line 10045 |
 | Leaky integral tau | 1.0s | |
 | Anti-windup | ±25 PWM |
 | steerI carry cap | ±5.0 between segments | | |
@@ -110,11 +110,21 @@ Same in square test, straight test, BFS DRIVE, and RUN mode.
   - Softer exponential stuck-detect: exp(3t) vs exp(4t), 150ms delay
   - Cap steerI carry between segments to ±5.0 (≈±7.5 PWM max bias correction)
 
-## Current Status (Run 136 pending)
+### 10. Run 136 — Abrupt braking causing catastrophic yaw errors (fixed)
+- **Problem**: Linear deceleration over only 15cm (speedFactor 1.0→0.60) caused 220→132 PWM drops in ~150ms. Differential wheel friction during sudden braking induced massive yaw torque:
+  - Seg 8: 24.7° yaw swing (gz=65°/s) during decel
+  - Seg 10: 23° yaw jump, gz=216°/s
+  - Seg 14: gz=-325°/s, 35° error, complete loss of control
+- **Fix**: Logarithmic deceleration curve over 30cm:
+  - `speedFactor = 0.55 + 0.45 * ln(1 + t*(e-1))` where t = remaining/0.30
+  - At 30cm: 1.0 (220 PWM), 15cm: 0.83 (183), 7.5cm: 0.71 (156), 0cm: 0.55 (121)
+  - Double the decel distance (30cm vs 15cm) gives twice the time to slow down
+  - Log curve onset is gentle at high speed, preventing abrupt torque imbalance
 
-- Run 135: `enc=BOTH`, dist=13.250, 124 samples, 10 segments before catastrophic heading error on seg 10 (physical bump, not software)
-- Turns are accurate (within 2.4° of target at DRIVE start)
-- Firmware uploaded with smoother cubic ramp + steerI capping
+## Current Status (Run 137 pending)
+
+- Run 136: Multiple catastrophic yaw errors caused by abrupt braking (not turns)
+- Logarithmic deceleration uploaded — should eliminate braking-induced yaw torque
 - Remaining concerns: boot encoder test can still fail for right encoder (EMI-sensitive)
 
 ## Encoder Mode System
