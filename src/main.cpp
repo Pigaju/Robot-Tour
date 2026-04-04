@@ -2819,10 +2819,7 @@ static bool imu_control_enabled = true;
 // Motor bias (feedforward): constant PWM offset applied to left motor to compensate for
 // mechanical differences (e.g., left wheel has more drag). Positive = boost left motor.
 // This is applied as feedforward BEFORE the feedback loop, reducing how hard the PID must work.
-// NOTE: Set to 0 — the old value of -12 had the wrong sign (boosting the already-faster
-// right motor, causing 6-11° veer at every segment start). The steering PID integral
-// handles motor asymmetry naturally via carry-forward across segments.
-static int16_t motor_bias_pwm = 0;
+static int16_t motor_bias_pwm = -12;
 #define MOTOR_BIAS_STEP_PWM 1
 #define MOTOR_BIAS_MAX_PWM 40
 
@@ -3361,15 +3358,12 @@ static float bfs_drive_prev_err = 0.0f;
 static float bfs_drive_dFilt = 0.0f;
 static uint32_t bfs_drive_pid_last_us = 0;
 static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering ramp
-// Segment-change detection (file-scope so run init can reset)
-static bool bfs_drive_seg_reset = true;
-static int  bfs_drive_last_seg_idx = -1;
-#define BFS_DRIVE_STEER_RAMP_MS 400  // suppress steering for this long after turn→drive
+#define BFS_DRIVE_STEER_RAMP_MS 150  // suppress steering for this long after turn→drive
 
 // BFS run tuning
-#define BFS_TURN_PWM 180
+#define BFS_TURN_PWM 130
 #define BFS_TURN_TOLERANCE_DEG 2.0f
-#define BFS_TURN_SETTLE_MS 150
+#define BFS_TURN_SETTLE_MS 300
 #define BFS_TURN_CRAWL_DEG 15.0f
 #define BFS_TURN_CRAWL_PWM 115
 #define BFS_DRIVE_PWM 160
@@ -3467,7 +3461,7 @@ static void loadPersistedSettings() {
   pulsesPerMeter = legacyPpm;
   syncPulsesPerMeterDerived();
   motor_bias_pwm = (int16_t)prefs.getShort("mtr_bias3", (int16_t)motor_bias_pwm);
-  motor_bias_pwm = 0;  // Force to 0: NVS holds stale -12 that amplifies wheel asymmetry (Fix #17/#18)
+  motor_bias_pwm = 0;  // NVS holds stale -12 that amplifies wheel asymmetry
 
   // Last-known-good gyro bias (used as a safe fallback if staged calibration is disturbed).
   imu_gz_bias_dps = prefs.getFloat(IMU_BIAS_PERSIST_KEY, imu_gz_bias_dps);
@@ -9490,28 +9484,6 @@ void loop() {
       // bfs_run_start_ms will be set when robot first moves (2026 rule: Run Time begins when Robot begins to move)
       bfs_run_start_yaw = imu_yaw;
       bfs_run_cumulative_yaw_deg = imu_yaw;
-
-      // Reset ALL PID state from previous run to prevent stale carry-over.
-      // Without this, bfs_drive_integral, turn PID state, and stale timestamps
-      // persist across runs causing inconsistent first-segment behavior.
-      bfs_drive_integral = 0.0f;
-      bfs_drive_prev_err = 0.0f;
-      bfs_drive_dFilt = 0.0f;
-      bfs_drive_pid_last_us = 0;
-      bfs_drive_steer_ramp_start_ms = 0;
-      bfs_drive_pd_first = true;
-      bfs_turn_integral = 0.0f;
-      bfs_turn_prev_err = 0.0f;
-      bfs_turn_dFilt = 0.0f;
-      bfs_turn_pid_last_us = 0;
-      bfs_turn_first_in_tol_ms = 0;
-      bfs_turn_start_ms = 0;
-      bfs_run_drive_start_ms = 0;
-      bfs_run_brake_start_ms = 0;
-      bfs_run_settle_start_ms = 0;
-      bfs_drive_seg_reset = true;
-      bfs_drive_last_seg_idx = -1;
-
       // Reset encoder health counters for this run
       enc_read_attempts = 0;
       enc_read_failures = 0;
@@ -9686,10 +9658,8 @@ void loop() {
       // Pivot in place to face the next waypoint
       float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
-      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG && fabsf(imu_gz_dps) < 10.0f) {
-        // In tolerance AND angular velocity truly low — stop motors and hold for settle
-        // The gz check prevents false-settle when the robot blasts through the
-        // tolerance zone at high angular velocity (which caused 7-15° overshoot).
+      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
+        // In tolerance — stop motors and hold for settle time (matching standalone turn test)
         stopAllMotors();
         if (bfs_turn_first_in_tol_ms == 0) bfs_turn_first_in_tol_ms = now;
         if ((now - bfs_turn_first_in_tol_ms) >= BFS_TURN_SETTLE_MS) {
@@ -9718,7 +9688,7 @@ void loop() {
 
         // Leaky integral (only accumulate when error is meaningful)
         const float turnKi = 1.0f;
-        const float turnKd = 0.25f;
+        const float turnKd = 0.15f;
         const float turnILeakTau = 1.0f;
         // Accelerate I leak in fine zone to shed accumulated integral from large-error phase
         float effectiveLeak = (fabsf(yaw_err) < 5.0f) ? 0.3f : turnILeakTau;
@@ -9752,11 +9722,7 @@ void loop() {
         float correction = (turnKi * bfs_turn_integral + turnKd * bfs_turn_dFilt) * errSign;
         float turnPwmF = basePwm + correction;
         if (turnPwmF > 200.0f) turnPwmF = 200.0f;
-        // Dynamic floor: 95 near target → 115 far away. Lets P/D terms
-        // actually slow the approach instead of maintaining 115 PWM until
-        // the robot blasts through the tolerance zone at high angular velocity.
-        float turnFloor = (absErr < 15.0f) ? (95.0f + absErr * (20.0f / 15.0f)) : 115.0f;
-        if (turnPwmF < turnFloor) turnPwmF = turnFloor;
+        if (turnPwmF < 115.0f) turnPwmF = 115.0f;
 
         int sign = (yaw_err > 0.0f) ? 1 : -1;
         setMotorsPivotPwm(sign, (uint8_t)(turnPwmF + 0.5f));
@@ -9768,10 +9734,8 @@ void loop() {
         }
       }
 
-      // Timeout safety: turns are active movement (motors running), so they do NOT
-      // count toward the competition stall rule. Use a generous 5s to let the PID
-      // converge properly rather than forcing a premature exit while still spinning.
-      if (bfs_turn_start_ms > 0 && (now - bfs_turn_start_ms) > 5000) {
+      // Timeout safety: 2.5s max (so TURN + BRAKE(300ms) + SETTLE(≤1s) < 3s stall rule)
+      if (bfs_turn_start_ms > 0 && (now - bfs_turn_start_ms) > 2500) {
         stopAllMotors();
         bfs_turn_first_in_tol_ms = 0;
         bfs_run_brake_start_ms = now;
@@ -9782,7 +9746,7 @@ void loop() {
     }
     else if (bfs_run_phase == BFS_PHASE_BRAKE) {
       // Electronic brake with motors commanded to 0 PWM.
-      // 300ms gives enough time to arrest angular momentum (especially after turn timeout).
+      // 150ms gives enough time to arrest angular momentum (especially after turn timeout).
       stopAllMotors();
       if ((now - bfs_run_brake_start_ms) >= 150u) {
         if (bfs_run_after_brake_phase == BFS_PHASE_SETTLE) {
@@ -9844,16 +9808,14 @@ void loop() {
 
       const bool timeOk = (now - bfs_run_settle_start_ms) >= 80u;
       const bool varSmall = var_g2 < (0.015f * 0.015f);
-      // Require angular velocity to be low before transitioning to DRIVE.
-      // After a turn timeout the robot can still be spinning fast; accel variance
-      // alone won't catch this because rotation-in-place is low-g.
+      // Require angular velocity to be low before driving (prevents driving while still spinning)
       const bool gzQuiet = fabsf(imu_gz_dps) < 20.0f;
-      // Hard timeout: never stay in SETTLE longer than 500ms
-      const bool settleTimeout = (now - bfs_run_settle_start_ms) >= 500u;
+      // Hard timeout: never stay in SETTLE longer than 1s (competition 3s stall rule)
+      const bool settleTimeout = (now - bfs_run_settle_start_ms) >= 1000u;
 
       if ((timeOk && varSmall && gzQuiet) || settleTimeout) {
         if (settleTimeout) {
-          Serial.println("BFS_RUN: SETTLE timeout (500ms), forcing DRIVE");
+          Serial.println("BFS_RUN: SETTLE timeout (1s), forcing DRIVE");
         }
         // Refine gyro bias from accumulated settle readings
         if (bfs_settle_gz_n >= 15) {
@@ -9871,17 +9833,15 @@ void loop() {
           }
         }
 
-        // Post-settle heading drift correction:
-        // The robot was at the target heading when the turn completed.
-        // Any discrepancy is accumulated IMU drift during the turn + settle phases.
-        // Correct 80% of the error to reduce post-turn heading offset.
+        // Post-settle IMU drift correction:
+        // The robot was at the target heading when the turn completed, so any
+        // discrepancy now is accumulated gyro drift during turn+settle phases.
         {
           float headingErr = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
           if (fabsf(headingErr) > 2.0f) {
-            float correction = headingErr * 0.8f;
-            imu_yaw += correction;
+            imu_yaw += headingErr * 0.8f;
             Serial.printf("BFS_RUN: SETTLE drift correction %.1f deg (err was %.1f)\n",
-                          (double)correction, (double)headingErr);
+                          (double)(headingErr * 0.8f), (double)headingErr);
           }
         }
 
@@ -9892,10 +9852,10 @@ void loop() {
         bfs_run_drive_start_ms = millis();  // for ENC_MODE_TIMED fallback
         bfs_run_phase = BFS_PHASE_DRIVE;
         bfs_drive_pd_first = true;  // reset PD state for new segment
-        // Reset steering integral at segment start.
-        // With motor_bias=0 there is no persistent mechanical bias to preserve.
-        // Carry-forward was contaminated by IMU drift during the previous segment.
-        bfs_drive_integral = 0.0f;
+        // Cap steering integral carry-forward to prevent drift-contaminated values
+        // from polluting subsequent segments on long-distance runs.
+        if (bfs_drive_integral > 1.5f) bfs_drive_integral = 1.5f;
+        if (bfs_drive_integral < -1.5f) bfs_drive_integral = -1.5f;
         bfs_drive_prev_err = 0.0f;
         bfs_drive_dFilt = 0.0f;
         bfs_drive_pid_last_us = 0;
@@ -9913,7 +9873,9 @@ void loop() {
       bfs_run_driven_m = getAverageDistanceMeters();
 
       // Detect new segment: reset per-drive statics that persist across segments
+      static bool bfs_drive_seg_reset = true;
       {
+        static int bfs_drive_last_seg_idx = -1;
         if ((int)bfs_state.path_index != bfs_drive_last_seg_idx) {
           bfs_drive_last_seg_idx = (int)bfs_state.path_index;
           bfs_drive_seg_reset = true;
@@ -10017,7 +9979,7 @@ void loop() {
         // Reached waypoint: gentle brake to full stop.
         // Decel zone already brought speed to ~110 PWM; use light reverse-brake
         // with encoder feedback to ensure wheels are truly stopped before turning.
-        brakeToStop(80, 200);  // light brake (80 PWM max), 200ms timeout
+        brakeToStop(80, 200);
         // Brief IMU-aware settle after brake (let chassis vibrations die)
         { unsigned long t0settle = millis();
           uint32_t lastImuPollUs = (uint32_t)micros();
@@ -10027,7 +9989,7 @@ void loop() {
           } }
         bfs_run_total_driven_m += bfs_run_driven_m;
         bfs_run_phase = BFS_PHASE_ARRIVED;
-        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (brake-stop)\n",
+        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (brakeToStop)\n",
                       (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
                       (double)bfs_run_total_driven_m);
       } else {
@@ -10051,14 +10013,13 @@ void loop() {
         }
 
         // Leaky integral for steady-state bias correction
-        // Faster leak (0.5s) to shed IMU-drift-related accumulation quickly
-        const float driveILeakTau = 0.5f;
+        const float driveILeakTau = 1.0f;
         bfs_drive_integral -= bfs_drive_integral * (dt / driveILeakTau);
         if (fabsf(yaw_err) > 0.1f) {
           bfs_drive_integral += yaw_err * dt;
         }
-        // Anti-windup: clamp integral contribution to ±12 PWM (tighter to limit drift-driven windup)
-        const float driveIMaxCorr = 12.0f;
+        // Anti-windup: clamp integral contribution to ±25 PWM
+        const float driveIMaxCorr = 25.0f;
         float driveILim = driveIMaxCorr / BFS_DRIVE_STEER_KI;
         if (bfs_drive_integral > driveILim) bfs_drive_integral = driveILim;
         if (bfs_drive_integral < -driveILim) bfs_drive_integral = -driveILim;
@@ -10080,8 +10041,8 @@ void loop() {
         float steerCorr = effectiveKp * yaw_err
                         + BFS_DRIVE_STEER_KI * bfs_drive_integral
                         + BFS_DRIVE_STEER_KD * bfs_drive_dFilt;
-        if (steerCorr > 80.0f) steerCorr = 80.0f;
-        if (steerCorr < -80.0f) steerCorr = -80.0f;
+        if (steerCorr > 60.0f) steerCorr = 60.0f;
+        if (steerCorr < -60.0f) steerCorr = -60.0f;
 
         // Post-turn steering ramp: suppress correction briefly to avoid jerk
         if (bfs_drive_steer_ramp_start_ms > 0) {
@@ -10099,7 +10060,7 @@ void loop() {
         // speedFactor = minF + (1-minF) * ln(1 + t*(e-1))  where t = remaining/decelZone
         // At t=1: 1.0, at t=0.5: ~0.83, at t=0.25: ~0.71, at t=0: minF
         // Floor at 0.35 so basePwm reaches ~77 at arrival (below 110 floor → 110),
-        // slow enough that a light brakeToStop(80, 400ms) brings wheels to zero quickly.
+        // slow enough that a light brakeToStop(80, 200ms) brings wheels to zero quickly.
         float speedFactor = 1.0f;
         const float decelZone = 0.40f;
         const float decelMinF = 0.35f;
@@ -10136,65 +10097,18 @@ void loop() {
         if (drivePwm < 130.0f) drivePwm = 130.0f;
         if (drivePwm > 220.0f) drivePwm = 220.0f;
 
-        // Adaptive launch ramp: closed-loop soft-start after turn/settle.
-        // Ramps from launchFloor up to drivePwm using encoder feedback.
-        // - If robot is stuck (static friction): exponential PWM increase
-        // - If robot is already near target speed: end ramp early
-        // - If going too fast for ramp position: cap to expected speed
-        // - Otherwise: smooth cubic (t³) ease-in over 800ms
+        // Launch boost: ramp from 160 PWM down to drivePwm over 500ms after
+        // turn/settle to overcome static friction without a PWM cliff.
         if (bfs_run_drive_start_ms > 0) {
-          unsigned long rampElapsed = now - bfs_run_drive_start_ms;
-          const unsigned long LAUNCH_RAMP_MS = 800;
-          if (rampElapsed < LAUNCH_RAMP_MS) {
-            const float launchFloor = 130.0f;
-            float t_norm = (float)rampElapsed / (float)LAUNCH_RAMP_MS; // 0→1
-
-            // Measure actual speed from encoder distance traveled since drive start
-            float rampDtS = (float)rampElapsed * 0.001f;
-            float actualMps = (rampDtS > 0.05f) ? (bfs_run_driven_m / rampDtS) : 0.0f;
-            // Approximate target speed at full drivePwm (~0.30 m/s at PWM 160)
-            float targetMps = 0.30f * (drivePwm / 160.0f);
-
-            float rampPwm;
-            if (bfs_run_driven_m < 0.003f && rampElapsed > 150) {
-              // Not moving despite applied PWM → exponential increase to break static friction
-              float expN = (expf(3.0f * t_norm) - 1.0f) / (expf(3.0f) - 1.0f);
-              rampPwm = launchFloor + (drivePwm - launchFloor) * expN;
-            } else if (actualMps >= targetMps * 0.85f) {
-              // Already near target speed → end ramp, use full drivePwm
-              rampPwm = drivePwm;
-            } else {
-              // Moving but not yet at speed → smooth cubic ease-in (t³)
-              // Stays low much longer than quadratic: at 50% time, only 12.5% of range
-              float tCubed = t_norm * t_norm * t_norm;
-              rampPwm = launchFloor + (drivePwm - launchFloor) * tCubed;
-              // Speed limiter: if encoder says we're going faster than ramp expects,
-              // cap PWM to prevent overshoot when static friction suddenly breaks
-              float rampTargetMps = targetMps * tCubed;
-              if (rampTargetMps > 0.05f && actualMps > rampTargetMps * 1.3f) {
-                // Going 30% faster than expected for this ramp position → hold PWM
-                rampPwm = launchFloor;
-              }
-            }
-            drivePwm = rampPwm;
+          unsigned long boostElapsed = now - bfs_run_drive_start_ms;
+          if (boostElapsed < 500) {
+            float boostPwm = 160.0f - (160.0f - drivePwm) * ((float)boostElapsed / 500.0f);
+            if (boostPwm > drivePwm) drivePwm = boostPwm;
           }
         }
 
         float basePwm = drivePwm * speedFactor;
-        if (basePwm < 120.0f) basePwm = 120.0f;
-
-        // During launch ramp, cap steerCorr to ±20% of basePwm.
-        // At low speed, large corrections cause massive wheel-speed differentials
-        // that destabilize heading (e.g. ±28 at basePwm=130 → 43% asymmetry).
-        if (bfs_run_drive_start_ms > 0) {
-          unsigned long launchElapsed = now - bfs_run_drive_start_ms;
-          if (launchElapsed < 800) {  // matches LAUNCH_RAMP_MS
-            float maxCorr = basePwm * 0.20f;
-            if (steerCorr > maxCorr) steerCorr = maxCorr;
-            if (steerCorr < -maxCorr) steerCorr = -maxCorr;
-          }
-        }
-
+        if (basePwm < 110.0f) basePwm = 110.0f;
         // Positive yaw_err → need to turn LEFT (CCW, increase IMU yaw)
         // → slow left wheel, speed up right wheel
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
