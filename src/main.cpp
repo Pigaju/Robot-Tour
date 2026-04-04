@@ -9764,8 +9764,10 @@ void loop() {
         }
       }
 
-      // Timeout safety: 2.5s max (so TURN + BRAKE(300ms) + SETTLE(≤1s) < 3s stall rule)
-      if (bfs_turn_start_ms > 0 && (now - bfs_turn_start_ms) > 2500) {
+      // Timeout safety: turns are active movement (motors running), so they do NOT
+      // count toward the competition stall rule. Use a generous 5s to let the PID
+      // converge properly rather than forcing a premature exit while still spinning.
+      if (bfs_turn_start_ms > 0 && (now - bfs_turn_start_ms) > 5000) {
         stopAllMotors();
         bfs_turn_first_in_tol_ms = 0;
         bfs_run_brake_start_ms = now;
@@ -9838,12 +9840,16 @@ void loop() {
 
       const bool timeOk = (now - bfs_run_settle_start_ms) >= 80u;
       const bool varSmall = var_g2 < (0.015f * 0.015f);
-      // Hard timeout: never stay in SETTLE longer than 1s (competition 3s stall rule)
-      const bool settleTimeout = (now - bfs_run_settle_start_ms) >= 1000u;
+      // Require angular velocity to be low before transitioning to DRIVE.
+      // After a turn timeout the robot can still be spinning fast; accel variance
+      // alone won't catch this because rotation-in-place is low-g.
+      const bool gzQuiet = fabsf(imu_gz_dps) < 20.0f;
+      // Hard timeout: never stay in SETTLE longer than 1.5s
+      const bool settleTimeout = (now - bfs_run_settle_start_ms) >= 1500u;
 
-      if ((timeOk && varSmall) || settleTimeout) {
+      if ((timeOk && varSmall && gzQuiet) || settleTimeout) {
         if (settleTimeout) {
-          Serial.println("BFS_RUN: SETTLE timeout (1s), forcing DRIVE");
+          Serial.println("BFS_RUN: SETTLE timeout (1.5s), forcing DRIVE");
         }
         // Refine gyro bias from accumulated settle readings
         if (bfs_settle_gz_n >= 15) {
