@@ -10071,13 +10071,38 @@ void loop() {
         if (drivePwm < 130.0f) drivePwm = 130.0f;
         if (drivePwm > 220.0f) drivePwm = 220.0f;
 
-        // Launch boost: ramp from 160 PWM down to drivePwm over 500ms after
-        // turn/settle to overcome static friction without a PWM cliff.
+        // Adaptive launch ramp: closed-loop soft-start after turn/settle.
+        // Ramps from launchFloor up to drivePwm using encoder feedback.
+        // - If robot is stuck (static friction): exponential PWM increase
+        // - If robot is already near target speed: end ramp early
+        // - Otherwise: gentle quadratic ease-in to avoid heading-destabilizing spikes
         if (bfs_run_drive_start_ms > 0) {
-          unsigned long boostElapsed = now - bfs_run_drive_start_ms;
-          if (boostElapsed < 500) {
-            float boostPwm = 160.0f - (160.0f - drivePwm) * ((float)boostElapsed / 500.0f);
-            if (boostPwm > drivePwm) drivePwm = boostPwm;
+          unsigned long rampElapsed = now - bfs_run_drive_start_ms;
+          const unsigned long LAUNCH_RAMP_MS = 500;
+          if (rampElapsed < LAUNCH_RAMP_MS) {
+            const float launchFloor = 130.0f;
+            float t_norm = (float)rampElapsed / (float)LAUNCH_RAMP_MS; // 0→1
+
+            // Measure actual speed from encoder distance traveled since drive start
+            float rampDtS = (float)rampElapsed * 0.001f;
+            float actualMps = (rampDtS > 0.03f) ? (bfs_run_driven_m / rampDtS) : 0.0f;
+            // Approximate target speed at full drivePwm (~0.30 m/s at PWM 160)
+            float targetMps = 0.30f * (drivePwm / 160.0f);
+
+            float rampPwm;
+            if (bfs_run_driven_m < 0.003f && rampElapsed > 100) {
+              // Not moving despite applied PWM → exponential increase to break static friction
+              // exp(4t)-1 normalized to [0,1]: slow start, aggressive finish
+              float expN = (expf(4.0f * t_norm) - 1.0f) / (expf(4.0f) - 1.0f);
+              rampPwm = launchFloor + (drivePwm - launchFloor) * expN;
+            } else if (actualMps >= targetMps * 0.85f) {
+              // Already near target speed → end ramp, use full drivePwm
+              rampPwm = drivePwm;
+            } else {
+              // Moving but not yet at speed → gentle quadratic ease-in
+              rampPwm = launchFloor + (drivePwm - launchFloor) * t_norm * t_norm;
+            }
+            drivePwm = rampPwm;
           }
         }
 
