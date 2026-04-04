@@ -9839,10 +9839,10 @@ void loop() {
         bfs_drive_pd_first = true;  // reset PD state for new segment
         // Carry forward steering integral from prior segment to reduce settling time.
         // The mechanical bias is persistent, so starting from 0 wastes the first ~1s re-learning it.
-        // Cap the carry-forward to ±5.0 (~±7.5 PWM) to prevent catastrophic accumulation
+        // Cap the carry-forward to ±3.0 (~±4.5 PWM) to prevent catastrophic accumulation
         // after stalls or heading-abort segments.
-        if (bfs_drive_integral > 5.0f) bfs_drive_integral = 5.0f;
-        if (bfs_drive_integral < -5.0f) bfs_drive_integral = -5.0f;
+        if (bfs_drive_integral > 3.0f) bfs_drive_integral = 3.0f;
+        if (bfs_drive_integral < -3.0f) bfs_drive_integral = -3.0f;
         bfs_drive_prev_err = 0.0f;
         bfs_drive_dFilt = 0.0f;
         bfs_drive_pid_last_us = 0;
@@ -10027,8 +10027,8 @@ void loop() {
         float steerCorr = effectiveKp * yaw_err
                         + BFS_DRIVE_STEER_KI * bfs_drive_integral
                         + BFS_DRIVE_STEER_KD * bfs_drive_dFilt;
-        if (steerCorr > 60.0f) steerCorr = 60.0f;
-        if (steerCorr < -60.0f) steerCorr = -60.0f;
+        if (steerCorr > 80.0f) steerCorr = 80.0f;
+        if (steerCorr < -80.0f) steerCorr = -80.0f;
 
         // Post-turn steering ramp: suppress correction briefly to avoid jerk
         if (bfs_drive_steer_ramp_start_ms > 0) {
@@ -10041,15 +10041,15 @@ void loop() {
           }
         }
 
-        // Deceleration zone: logarithmic decay over last 0.30m
+        // Deceleration zone: logarithmic decay over last 0.40m
         // Log curve is gentle at onset (high speed) and progressively stronger.
         // speedFactor = minF + (1-minF) * ln(1 + t*(e-1))  where t = remaining/decelZone
         // At t=1: 1.0, at t=0.5: ~0.83, at t=0.25: ~0.71, at t=0: minF
-        // Floor at 0.45 so basePwm reaches ~99 at arrival (below 110 floor → 110),
+        // Floor at 0.35 so basePwm reaches ~77 at arrival (below 110 floor → 110),
         // slow enough that coast-stop replaces reverse-brake with no yaw torque.
         float speedFactor = 1.0f;
-        const float decelZone = 0.30f;
-        const float decelMinF = 0.45f;
+        const float decelZone = 0.40f;
+        const float decelMinF = 0.35f;
         if (remaining < decelZone) {
           float t = remaining / decelZone;  // 1.0 at edge → 0.0 at waypoint
           float logScale = logf(1.0f + t * 1.7183f);  // ln(1 + t*(e-1)), range 0→1
