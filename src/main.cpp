@@ -9839,7 +9839,10 @@ void loop() {
         bfs_drive_pd_first = true;  // reset PD state for new segment
         // Carry forward steering integral from prior segment to reduce settling time.
         // The mechanical bias is persistent, so starting from 0 wastes the first ~1s re-learning it.
-        // (bfs_drive_integral retains its value from the previous DRIVE phase)
+        // Cap the carry-forward to ±5.0 (~±7.5 PWM) to prevent catastrophic accumulation
+        // after stalls or heading-abort segments.
+        if (bfs_drive_integral > 5.0f) bfs_drive_integral = 5.0f;
+        if (bfs_drive_integral < -5.0f) bfs_drive_integral = -5.0f;
         bfs_drive_prev_err = 0.0f;
         bfs_drive_dFilt = 0.0f;
         bfs_drive_pid_last_us = 0;
@@ -10075,32 +10078,41 @@ void loop() {
         // Ramps from launchFloor up to drivePwm using encoder feedback.
         // - If robot is stuck (static friction): exponential PWM increase
         // - If robot is already near target speed: end ramp early
-        // - Otherwise: gentle quadratic ease-in to avoid heading-destabilizing spikes
+        // - If going too fast for ramp position: cap to expected speed
+        // - Otherwise: smooth cubic (t³) ease-in over 800ms
         if (bfs_run_drive_start_ms > 0) {
           unsigned long rampElapsed = now - bfs_run_drive_start_ms;
-          const unsigned long LAUNCH_RAMP_MS = 500;
+          const unsigned long LAUNCH_RAMP_MS = 800;
           if (rampElapsed < LAUNCH_RAMP_MS) {
             const float launchFloor = 130.0f;
             float t_norm = (float)rampElapsed / (float)LAUNCH_RAMP_MS; // 0→1
 
             // Measure actual speed from encoder distance traveled since drive start
             float rampDtS = (float)rampElapsed * 0.001f;
-            float actualMps = (rampDtS > 0.03f) ? (bfs_run_driven_m / rampDtS) : 0.0f;
+            float actualMps = (rampDtS > 0.05f) ? (bfs_run_driven_m / rampDtS) : 0.0f;
             // Approximate target speed at full drivePwm (~0.30 m/s at PWM 160)
             float targetMps = 0.30f * (drivePwm / 160.0f);
 
             float rampPwm;
-            if (bfs_run_driven_m < 0.003f && rampElapsed > 100) {
+            if (bfs_run_driven_m < 0.003f && rampElapsed > 150) {
               // Not moving despite applied PWM → exponential increase to break static friction
-              // exp(4t)-1 normalized to [0,1]: slow start, aggressive finish
-              float expN = (expf(4.0f * t_norm) - 1.0f) / (expf(4.0f) - 1.0f);
+              float expN = (expf(3.0f * t_norm) - 1.0f) / (expf(3.0f) - 1.0f);
               rampPwm = launchFloor + (drivePwm - launchFloor) * expN;
             } else if (actualMps >= targetMps * 0.85f) {
               // Already near target speed → end ramp, use full drivePwm
               rampPwm = drivePwm;
             } else {
-              // Moving but not yet at speed → gentle quadratic ease-in
-              rampPwm = launchFloor + (drivePwm - launchFloor) * t_norm * t_norm;
+              // Moving but not yet at speed → smooth cubic ease-in (t³)
+              // Stays low much longer than quadratic: at 50% time, only 12.5% of range
+              float tCubed = t_norm * t_norm * t_norm;
+              rampPwm = launchFloor + (drivePwm - launchFloor) * tCubed;
+              // Speed limiter: if encoder says we're going faster than ramp expects,
+              // cap PWM to prevent overshoot when static friction suddenly breaks
+              float rampTargetMps = targetMps * tCubed;
+              if (rampTargetMps > 0.05f && actualMps > rampTargetMps * 1.3f) {
+                // Going 30% faster than expected for this ramp position → hold PWM
+                rampPwm = launchFloor;
+              }
             }
             drivePwm = rampPwm;
           }
