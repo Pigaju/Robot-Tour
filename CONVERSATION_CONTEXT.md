@@ -31,7 +31,7 @@ Use this file to bootstrap a new chat window. Paste/attach it so the assistant h
 | Turn PID | Ki=1.0, Kd=0.15, err/45 base, floor 115 | |
 | Encoder PPM | L=924.5, R=888.0 | NVS |
 | PWM floor (satshift) | L=90, R=95 | ~line 10050 |
-| Launch boost | 160→drivePwm ramp over 500ms | ~line 10028 |
+| Launch ramp | Adaptive: quadratic 130→target, 500ms, encoder feedback | ~line 10075 |
 | Decel zone | last 0.15m, speedFactor floor 0.60 | ~line 9993 |
 | Leaky integral tau | 1.0s | |
 | Anti-windup | ±25 PWM | |
@@ -92,13 +92,21 @@ Same in square test, straight test, BFS DRIVE, and RUN mode.
   - Deceleration zone: shortened 0.20m→0.15m, raised floor 0.30→0.60, raised basePwm minimum 90→110
   - Carry forward steerI between segments (mechanical bias is persistent, saves ~1s convergence)
 
-## Current Status (Run 134)
+### 8. Run 134 — Instant PWM spike after every turn (fixed)
+- **Problem**: Old launch boost ramped 160→drivePwm, but time-based speed scaling pushed drivePwm to 220. Since 160 < 220, the ramp was completely bypassed — robot jumped from 0→220 PWM instantly. Caused heading errors of 4-25° (seg 5 worst: 25.3° error, corrOut clamped at ±60).
+- **Fix**: Adaptive closed-loop launch ramp using encoder feedback:
+  - Quadratic ease-in from 130→drivePwm over 500ms (normal case)
+  - Exponential `exp(4t)` increase when stuck (encoder < 3mm after 100ms)
+  - Early ramp exit when encoder speed ≥ 85% of target speed
+  - At 250ms (midpoint), PWM is only 25% of the way to target → gives steering PID time to lock on
+
+## Current Status (Run 135 pending)
 
 - Runs 132-133: `enc=LEFT` — right encoder boot test failing again intermittently
-- Run 134: `enc=BOTH`, dist=13.250 (different/longer path), 67 rows logged
-- Robot is traversing segments much more reliably with all fixes
+- Run 134: `enc=BOTH`, dist=13.250, 62 samples. Completed 9 segments before USER_STOP. Heading errors 4-25° from instant PWM spikes (now fixed)
+- Firmware uploaded with adaptive launch ramp
 - Turns are accurate and drift-immune
-- Remaining concern: boot encoder test can still fail for right encoder (EMI-sensitive)
+- Remaining concerns: boot encoder test can still fail for right encoder (EMI-sensitive)
 
 ## Encoder Mode System
 
@@ -132,7 +140,8 @@ Same in square test, straight test, BFS DRIVE, and RUN mode.
 | Post-turn steer ramp (150ms) | ~9983-9990 |
 | Deceleration zone (last 0.15m) | ~9993-9998 |
 | Time-based speed scaling | ~10000-10023 |
-| drivePwm floor (130) + launch boost ramp | ~10025-10035 |
+| drivePwm floor (130) | ~10070 |
+| Adaptive launch ramp (encoder feedback) | ~10075-10107 |
 | basePwm floor (110) | ~10042 |
 | Saturation shift (floor preserve) | ~10050-10065 |
 | PWM clamp + motor output | ~10067-10075 |
