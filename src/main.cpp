@@ -9963,19 +9963,20 @@ void loop() {
       }
 
       if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
-        // Reached waypoint: coast-stop (decel zone already brought speed to ~110 PWM).
-        // No reverse-brake — avoids asymmetric wheel braking that causes yaw torque.
-        stopAllMotors();
-        // IMU-aware settle wait (200ms is enough at low arrival speed)
+        // Reached waypoint: gentle brake to full stop.
+        // Decel zone already brought speed to ~110 PWM; use light reverse-brake
+        // with encoder feedback to ensure wheels are truly stopped before turning.
+        brakeToStop(80, 400);  // light brake (80 PWM max), 400ms timeout
+        // Brief IMU-aware settle after brake (let chassis vibrations die)
         { unsigned long t0settle = millis();
           uint32_t lastImuPollUs = (uint32_t)micros();
-          while ((millis() - t0settle) < 200) {
+          while ((millis() - t0settle) < 100) {
             uint32_t nUs = (uint32_t)micros();
             if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
           } }
         bfs_run_total_driven_m += bfs_run_driven_m;
         bfs_run_phase = BFS_PHASE_ARRIVED;
-        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (coast-stop)\n",
+        Serial.printf("BFS_RUN: DRIVE done dist=%.2f/%.2f total=%.2f (brake-stop)\n",
                       (double)bfs_run_driven_m, (double)bfs_run_segment_dist_m,
                       (double)bfs_run_total_driven_m);
       } else {
@@ -10046,7 +10047,7 @@ void loop() {
         // speedFactor = minF + (1-minF) * ln(1 + t*(e-1))  where t = remaining/decelZone
         // At t=1: 1.0, at t=0.5: ~0.83, at t=0.25: ~0.71, at t=0: minF
         // Floor at 0.35 so basePwm reaches ~77 at arrival (below 110 floor → 110),
-        // slow enough that coast-stop replaces reverse-brake with no yaw torque.
+        // slow enough that a light brakeToStop(80, 400ms) brings wheels to zero quickly.
         float speedFactor = 1.0f;
         const float decelZone = 0.40f;
         const float decelMinF = 0.35f;
