@@ -3461,7 +3461,6 @@ static void loadPersistedSettings() {
   pulsesPerMeter = legacyPpm;
   syncPulsesPerMeterDerived();
   motor_bias_pwm = (int16_t)prefs.getShort("mtr_bias3", (int16_t)motor_bias_pwm);
-  motor_bias_pwm = 0;  // NVS holds stale -12 that amplifies wheel asymmetry
 
   // Last-known-good gyro bias (used as a safe fallback if staged calibration is disturbed).
   imu_gz_bias_dps = prefs.getFloat(IMU_BIAS_PERSIST_KEY, imu_gz_bias_dps);
@@ -9536,6 +9535,7 @@ void loop() {
       }
 
       // Start by computing first segment
+      bfs_drive_integral = 0.0f;  // reset steering integral at run start
       bfs_run_phase = BFS_PHASE_ARRIVED;  // Will immediately compute first segment
       Serial.printf("BFS_RUN: init yaw=%.1f initial_heading=%.1f path_len=%d path_idx=%d\n",
                     (double)imu_yaw, (double)bfs_run_initial_heading_deg,
@@ -9746,9 +9746,9 @@ void loop() {
     }
     else if (bfs_run_phase == BFS_PHASE_BRAKE) {
       // Electronic brake with motors commanded to 0 PWM.
-      // 150ms gives enough time to arrest angular momentum (especially after turn timeout).
+      // 300ms gives enough time to arrest angular momentum (especially after turn timeout).
       stopAllMotors();
-      if ((now - bfs_run_brake_start_ms) >= 150u) {
+      if ((now - bfs_run_brake_start_ms) >= 300u) {
         if (bfs_run_after_brake_phase == BFS_PHASE_SETTLE) {
           bfs_run_settle_start_ms = now;
           bfs_settle_mean_g = 0.0f;
@@ -9808,12 +9808,10 @@ void loop() {
 
       const bool timeOk = (now - bfs_run_settle_start_ms) >= 80u;
       const bool varSmall = var_g2 < (0.015f * 0.015f);
-      // Require angular velocity to be low before driving (prevents driving while still spinning)
-      const bool gzQuiet = fabsf(imu_gz_dps) < 20.0f;
       // Hard timeout: never stay in SETTLE longer than 1s (competition 3s stall rule)
       const bool settleTimeout = (now - bfs_run_settle_start_ms) >= 1000u;
 
-      if ((timeOk && varSmall && gzQuiet) || settleTimeout) {
+      if ((timeOk && varSmall) || settleTimeout) {
         if (settleTimeout) {
           Serial.println("BFS_RUN: SETTLE timeout (1s), forcing DRIVE");
         }
@@ -9833,18 +9831,6 @@ void loop() {
           }
         }
 
-        // Post-settle IMU drift correction:
-        // The robot was at the target heading when the turn completed, so any
-        // discrepancy now is accumulated gyro drift during turn+settle phases.
-        {
-          float headingErr = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
-          if (fabsf(headingErr) > 2.0f) {
-            imu_yaw += headingErr * 0.8f;
-            Serial.printf("BFS_RUN: SETTLE drift correction %.1f deg (err was %.1f)\n",
-                          (double)(headingErr * 0.8f), (double)headingErr);
-          }
-        }
-
         // Fresh encoder snapshot for the upcoming DRIVE
         readWheelEncodersInternal(true);
         bfs_run_enc_start_L = encoderL_count;
@@ -9852,10 +9838,13 @@ void loop() {
         bfs_run_drive_start_ms = millis();  // for ENC_MODE_TIMED fallback
         bfs_run_phase = BFS_PHASE_DRIVE;
         bfs_drive_pd_first = true;  // reset PD state for new segment
-        // Cap steering integral carry-forward to prevent drift-contaminated values
-        // from polluting subsequent segments on long-distance runs.
-        if (bfs_drive_integral > 1.5f) bfs_drive_integral = 1.5f;
-        if (bfs_drive_integral < -1.5f) bfs_drive_integral = -1.5f;
+        // Reset steering integral: after a 90° turn the mechanical bias is
+        // direction-dependent, so the old value does more harm than good.
+        bfs_drive_integral = 0.0f;
+        // Refresh target yaw to current IMU heading — compensates for any
+        // drift that occurred during the BRAKE + SETTLE stationary pause.
+        imuIntegrateOnce();
+        bfs_run_target_yaw_deg = imu_yaw;
         bfs_drive_prev_err = 0.0f;
         bfs_drive_dFilt = 0.0f;
         bfs_drive_pid_last_us = 0;
@@ -9976,14 +9965,12 @@ void loop() {
       }
 
       if (bfs_run_driven_m >= bfs_run_segment_dist_m - BFS_ARRIVE_TOLERANCE_M) {
-        // Reached waypoint: gentle brake to full stop.
-        // Decel zone already brought speed to ~110 PWM; use light reverse-brake
-        // with encoder feedback to ensure wheels are truly stopped before turning.
-        brakeToStop(80, 200);
-        // Brief IMU-aware settle after brake (let chassis vibrations die)
+        // Reached waypoint: closed-loop reverse brake (like straight test)
+        brakeToStop(140, 400);
+        // IMU-aware settle wait
         { unsigned long t0settle = millis();
           uint32_t lastImuPollUs = (uint32_t)micros();
-          while ((millis() - t0settle) < 50) {
+          while ((millis() - t0settle) < 300) {
             uint32_t nUs = (uint32_t)micros();
             if ((nUs - lastImuPollUs) >= 1000u) { imuIntegrateOnce(); lastImuPollUs = nUs; }
           } }
@@ -10055,20 +10042,12 @@ void loop() {
           }
         }
 
-        // Deceleration zone: logarithmic decay over last 0.40m
-        // Log curve is gentle at onset (high speed) and progressively stronger.
-        // speedFactor = minF + (1-minF) * ln(1 + t*(e-1))  where t = remaining/decelZone
-        // At t=1: 1.0, at t=0.5: ~0.83, at t=0.25: ~0.71, at t=0: minF
-        // Floor at 0.35 so basePwm reaches ~77 at arrival (below 110 floor → 110),
-        // slow enough that a light brakeToStop(80, 200ms) brings wheels to zero quickly.
+        // Deceleration zone: ramp down over last 0.15m
+        // Floor at 0.60 so basePwm stays >= 130*0.60 = 78 (above motor floors)
         float speedFactor = 1.0f;
-        const float decelZone = 0.40f;
-        const float decelMinF = 0.35f;
-        if (remaining < decelZone) {
-          float t = remaining / decelZone;  // 1.0 at edge → 0.0 at waypoint
-          float logScale = logf(1.0f + t * 1.7183f);  // ln(1 + t*(e-1)), range 0→1
-          speedFactor = decelMinF + (1.0f - decelMinF) * logScale;
-          if (speedFactor > 1.0f) speedFactor = 1.0f;
+        if (remaining < 0.15f) {
+          speedFactor = remaining / 0.15f;
+          if (speedFactor < 0.60f) speedFactor = 0.60f;
         }
 
         // Time-based drive PWM: scale speed to finish path within runTimeS.
