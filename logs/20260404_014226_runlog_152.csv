@@ -1,0 +1,5 @@
+# TEST_BEGIN id=152 fw=unknown mode=ENC enc=BOTH dist=7.250 time=63.000 can=0.000 ppm=906.2 ppmL=924.5 ppmR=888.0 mtr_bias=0 i2c_hz=100000 ctrl_ms=10 imu_present=1 imu_ok_start=1 lock_pwm=0 lock_pwm_val=0.0 softstart_ms=0
+# spiffs_total=942080 spiffs_used=40960 spiffs_free=901120
+t_ms,meters,forwardM,currentYaw,targetYaw,yawErrDeg,yawI,gz_dps,gzRaw_dps,gzBias_dps,actualRate,leftRate,rightRate,speedErr,basePWM,corrRaw,corrFiltered,corrOut,canPhase,turnTargetDeg,turnImuDeg,turnEncDeg,turnFusedDeg,braking,lPwm,rPwm,mL_err_dir,mL_err_pwm,mR_err_dir,mR_err_pwm,lateralM,remainingM,nomTargetRate,effTargetRate,targetRatePps,actualRatePps,speedI,steerI,encTrimPwm,loopDtMs,corrUsed,motorBiasPwm,satShift,imuReadUs,motorWriteUs,cmdL_dir,cmdR_dir,regL_dir,regL_pwm,regR_dir,regR_pwm,distL,distR
+# TEST_END id=152 samples=0 ram_samples=0 overflow=no stop=USER_STOP max_ctrl_dt_ms=0 max_ctrl_dt_at_ms=0 ctrl_overruns=0 ctrl_stalls200ms=0
+
