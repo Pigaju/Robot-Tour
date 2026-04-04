@@ -3358,7 +3358,7 @@ static float bfs_drive_prev_err = 0.0f;
 static float bfs_drive_dFilt = 0.0f;
 static uint32_t bfs_drive_pid_last_us = 0;
 static unsigned long bfs_drive_steer_ramp_start_ms = 0;  // post-turn steering ramp
-#define BFS_DRIVE_STEER_RAMP_MS 150  // suppress steering for this long after turn→drive
+#define BFS_DRIVE_STEER_RAMP_MS 400  // suppress steering for this long after turn→drive
 
 // BFS run tuning
 #define BFS_TURN_PWM 130
@@ -9839,10 +9839,10 @@ void loop() {
         bfs_drive_pd_first = true;  // reset PD state for new segment
         // Carry forward steering integral from prior segment to reduce settling time.
         // The mechanical bias is persistent, so starting from 0 wastes the first ~1s re-learning it.
-        // Cap the carry-forward to ±3.0 (~±4.5 PWM) to prevent catastrophic accumulation
+        // Cap the carry-forward to ±1.5 (~±2.3 PWM) to prevent catastrophic accumulation
         // after stalls or heading-abort segments.
-        if (bfs_drive_integral > 3.0f) bfs_drive_integral = 3.0f;
-        if (bfs_drive_integral < -3.0f) bfs_drive_integral = -3.0f;
+        if (bfs_drive_integral > 1.5f) bfs_drive_integral = 1.5f;
+        if (bfs_drive_integral < -1.5f) bfs_drive_integral = -1.5f;
         bfs_drive_prev_err = 0.0f;
         bfs_drive_dFilt = 0.0f;
         bfs_drive_pid_last_us = 0;
@@ -10130,6 +10130,19 @@ void loop() {
 
         float basePwm = drivePwm * speedFactor;
         if (basePwm < 110.0f) basePwm = 110.0f;
+
+        // During launch ramp, cap steerCorr to ±20% of basePwm.
+        // At low speed, large corrections cause massive wheel-speed differentials
+        // that destabilize heading (e.g. ±28 at basePwm=130 → 43% asymmetry).
+        if (bfs_run_drive_start_ms > 0) {
+          unsigned long launchElapsed = now - bfs_run_drive_start_ms;
+          if (launchElapsed < 800) {  // matches LAUNCH_RAMP_MS
+            float maxCorr = basePwm * 0.20f;
+            if (steerCorr > maxCorr) steerCorr = maxCorr;
+            if (steerCorr < -maxCorr) steerCorr = -maxCorr;
+          }
+        }
+
         // Positive yaw_err → need to turn LEFT (CCW, increase IMU yaw)
         // → slow left wheel, speed up right wheel
         float leftPwm = basePwm - steerCorr + (float)motor_bias_pwm;
