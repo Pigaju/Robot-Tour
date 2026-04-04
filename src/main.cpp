@@ -9657,8 +9657,10 @@ void loop() {
       // Pivot in place to face the next waypoint
       float yaw_err = wrapDeg(bfs_run_target_yaw_deg - imu_yaw);
 
-      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG) {
-        // In tolerance — stop motors and hold for settle time (matching standalone turn test)
+      if (fabsf(yaw_err) < BFS_TURN_TOLERANCE_DEG && fabsf(imu_gz_dps) < 30.0f) {
+        // In tolerance AND angular velocity low — stop motors and hold for settle
+        // The gz check prevents false-settle when the robot blasts through the
+        // tolerance zone at high angular velocity (which caused 48° overshoot).
         stopAllMotors();
         if (bfs_turn_first_in_tol_ms == 0) bfs_turn_first_in_tol_ms = now;
         if ((now - bfs_turn_first_in_tol_ms) >= BFS_TURN_SETTLE_MS) {
@@ -9687,7 +9689,7 @@ void loop() {
 
         // Leaky integral (only accumulate when error is meaningful)
         const float turnKi = 1.0f;
-        const float turnKd = 0.15f;
+        const float turnKd = 0.25f;
         const float turnILeakTau = 1.0f;
         // Accelerate I leak in fine zone to shed accumulated integral from large-error phase
         float effectiveLeak = (fabsf(yaw_err) < 5.0f) ? 0.3f : turnILeakTau;
@@ -9721,7 +9723,11 @@ void loop() {
         float correction = (turnKi * bfs_turn_integral + turnKd * bfs_turn_dFilt) * errSign;
         float turnPwmF = basePwm + correction;
         if (turnPwmF > 200.0f) turnPwmF = 200.0f;
-        if (turnPwmF < 115.0f) turnPwmF = 115.0f;
+        // Dynamic floor: 95 near target → 115 far away. Lets P/D terms
+        // actually slow the approach instead of maintaining 115 PWM until
+        // the robot blasts through the tolerance zone at high angular velocity.
+        float turnFloor = (absErr < 15.0f) ? (95.0f + absErr * (20.0f / 15.0f)) : 115.0f;
+        if (turnPwmF < turnFloor) turnPwmF = turnFloor;
 
         int sign = (yaw_err > 0.0f) ? 1 : -1;
         setMotorsPivotPwm(sign, (uint8_t)(turnPwmF + 0.5f));
