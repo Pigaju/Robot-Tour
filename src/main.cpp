@@ -10040,12 +10040,18 @@ void loop() {
           }
         }
 
-        // Deceleration zone: ramp down over last 0.15m
-        // Floor at 0.60 so basePwm stays >= 130*0.60 = 78 (above motor floors)
+        // Deceleration zone: logarithmic decay over last 0.30m
+        // Log curve is gentle at onset (high speed) and progressively stronger.
+        // speedFactor = minF + (1-minF) * ln(1 + t*(e-1))  where t = remaining/decelZone
+        // At t=1: 1.0, at t=0.5: ~0.83, at t=0.25: ~0.71, at t=0: minF
         float speedFactor = 1.0f;
-        if (remaining < 0.15f) {
-          speedFactor = remaining / 0.15f;
-          if (speedFactor < 0.60f) speedFactor = 0.60f;
+        const float decelZone = 0.30f;
+        const float decelMinF = 0.55f;  // floor: basePwm never below drivePwm*0.55
+        if (remaining < decelZone) {
+          float t = remaining / decelZone;  // 1.0 at edge → 0.0 at waypoint
+          float logScale = logf(1.0f + t * 1.7183f);  // ln(1 + t*(e-1)), range 0→1
+          speedFactor = decelMinF + (1.0f - decelMinF) * logScale;
+          if (speedFactor > 1.0f) speedFactor = 1.0f;
         }
 
         // Time-based drive PWM: scale speed to finish path within runTimeS.
